@@ -204,6 +204,10 @@ impl<T> Resident<T> {
         out: &mut Vec<Visible>,
     ) {
         let from = camera_column(camera);
+        // When the near-plane normal points mostly vertically, projecting
+        // tall columns leaves too many active planes for masking to pay off.
+        // Keep the exact original per-section path in that camera regime.
+        let mask_columns = frustum.masks_help_for_view();
         for column in &self.columns {
             let near = in_view_distance(from, radius, column.x, column.z);
             if !near && !beyond(column.x, column.z) {
@@ -212,7 +216,11 @@ impl<T> Resident<T> {
             let min = origin((column.x, column.low, column.z), camera).as_vec3();
             let top = origin((column.x, column.high, column.z), camera).as_vec3();
             let max = top + Vec3::splat(16.0);
-            let Some(clip_mask) = frustum.column_clip_mask(min, max) else {
+            let Some(clip_mask) = (if mask_columns {
+                frustum.column_clip_mask(min, max)
+            } else {
+                frustum.intersects(min, max).then_some(0b11_1111)
+            }) else {
                 continue;
             };
             for &(y, slot) in &column.sections {
@@ -252,6 +260,39 @@ impl<T> Resident<T> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// A normal camera still uses the mask; very steep upward or downward
+    /// views use the legacy clip loop regardless of yaw or field of view.
+    /// This guard is an optimization decision, not a visibility decision.
+    #[test]
+    fn adaptive_column_mask_uses_view_direction_not_yaw_or_fov() {
+        for yaw in [0.0, 45.0, 135.0, 270.0] {
+            for fov in [50.0, 70.0, 90.0] {
+                let projection = super::super::world_projection(fov, 16.0 / 9.0, 1100.0);
+                for (pitch, expected) in [
+                    (0.0, true),
+                    (50.0, true),
+                    (-50.0, true),
+                    (60.0, true),
+                    (-60.0, true),
+                    (75.0, false),
+                    (-75.0, false),
+                    (89.0, false),
+                    (-89.0, false),
+                ] {
+                    let view = crate::camera::view_matrix(yaw, pitch);
+                    let frustum = Frustum {
+                        planes: super::super::frustum(projection * view),
+                    };
+                    assert_eq!(
+                        frustum.masks_help_for_view(),
+                        expected,
+                        "yaw={yaw} pitch={pitch} fov={fov}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn column_walk_finds_exactly_the_sections_in_view() {
@@ -450,7 +491,18 @@ mod tests {
             ("meadow_rd16", 20.0, 15.0, 16),
             ("meadow_rd32", 20.0, 15.0, 32),
             ("peak_rd32", 65.0, -40.0, 32),
+            ("pitch_n89_rd32", 30.0, -89.0, 32),
+            ("pitch_n80_rd32", 30.0, -80.0, 32),
+            ("pitch_n70_rd32", 30.0, -70.0, 32),
+            ("pitch_n60_rd32", 30.0, -60.0, 32),
+            ("pitch_0_rd32", 30.0, 0.0, 32),
+            ("pitch_50_rd32", 30.0, 50.0, 32),
+            ("pitch_60_rd32", 30.0, 60.0, 32),
+            ("pitch_70_rd32", 30.0, 70.0, 32),
+            ("pitch_75_rd32", 30.0, 75.0, 32),
+            ("pitch_80_rd32", 30.0, 80.0, 32),
             ("top_down_rd32", 30.0, 85.0, 32),
+            ("pitch_89_rd32", 30.0, 89.0, 32),
         ] {
             let frustum = Frustum {
                 planes: super::super::frustum(projection * crate::camera::view_matrix(yaw, pitch)),
@@ -517,10 +569,63 @@ mod tests {
             let baseline_us = base_samples[12];
             let candidate_us = fast_samples[12];
             println!(
-                "culling_ab,{name},radius={radius},resident={},visible={},baseline_us={baseline_us:.3},candidate_us={candidate_us:.3},speedup={:.3}",
+                "culling_ab,{name},radius={radius},resident={},visible={},near_y={:.4},baseline_us={baseline_us:.3},candidate_us={candidate_us:.3},speedup={:.3}",
                 r.len(),
                 fast.len(),
+                frustum.planes[4].y,
                 baseline_us / candidate_us,
+            );
+        }
+    }
+
+    /// Explain which columns and section counts benefit from a shared
+    /// frustum-plane mask. Diagnostic-only; does not change rendering.
+    #[test]
+    #[ignore = "geometry diagnostics only"]
+    fn column_clip_mask_distribution() {
+        let mut r: Resident<()> = Resident::default();
+        for x in -33i32..=33 {
+            for z in -33i32..=33 {
+                for y in 0..24 {
+                    if (x * 7 + y * 3 + z * 5).rem_euclid(4) != 0 {
+                        r.insert((x, y, z), ());
+                    }
+                }
+            }
+        }
+        let camera = DVec3::new(8.5, 100.0, 8.5);
+        for (name, yaw, pitch, radius) in [
+            ("meadow_rd16", 20.0, 15.0, 16),
+            ("meadow_rd32", 20.0, 15.0, 32),
+            ("peak_rd32", 65.0, -40.0, 32),
+            ("top_down_rd32", 30.0, 85.0, 32),
+        ] {
+            let proj = super::super::world_projection(70.0, 16.0 / 9.0, 1100.0);
+            let frustum = Frustum {
+                planes: super::super::frustum(proj * crate::camera::view_matrix(yaw, pitch)),
+            };
+            let mut inspected = 0usize;
+            let mut accepted = 0usize;
+            let mut accepted_sections = 0usize;
+            let mut by_planes = [0usize; 7];
+            let mut by_sections = [0usize; 7];
+            for c in &r.columns {
+                if !in_view_distance(camera_column(camera), radius, c.x, c.z) {
+                    continue;
+                }
+                inspected += 1;
+                let min = origin((c.x, c.low, c.z), camera).as_vec3();
+                let top = origin((c.x, c.high, c.z), camera).as_vec3();
+                if let Some(mask) = frustum.column_clip_mask(min, top + Vec3::splat(16.0)) {
+                    accepted += 1;
+                    accepted_sections += c.sections.len();
+                    let p = mask.count_ones() as usize;
+                    by_planes[p] += 1;
+                    by_sections[p] += c.sections.len();
+                }
+            }
+            println!(
+                "frustum_mask_diag,{name},columns_inspected={inspected},columns_accepted={accepted},sections_accepted={accepted_sections},columns_by_active_planes={by_planes:?},sections_by_active_planes={by_sections:?}"
             );
         }
     }

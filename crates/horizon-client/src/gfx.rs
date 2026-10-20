@@ -3929,6 +3929,15 @@ impl Frustum {
             p.truncate().dot(v) + p.w < 0.0
         })
     }
+    /// Reuse plain six-plane culling for near-vertical cameras. Tall chunk
+    /// columns then intersect nearly every side plane, so building a mask
+    /// costs more than it saves. The near-plane Y normal measures vertical
+    /// view direction, independent of yaw and frustum FOV. The 0.90 cutoff
+    /// was chosen from a multi-pitch optimized A/B sweep, not for parity.
+    #[inline]
+    fn masks_help_for_view(&self) -> bool {
+        self.planes[4].y.abs() < 0.90
+    }
     /// Determine which planes still need testing for sections inside the
     /// column AABB. `None` rejects the whole column; a zero mask means
     /// every nested box is fully inside. Plane normals are unit-length.
