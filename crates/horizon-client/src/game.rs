@@ -10076,6 +10076,7 @@ impl ApplicationHandler for Game<'_> {
                 &event,
                 WindowEvent::CloseRequested
                     | WindowEvent::Resized(_)
+                    | WindowEvent::ScaleFactorChanged { .. }
                     | WindowEvent::RedrawRequested
             )
         {
@@ -10092,6 +10093,15 @@ impl ApplicationHandler for Game<'_> {
                         r.resize(size.width, size.height);
                     }
                     self.observe_fullscreen();
+                }
+                WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                    // On Wayland a fractional-scale/monitor transition may
+                    // invalidate the presented buffers without issuing a
+                    // `Resized` event. Reconfigure even when size is unchanged.
+                    if let Some(r) = &mut self.renderer {
+                        r.scale_factor_changed();
+                    }
+                    log::debug!("Horizon: window scale factor changed to {scale_factor}");
                 }
                 WindowEvent::Focused(focused) => {
                     self.focused = focused;

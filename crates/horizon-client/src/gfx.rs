@@ -2216,6 +2216,15 @@ impl Renderer {
         }
         self.depth = Self::depth(&self.device, &self.config);
     }
+    /// Winit may report a DPI/fractional-scale transition without changing
+    /// the physical dimensions of the window. Reconfigure the current
+    /// swapchain anyway: a Wayland compositor may have invalidated its old
+    /// buffer scale while the surface still reports acquired frames. Winit
+    /// can also emit `Resized` afterwards, which uses the same safe path.
+    pub fn scale_factor_changed(&mut self) {
+        let size = self.window.inner_size();
+        self.resize(size.width, size.height);
+    }
     /// Whether sections are drawn as one index list per frame (`flat`).
     pub fn flat_draws(&self) -> bool {
         self.flat_on
