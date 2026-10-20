@@ -6,6 +6,11 @@ use super::{Frustum, SectionKey};
 use crate::{fast_hash::FxHashMap, streaming::in_view_distance};
 use glam::{DVec3, Vec3};
 
+#[cfg(test)]
+mod tile_tests;
+#[cfg(test)]
+mod tiled;
+
 /// One chunk column's resident sections.
 struct Column {
     x: i32,
@@ -31,6 +36,8 @@ pub struct Resident<T> {
     slots: FxHashMap<SectionKey, u32>,
     columns: Vec<Column>,
     column_index: FxHashMap<(i32, i32), u32>,
+    #[cfg(test)]
+    tiled_index: Option<tiled::TileIndex>,
 }
 
 impl<T> Default for Resident<T> {
@@ -40,6 +47,8 @@ impl<T> Default for Resident<T> {
             slots: FxHashMap::default(),
             columns: Vec::new(),
             column_index: FxHashMap::default(),
+            #[cfg(test)]
+            tiled_index: None,
         }
     }
 }
@@ -66,6 +75,10 @@ impl<T> Resident<T> {
         self.slots.clear();
         self.columns.clear();
         self.column_index.clear();
+        #[cfg(test)]
+        if let Some(index) = &mut self.tiled_index {
+            *index = tiled::TileIndex::default();
+        }
     }
     /// Adds or replaces `key`'s value.
     pub fn insert(&mut self, key: SectionKey, value: T) {
@@ -76,6 +89,8 @@ impl<T> Resident<T> {
         let slot = self.items.len() as u32;
         self.items.push((key, value));
         self.slots.insert(key, slot);
+        #[cfg(test)]
+        let new_column = !self.column_index.contains_key(&(key.0, key.2));
         let column = match self.column_index.get(&(key.0, key.2)) {
             Some(&c) => &mut self.columns[c as usize],
             None => {
@@ -94,11 +109,22 @@ impl<T> Resident<T> {
         column.sections.push((key.1, slot));
         column.low = column.low.min(key.1);
         column.high = column.high.max(key.1);
+        #[cfg(test)]
+        if let Some(index) = &mut self.tiled_index {
+            let col = &self.columns[self.column_index[&(key.0, key.2)] as usize];
+            if new_column {
+                index.add_column(col, self.column_index[&(key.0, key.2)]);
+            } else {
+                index.expanded(col);
+            }
+        }
     }
     pub fn remove(&mut self, key: SectionKey) -> Option<T> {
         let slot = self.slots.remove(&key)?;
         let c = self.column_index[&(key.0, key.2)] as usize;
         let column = &mut self.columns[c];
+        #[cfg(test)]
+        let (old_low, old_high) = (column.low, column.high);
         let at = column
             .sections
             .iter()
@@ -106,16 +132,29 @@ impl<T> Resident<T> {
             .expect("section in its column");
         column.sections.swap_remove(at);
         if column.sections.is_empty() {
+            #[cfg(test)]
+            let previous_last = self.columns.len() as u32 - 1;
             self.column_index.remove(&(key.0, key.2));
             self.columns.swap_remove(c);
             if let Some(moved) = self.columns.get(c) {
                 self.column_index.insert((moved.x, moved.z), c as u32);
             }
+            #[cfg(test)]
+            if let Some(index) = &mut self.tiled_index {
+                let moved = self
+                    .columns
+                    .get(c)
+                    .map(|col| ((col.x, col.z), previous_last));
+                index.removed_column((key.0, key.2), c as u32, moved, &self.columns);
+            }
         } else {
             column.bounds();
+            #[cfg(test)]
+            if let Some(index) = &mut self.tiled_index {
+                index.shrunk(&self.columns[c], old_low, old_high, &self.columns);
+            }
         }
         let (_, value) = self.items.swap_remove(slot as usize);
-        // The last item now sits in `slot`: point its key and column at it.
         if let Some(&(moved, _)) = self.items.get(slot as usize) {
             let last = self.items.len() as u32;
             self.slots.insert(moved, slot);
@@ -183,6 +222,25 @@ fn in_frustum(key: SectionKey, camera: DVec3, frustum: &Frustum) -> Option<(f64,
 }
 
 impl<T> Resident<T> {
+    #[cfg(test)]
+    fn enable_tiled_index(&mut self) {
+        self.tiled_index = Some(tiled::TileIndex::from_columns(&self.columns));
+    }
+    #[cfg(test)]
+    fn visible_tiled(
+        &self,
+        camera: DVec3,
+        radius: i32,
+        frustum: &Frustum,
+        reachable: impl Fn(SectionKey) -> bool,
+        beyond: impl Fn(i32, i32) -> bool,
+        out: &mut Vec<Visible>,
+    ) {
+        self.tiled_index
+            .as_ref()
+            .expect("enable_tiled_index first")
+            .visible(self, camera, radius, frustum, reachable, beyond, out);
+    }
     /// Appends the sections `in_view` and `reachable` to `out`, nearest
     /// first (ties by key, so the order never depends on storage), and the
     /// sections in the frustum of columns past the render distance that
