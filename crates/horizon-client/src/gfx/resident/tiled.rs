@@ -1,4 +1,4 @@
-//! Test-only incrementally maintained coarse 8×8-column tile index.
+//! Test-only incrementally maintained coarse column tile index (4×4/8×8/16×16).
 //!
 //! This deliberately leaves the production resident-column walker unchanged
 //! until insertion/removal costs, visible parity and end-to-end performance
@@ -6,12 +6,6 @@
 use super::{Column, Frustum, Resident, SectionKey, Visible, camera_column, in_frustum, origin};
 use crate::{fast_hash::FxHashMap, streaming::in_view_distance};
 use glam::{DVec3, Vec3};
-
-const WIDTH: i32 = 8;
-
-fn tile_key(x: i32, z: i32) -> (i32, i32) {
-    (x.div_euclid(WIDTH), z.div_euclid(WIDTH))
-}
 
 #[derive(Debug)]
 struct Tile {
@@ -51,22 +45,45 @@ impl Tile {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub(super) struct TileIndex {
+    /// Fixed at construction so tile-key identity cannot change mid-stream.
+    width: i32,
     tiles: Vec<Tile>,
     lookup: FxHashMap<(i32, i32), u32>,
 }
 
 impl TileIndex {
-    pub(super) fn from_columns(columns: &[Column]) -> Self {
-        let mut t = Self::default();
+    fn tile_key(&self, x: i32, z: i32) -> (i32, i32) {
+        (x.div_euclid(self.width), z.div_euclid(self.width))
+    }
+    pub(super) fn new(width: i32) -> Self {
+        assert!(
+            matches!(width, 4 | 8 | 16),
+            "unsupported tile width {width}"
+        );
+        Self {
+            width,
+            tiles: Vec::new(),
+            lookup: FxHashMap::default(),
+        }
+    }
+    pub(super) fn clear(&mut self) {
+        self.tiles.clear();
+        self.lookup.clear();
+    }
+    pub(super) fn width(&self) -> i32 {
+        self.width
+    }
+    pub(super) fn from_columns(columns: &[Column], width: i32) -> Self {
+        let mut t = Self::new(width);
         for (idx, c) in columns.iter().enumerate() {
             t.add_column(c, idx as u32);
         }
         t
     }
     pub(super) fn add_column(&mut self, c: &Column, index: u32) {
-        let key = tile_key(c.x, c.z);
+        let key = self.tile_key(c.x, c.z);
         if let Some(&slot) = self.lookup.get(&key) {
             let t = &mut self.tiles[slot as usize];
             debug_assert!(!t.columns.contains(&index));
@@ -79,13 +96,13 @@ impl TileIndex {
         }
     }
     pub(super) fn expanded(&mut self, c: &Column) {
-        let key = tile_key(c.x, c.z);
+        let key = self.tile_key(c.x, c.z);
         self.tiles[self.lookup[&key] as usize].include(c);
     }
     /// Called after the owning column bounds shrink. Tight tiles only need a
     /// rescan when that column used to supply the tile's extreme Y bound.
     pub(super) fn shrunk(&mut self, c: &Column, old_low: i32, old_high: i32, columns: &[Column]) {
-        let ti = self.lookup[&tile_key(c.x, c.z)] as usize;
+        let ti = self.lookup[&self.tile_key(c.x, c.z)] as usize;
         let t = &self.tiles[ti];
         if (c.low != old_low && old_low == t.min.1) || (c.high != old_high && old_high == t.max.1) {
             self.tiles[ti].recompute(columns);
@@ -101,7 +118,7 @@ impl TileIndex {
         moved: Option<((i32, i32), u32)>,
         columns: &[Column],
     ) {
-        let key = tile_key(removed.0, removed.1);
+        let key = self.tile_key(removed.0, removed.1);
         let ti = self.lookup[&key] as usize;
         let members = &mut self.tiles[ti].columns;
         let at = members
@@ -117,7 +134,7 @@ impl TileIndex {
             }
         }
         if let Some(((x, z), previous_last_index)) = moved {
-            let moved_ti = self.lookup[&tile_key(x, z)] as usize;
+            let moved_ti = self.lookup[&self.tile_key(x, z)] as usize;
             let member = self.tiles[moved_ti]
                 .columns
                 .iter_mut()
@@ -203,7 +220,7 @@ impl TileIndex {
         for (tile_idx, tile) in self.tiles.iter().enumerate() {
             assert!(!tile.columns.is_empty());
             assert_eq!(self.lookup[&tile.key], tile_idx as u32);
-            assert!(tile.columns.len() <= (WIDTH * WIDTH) as usize);
+            assert!(tile.columns.len() <= (self.width * self.width) as usize);
             let mut expected = Tile::from_column(
                 tile.key,
                 tile.columns[0],
@@ -215,7 +232,7 @@ impl TileIndex {
                     "duplicate or stale tile column index {index}"
                 );
                 let col = &columns[index as usize];
-                assert_eq!(tile_key(col.x, col.z), tile.key);
+                assert_eq!(self.tile_key(col.x, col.z), tile.key);
                 expected.include(col);
             }
             assert_eq!(tile.min, expected.min);
@@ -225,5 +242,17 @@ impl TileIndex {
     }
     pub(super) fn tile_count(&self) -> usize {
         self.tiles.len()
+    }
+    /// Lower-bound size estimate for this index's explicit storage. Excludes
+    /// the hash table allocator/control bytes and heap fragmentation.
+    pub(super) fn known_allocated_bytes(&self) -> usize {
+        self.tiles.capacity() * std::mem::size_of::<Tile>()
+            + self
+                .tiles
+                .iter()
+                .map(|t| t.columns.capacity() * std::mem::size_of::<u32>())
+                .sum::<usize>()
+            + self.lookup.capacity()
+                * (std::mem::size_of::<(i32, i32)>() + std::mem::size_of::<u32>())
     }
 }

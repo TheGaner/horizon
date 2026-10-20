@@ -9,6 +9,8 @@ use glam::{DVec3, Vec3};
 #[cfg(test)]
 mod tile_tests;
 #[cfg(test)]
+mod tile_width_tests;
+#[cfg(test)]
 mod tiled;
 
 /// One chunk column's resident sections.
@@ -77,7 +79,7 @@ impl<T> Resident<T> {
         self.column_index.clear();
         #[cfg(test)]
         if let Some(index) = &mut self.tiled_index {
-            *index = tiled::TileIndex::default();
+            index.clear();
         }
     }
     /// Adds or replaces `key`'s value.
@@ -224,7 +226,11 @@ fn in_frustum(key: SectionKey, camera: DVec3, frustum: &Frustum) -> Option<(f64,
 impl<T> Resident<T> {
     #[cfg(test)]
     fn enable_tiled_index(&mut self) {
-        self.tiled_index = Some(tiled::TileIndex::from_columns(&self.columns));
+        self.enable_tiled_index_with_width(8);
+    }
+    #[cfg(test)]
+    fn enable_tiled_index_with_width(&mut self, width: i32) {
+        self.tiled_index = Some(tiled::TileIndex::from_columns(&self.columns, width));
     }
     #[cfg(test)]
     fn visible_tiled(
