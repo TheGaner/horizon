@@ -6084,6 +6084,7 @@ impl Game<'_> {
             }
         }
         // Block entities (BlockEntityRenderers): chests, shulker boxes, banners, skulls...
+        let block_entity_span = horizon_client::spans::scope("block_entity_geometry");
         if let Some(r) = &self.renderer {
             let lid = |p: [i32; 3]| self.chest_lid(p, alpha as f32);
             let anim = |p: [i32; 3]| self.block_anim(p, alpha as f32);
@@ -6164,6 +6165,7 @@ impl Game<'_> {
                     .render_breaking(&scene, mining.pos, state.0, &mut out);
             }
         }
+        drop(block_entity_span);
         // Experience orbs (ExperienceOrbRenderer): pulsing billboards from a 4x4 icon sheet.
         if let Some(r) = self
             .gui
@@ -10614,11 +10616,7 @@ impl ApplicationHandler for Game<'_> {
                         let cpu = now.elapsed().saturating_sub(r.last_wait).as_secs_f32() * 1000.0;
                         let spans = horizon_client::spans::take();
                         if cpu > threshold {
-                            let list: Vec<String> = spans
-                                .iter()
-                                .filter(|(_, ms)| *ms >= 0.5)
-                                .map(|(n, ms)| format!("{n} {ms:.1}"))
-                                .collect();
+                            let list = horizon_client::spans::describe(&spans, threshold <= 0.0);
                             log::info!(
                                 "Horizon: slow frame {cpu:.1} ms ({} ticks): {}",
                                 steps,

@@ -29,6 +29,50 @@ pub fn time<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     SPANS.with(|s| s.borrow_mut().push((name, ms)));
     out
 }
+/// A non-borrowing named timing scope. Unlike wrapping a large block in a
+/// closure, it can be dropped at a chosen point without changing local
+/// variable lifetimes, `?` propagation or frame-render execution order.
+/// Disabled scopes make no clock reads and do not allocate.
+#[must_use = "keep the scope alive until the operation ends"]
+pub struct Scope {
+    name: &'static str,
+    started: Option<Instant>,
+}
+
+#[inline]
+pub fn scope(name: &'static str) -> Scope {
+    Scope {
+        name,
+        started: ENABLED.load(Ordering::Relaxed).then(Instant::now),
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            let ms = started.elapsed().as_secs_f32() * 1000.0;
+            SPANS.with(|spans| spans.borrow_mut().push((self.name, ms)));
+        }
+    }
+}
+
+/// Text for the slow-frame log. By default small spans are suppressed for
+/// readability. `HORIZON_SPIKES=0` opts into every frame and sub-ms timings
+/// when investigating inexpensive draw-list or upload stages.
+pub fn describe(spans: &[(&'static str, f32)], all: bool) -> Vec<String> {
+    spans
+        .iter()
+        .filter(|(_, ms)| all || *ms >= 0.5)
+        .map(|(name, ms)| {
+            if all {
+                format!("{name} {ms:.3}")
+            } else {
+                format!("{name} {ms:.1}")
+            }
+        })
+        .collect()
+}
+
 /// The CPU time this thread has used, where the platform tells it: a tick
 /// with more wall time than CPU time waited (for a lock, or for a core on a
 /// busy machine).
@@ -57,6 +101,34 @@ pub fn take() -> Vec<(&'static str, f32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn detailed_log_preserves_submillisecond_measurements() {
+        let spans = [("draw_list", 0.0034), ("tick", 3.4)];
+        assert_eq!(super::describe(&spans, false), ["tick 3.4"]);
+        assert_eq!(
+            super::describe(&spans, true),
+            ["draw_list 0.003", "tick 3.400"]
+        );
+    }
+
+    /// RAII instrumentation records the named span on the current thread
+    /// without requiring the global debug switch to be toggled during tests.
+    #[test]
+    fn scope_records_on_drop_in_its_thread() {
+        let _ = super::take();
+        let clock = std::time::Instant::now();
+        let span = super::Scope {
+            name: "scope_regression",
+            started: Some(clock),
+        };
+        assert!(super::take().is_empty());
+        drop(span);
+        let values = super::take();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].0, "scope_regression");
+        assert!(values[0].1 >= 0.0);
+    }
+
     /// The thread's CPU clock moves with work done on it, not with time
     /// spent asleep.
     #[cfg(unix)]

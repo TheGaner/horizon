@@ -2911,6 +2911,7 @@ impl Renderer {
                 mapped_at_creation: false,
             });
         }
+        let draw_list_span = crate::spans::scope("draw_list");
         self.origins.clear();
         self.origins.extend(
             visible
@@ -2983,12 +2984,14 @@ impl Renderer {
             });
         }
         let phase1_draws = self.draws.len() as u32;
+        drop(draw_list_span);
         self.draws.extend_from_slice(&self.phase2_draws);
         self.draw_pages.extend_from_slice(&self.phase2_pages);
         let culling = cull.is_some();
         let solid_draws = self.draws.len() as u32;
         // LevelRenderer: nearby sections each frame, plus a rotating eighth
         // (at least 15) of the visible list. Cached views avoid needless sorts.
+        let translucent_list_span = crate::spans::scope("translucent_list");
         self.translucent_draws.clear();
         let count = visible.len() + visible_lods.len();
         let budget = (count / 8).max(15).min(count);
@@ -3095,6 +3098,7 @@ impl Renderer {
         } else {
             self.draws.len()
         };
+        drop(translucent_list_span);
         let debug_depth = frame.debug_lines.len() as u32;
         let debug_top = frame.debug_lines_on_top.len() as u32;
         let crosshair = frame.debug_crosshair.len() as u32;
@@ -3303,12 +3307,14 @@ impl Renderer {
                     mapped_at_creation: false,
                 });
             }
-            self.uploads.buffer(
-                &mut encoder,
-                &self.indirect,
-                0,
-                bytemuck::cast_slice(&self.draws),
-            );
+            crate::spans::time("indirect_upload_cpu", || {
+                self.uploads.buffer(
+                    &mut encoder,
+                    &self.indirect,
+                    0,
+                    bytemuck::cast_slice(&self.draws),
+                );
+            });
             if culling && let Some(cull) = &mut self.cull {
                 cull.upload(
                     &self.device,
