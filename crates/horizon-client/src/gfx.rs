@@ -3929,6 +3929,51 @@ impl Frustum {
             p.truncate().dot(v) + p.w < 0.0
         })
     }
+    /// Determine which planes still need testing for sections inside the
+    /// column AABB. `None` rejects the whole column; a zero mask means
+    /// every nested box is fully inside. Plane normals are unit-length.
+    /// The 1-block clearance guards against f32 edge rounding.
+    #[inline]
+    fn column_clip_mask(&self, min: Vec3, max: Vec3) -> Option<u8> {
+        let mut mask = 0u8;
+        for (index, p) in self.planes.iter().enumerate() {
+            let positive = Vec3::new(
+                if p.x >= 0.0 { max.x } else { min.x },
+                if p.y >= 0.0 { max.y } else { min.y },
+                if p.z >= 0.0 { max.z } else { min.z },
+            );
+            if p.truncate().dot(positive) + p.w < 0.0 {
+                return None;
+            }
+            let negative = Vec3::new(
+                if p.x >= 0.0 { min.x } else { max.x },
+                if p.y >= 0.0 { min.y } else { max.y },
+                if p.z >= 0.0 { min.z } else { max.z },
+            );
+            if p.truncate().dot(negative) + p.w < 1.0 {
+                mask |= 1 << index;
+            }
+        }
+        Some(mask)
+    }
+    /// Test only the frustum planes that may intersect the containing column.
+    #[inline]
+    fn intersects_masked(&self, min: Vec3, max: Vec3, mut mask: u8) -> bool {
+        while mask != 0 {
+            let index = mask.trailing_zeros() as usize;
+            mask &= mask - 1;
+            let p = &self.planes[index];
+            let positive = Vec3::new(
+                if p.x >= 0.0 { max.x } else { min.x },
+                if p.y >= 0.0 { max.y } else { min.y },
+                if p.z >= 0.0 { max.z } else { min.z },
+            );
+            if p.truncate().dot(positive) + p.w < 0.0 {
+                return false;
+            }
+        }
+        true
+    }
 }
 /// Vanilla's `Projection`: reversed depth (near maps to 1, far to 0, tests
 /// are GREATER_THAN_OR_EQUAL), which keeps far faces a hair apart, like

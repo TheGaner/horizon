@@ -211,15 +211,30 @@ impl<T> Resident<T> {
             }
             let min = origin((column.x, column.low, column.z), camera).as_vec3();
             let top = origin((column.x, column.high, column.z), camera).as_vec3();
-            if !frustum.intersects(min, top + Vec3::splat(16.0)) {
+            let max = top + Vec3::splat(16.0);
+            let Some(clip_mask) = frustum.column_clip_mask(min, max) else {
                 continue;
-            }
+            };
             for &(y, slot) in &column.sections {
                 let key = (column.x, y, column.z);
                 if near && !reachable(key) {
                     continue;
                 }
-                if let Some((d, o)) = in_frustum(key, camera, frustum) {
+                // Only planes intersecting the column can reject a section;
+                // leave all other rules and f64 distance arithmetic intact.
+                let visibility = if clip_mask == 0 {
+                    let rel = origin(key, camera);
+                    Some(((rel + DVec3::splat(8.0)).length_squared(), rel.as_vec3()))
+                } else if clip_mask == 0b11_1111 {
+                    in_frustum(key, camera, frustum)
+                } else {
+                    let rel = origin(key, camera);
+                    let pos = rel.as_vec3();
+                    frustum
+                        .intersects_masked(pos, pos + Vec3::splat(16.0), clip_mask)
+                        .then(|| ((rel + DVec3::splat(8.0)).length_squared(), pos))
+                };
+                if let Some((d, o)) = visibility {
                     out.push(Visible {
                         distance: d.to_bits(),
                         key,
@@ -347,6 +362,167 @@ mod tests {
         r.clear();
         assert_eq!(r.len(), 0);
         assert!(r.columns.is_empty());
+    }
+
+    /// Thousands of changing section/camera combinations against the
+    /// reference implementation that always tests every section box. The
+    /// reference computes identical distance bits, slot and origin values.
+    #[test]
+    fn fully_contained_columns_match_individual_section_tests_with_churn() {
+        let mut r: Resident<u32> = Resident::default();
+        for x in -12i32..=12 {
+            for z in -12i32..=12 {
+                for y in 0..24 {
+                    if (x * 7 + y * 3 + z * 5).rem_euclid(5) != 0 {
+                        r.insert((x, y, z), (x ^ y ^ z) as u32);
+                    }
+                }
+            }
+        }
+        for i in 0i32..180 {
+            // Mutate an existing section near the camera each step: the
+            // dense slot table can swap its final occupant into the hole.
+            let key = (i * 7 % 23 - 11, i * 3 % 24, i * 13 % 23 - 11);
+            if i % 3 == 0 {
+                r.remove(key);
+            } else {
+                r.insert(key, i as u32);
+            }
+            let camera = DVec3::new(
+                f64::from(i * 17 % 181 - 90) + 0.25,
+                f64::from(i * 23 % 280 - 70) + 0.75,
+                f64::from(i * 31 % 181 - 90) + 0.5,
+            );
+            let yaw = (i * 71 % 360) as f32;
+            let pitch = (i * 43 % 160 - 80) as f32;
+            let projection = super::super::world_projection(70.0, 16.0 / 9.0, 1100.0);
+            let frustum = Frustum {
+                planes: super::super::frustum(projection * crate::camera::view_matrix(yaw, pitch)),
+            };
+            let reachable = |key: SectionKey| (key.0 + 3 * key.1 - key.2 + i).rem_euclid(11) != 0;
+            let beyond = |x: i32, z: i32| (x * 3 + z + i).rem_euclid(13) == 0;
+            for radius in [2, 8, 16] {
+                let mut actual = Vec::new();
+                r.visible(camera, radius, &frustum, reachable, beyond, &mut actual);
+                let mut expected = Vec::new();
+                for (slot, (key, _)) in r.items.iter().enumerate() {
+                    let near = in_view_distance(camera_column(camera), radius, key.0, key.2);
+                    if (near && !reachable(*key)) || (!near && !beyond(key.0, key.2)) {
+                        continue;
+                    }
+                    if let Some((distance, rel)) = in_frustum(*key, camera, &frustum) {
+                        expected.push(Visible {
+                            distance: distance.to_bits(),
+                            key: *key,
+                            slot: slot as u32,
+                            origin: rel.to_array(),
+                        });
+                    }
+                }
+                expected.sort_unstable_by_key(|v| (v.distance, v.key));
+                assert_eq!(
+                    actual, expected,
+                    "case={i} radius={radius}, yaw={yaw} pitch={pitch}"
+                );
+            }
+        }
+    }
+
+    /// Same-process A/B benchmark against the original column-frustum loop.
+    /// Never use this as a claim of whole-game FPS improvement.
+    #[test]
+    #[ignore = "CPU timing: run separately with --profile fast and --nocapture"]
+    fn column_inside_fast_path_speed() {
+        use std::{hint::black_box, time::Instant};
+        let mut r: Resident<u32> = Resident::default();
+        for x in -33i32..=33 {
+            for z in -33i32..=33 {
+                for y in 0..24 {
+                    if (x * 7 + y * 3 + z * 5).rem_euclid(4) != 0 {
+                        r.insert((x, y, z), (x ^ y ^ z) as u32);
+                    }
+                }
+            }
+        }
+        let projection = super::super::world_projection(70.0, 16.0 / 9.0, 1100.0);
+        let camera = DVec3::new(8.5, 100.0, 8.5);
+        for (name, yaw, pitch, radius) in [
+            ("meadow_rd16", 20.0, 15.0, 16),
+            ("meadow_rd32", 20.0, 15.0, 32),
+            ("peak_rd32", 65.0, -40.0, 32),
+            ("top_down_rd32", 30.0, 85.0, 32),
+        ] {
+            let frustum = Frustum {
+                planes: super::super::frustum(projection * crate::camera::view_matrix(yaw, pitch)),
+            };
+            let old = |out: &mut Vec<Visible>| {
+                out.clear();
+                let from = camera_column(camera);
+                for c in &r.columns {
+                    if !in_view_distance(from, radius, c.x, c.z) {
+                        continue;
+                    }
+                    let min = origin((c.x, c.low, c.z), camera).as_vec3();
+                    let top = origin((c.x, c.high, c.z), camera).as_vec3();
+                    if !frustum.intersects(min, top + Vec3::splat(16.0)) {
+                        continue;
+                    }
+                    for &(y, slot) in &c.sections {
+                        let key = (c.x, y, c.z);
+                        if let Some((dist, o)) = in_frustum(key, camera, &frustum) {
+                            out.push(Visible {
+                                distance: dist.to_bits(),
+                                key,
+                                slot,
+                                origin: o.to_array(),
+                            });
+                        }
+                    }
+                }
+                out.sort_unstable_by_key(|v| (v.distance, v.key));
+            };
+            let mut fast = Vec::new();
+            let mut reference = Vec::new();
+            for _ in 0..6 {
+                old(&mut reference);
+                fast.clear();
+                r.visible(camera, radius, &frustum, |_| true, |_, _| false, &mut fast);
+            }
+            assert_eq!(fast, reference, "reference/fast mismatch for {name}");
+            let mut base_samples = Vec::new();
+            let mut fast_samples = Vec::new();
+            for k in 0..24 {
+                let first_fast = k % 2 == 0;
+                for is_fast in [first_fast, !first_fast] {
+                    let t = Instant::now();
+                    if is_fast {
+                        for _ in 0..3 {
+                            fast.clear();
+                            r.visible(camera, radius, &frustum, |_| true, |_, _| false, &mut fast);
+                            black_box(fast.len());
+                        }
+                        fast_samples.push(t.elapsed().as_secs_f64() * 1e6 / 3.0);
+                    } else {
+                        for _ in 0..3 {
+                            old(&mut reference);
+                            black_box(reference.len());
+                        }
+                        base_samples.push(t.elapsed().as_secs_f64() * 1e6 / 3.0);
+                    }
+                }
+            }
+            base_samples.sort_by(f64::total_cmp);
+            fast_samples.sort_by(f64::total_cmp);
+            assert_eq!(fast, reference);
+            let baseline_us = base_samples[12];
+            let candidate_us = fast_samples[12];
+            println!(
+                "culling_ab,{name},radius={radius},resident={},visible={},baseline_us={baseline_us:.3},candidate_us={candidate_us:.3},speedup={:.3}",
+                r.len(),
+                fast.len(),
+                baseline_us / candidate_us,
+            );
+        }
     }
 
     /// The old walk (every key of a hash map, sorted by distance, then two
