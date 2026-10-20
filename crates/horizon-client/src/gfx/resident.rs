@@ -630,6 +630,177 @@ mod tests {
         }
     }
 
+    /// Research proxy for #987: group existing chunk columns into larger
+    /// X/Z cells and reject the whole tile by its tight frustum AABB before
+    /// visiting contained columns. Built only in the ignored benchmark: this
+    /// is NOT a dynamic octree or a proposed production data structure.
+    #[test]
+    #[ignore = "CPU timing / hierarchy research, not a normal regression test"]
+    fn tiled_column_hierarchy_speed() {
+        use std::{collections::BTreeMap, hint::black_box, time::Instant};
+        struct Tile {
+            min: (i32, i32, i32),
+            max: (i32, i32, i32),
+            columns: Vec<usize>,
+        }
+        let mut r: Resident<()> = Resident::default();
+        for x in -33i32..=33 {
+            for z in -33i32..=33 {
+                for y in 0..24 {
+                    if (x * 7 + y * 3 + z * 5).rem_euclid(4) != 0 {
+                        r.insert((x, y, z), ());
+                    }
+                }
+            }
+        }
+        let camera = DVec3::new(8.5, 100.0, 8.5);
+        let project = super::super::world_projection(70.0, 16.0 / 9.0, 1100.0);
+        for width in [4, 8, 16] {
+            let build_at = Instant::now();
+            let mut cells = BTreeMap::<(i32, i32), Vec<usize>>::new();
+            for (i, c) in r.columns.iter().enumerate() {
+                cells
+                    .entry((c.x.div_euclid(width), c.z.div_euclid(width)))
+                    .or_default()
+                    .push(i);
+            }
+            let tiles: Vec<Tile> = cells
+                .into_values()
+                .map(|columns| {
+                    let mut bounds = Tile {
+                        min: (i32::MAX, i32::MAX, i32::MAX),
+                        max: (i32::MIN, i32::MIN, i32::MIN),
+                        columns,
+                    };
+                    for &i in &bounds.columns {
+                        let c = &r.columns[i];
+                        bounds.min.0 = bounds.min.0.min(c.x);
+                        bounds.min.1 = bounds.min.1.min(c.low);
+                        bounds.min.2 = bounds.min.2.min(c.z);
+                        bounds.max.0 = bounds.max.0.max(c.x);
+                        bounds.max.1 = bounds.max.1.max(c.high);
+                        bounds.max.2 = bounds.max.2.max(c.z);
+                    }
+                    bounds
+                })
+                .collect();
+            let build_us = build_at.elapsed().as_secs_f64() * 1e6;
+            for (name, yaw, pitch, radius) in [
+                ("meadow_rd16", 20.0, 15.0, 16),
+                ("meadow_rd32", 20.0, 15.0, 32),
+                ("peak_rd32", 65.0, -40.0, 32),
+                ("top_down_rd32", 30.0, 85.0, 32),
+            ] {
+                let frustum = Frustum {
+                    planes: super::super::frustum(project * crate::camera::view_matrix(yaw, pitch)),
+                };
+                let from = camera_column(camera);
+                let mask = frustum.masks_help_for_view();
+                let mut tiled = Vec::<Visible>::new();
+                let mut base = Vec::<Visible>::new();
+                let tiled_walk = |out: &mut Vec<Visible>| {
+                    out.clear();
+                    for tile in &tiles {
+                        let min = origin(tile.min, camera).as_vec3();
+                        let max = origin(tile.max, camera).as_vec3() + Vec3::splat(16.0);
+                        if !frustum.intersects(min, max) {
+                            continue;
+                        }
+                        for &idx in &tile.columns {
+                            let c = &r.columns[idx];
+                            if !in_view_distance(from, radius, c.x, c.z) {
+                                continue;
+                            }
+                            let min = origin((c.x, c.low, c.z), camera).as_vec3();
+                            let max =
+                                origin((c.x, c.high, c.z), camera).as_vec3() + Vec3::splat(16.0);
+                            let Some(clip_mask) = (if mask {
+                                frustum.column_clip_mask(min, max)
+                            } else {
+                                frustum.intersects(min, max).then_some(0b11_1111)
+                            }) else {
+                                continue;
+                            };
+                            for &(y, slot) in &c.sections {
+                                let key = (c.x, y, c.z);
+                                let visibility = if clip_mask == 0 {
+                                    let rel = origin(key, camera);
+                                    Some((
+                                        (rel + DVec3::splat(8.0)).length_squared(),
+                                        rel.as_vec3(),
+                                    ))
+                                } else if clip_mask == 0b11_1111 {
+                                    in_frustum(key, camera, &frustum)
+                                } else {
+                                    let rel = origin(key, camera);
+                                    let pos = rel.as_vec3();
+                                    frustum
+                                        .intersects_masked(pos, pos + Vec3::splat(16.0), clip_mask)
+                                        .then(|| ((rel + DVec3::splat(8.0)).length_squared(), pos))
+                                };
+                                if let Some((dist, rel)) = visibility {
+                                    out.push(Visible {
+                                        distance: dist.to_bits(),
+                                        key,
+                                        slot,
+                                        origin: rel.to_array(),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    out.sort_unstable_by_key(|v| (v.distance, v.key));
+                };
+                for _ in 0..5 {
+                    base.clear();
+                    r.visible(camera, radius, &frustum, |_| true, |_, _| false, &mut base);
+                    tiled_walk(&mut tiled);
+                }
+                assert_eq!(tiled, base, "tile={width} scene={name}");
+                let mut baseline = Vec::new();
+                let mut candidate = Vec::new();
+                for k in 0..24 {
+                    for test_tile in [k % 2 == 0, k % 2 != 0] {
+                        let before = Instant::now();
+                        if test_tile {
+                            for _ in 0..3 {
+                                tiled_walk(&mut tiled);
+                                black_box(tiled.len());
+                            }
+                            candidate.push(before.elapsed().as_secs_f64() * 1e6 / 3.0);
+                        } else {
+                            for _ in 0..3 {
+                                base.clear();
+                                r.visible(
+                                    camera,
+                                    radius,
+                                    &frustum,
+                                    |_| true,
+                                    |_, _| false,
+                                    &mut base,
+                                );
+                                black_box(base.len());
+                            }
+                            baseline.push(before.elapsed().as_secs_f64() * 1e6 / 3.0);
+                        }
+                    }
+                }
+                baseline.sort_by(f64::total_cmp);
+                candidate.sort_by(f64::total_cmp);
+                assert_eq!(tiled, base);
+                let original_us = baseline[12];
+                let tiled_us = candidate[12];
+                println!(
+                    "culling_tiles,{name},tile={width},groups={},build_us={build_us:.3},resident={},visible={},original_us={original_us:.3},tiled_us={tiled_us:.3},speedup={:.3}",
+                    tiles.len(),
+                    r.len(),
+                    base.len(),
+                    original_us / tiled_us,
+                );
+            }
+        }
+    }
+
     /// The old walk (every key of a hash map, sorted by distance, then two
     /// lookups per visible section) against `visible` on a render distance
     /// 32 world. Run with `cargo test --profile fast -p horizon-client --lib
