@@ -95,11 +95,7 @@ impl Uploads {
 mod tests {
     use super::*;
 
-    fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        pollster::block_on(adapter.request_device(&Default::default())).ok()
-    }
+    use super::super::test_device::device;
 
     /// Every mip level of one layer, read back as tightly packed RGBA8.
     fn read_back(device: &wgpu::Device, queue: &wgpu::Queue, texture: &wgpu::Texture) -> Vec<u8> {

@@ -67,6 +67,8 @@ mod occlusion;
 mod pack_stages;
 pub mod panorama;
 mod resident;
+#[cfg(test)]
+mod test_device;
 mod timing;
 pub mod translucency;
 pub(crate) mod upload;

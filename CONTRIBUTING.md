@@ -20,6 +20,29 @@ cargo run --release -p horizon-client
 
 The launcher is its own Cargo workspace in `launcher/` (`cd launcher && cargo run`; on NixOS, `nix-shell` first).
 
+## GPU-backed renderer tests
+
+The native renderer unit tests share one lazily initialized wgpu Instance and
+adapter, but request independent devices and queues for each test. This avoids
+concurrent Vulkan driver discovery during the test run without forcing tests
+to run serially. Run them at the normal test-thread concurrency:
+
+```sh
+cargo test --locked -p horizon-client --lib
+```
+
+Headless CI runners without a usable adapter skip GPU-specific tests. On a
+runner intended to *exercise* those tests, require an adapter and device:
+
+```sh
+HORIZON_REQUIRE_GPU_TESTS=1 cargo test --locked -p horizon-client --lib -- --test-threads=8
+```
+
+Use `-- --nocapture` for a targeted GPU test to see the selected adapter.
+A software adapter such as llvmpipe **counts** as a Vulkan adapter; requiring
+an adapter does not prove the test ran on a physical GPU. Validate with a
+physical GPU separately when investigating driver-specific problems.
+
 ## Vanilla first
 
 Wherever vanilla has a feature, vanilla is the specification, down to the order of random calls. "Parity" here

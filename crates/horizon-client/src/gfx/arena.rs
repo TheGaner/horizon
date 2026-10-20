@@ -285,22 +285,7 @@ fn try_create(device: &wgpu::Device, size: u64, usage: wgpu::BufferUsages) -> Op
 mod tests {
     use super::*;
 
-    fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        device_with(wgpu::Features::empty())
-    }
-
-    /// A device with those of `features` the adapter has.
-    fn device_with(features: wgpu::Features) -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        eprintln!("arena GPU regression: {}", adapter.get_info().name);
-        let required_features = adapter.features() & features;
-        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features,
-            ..Default::default()
-        }))
-        .ok()
-    }
+    use super::super::test_device::{device, device_with};
 
     /// `Arena::alloc`, with the copies of a grow submitted at once.
     fn alloc(
