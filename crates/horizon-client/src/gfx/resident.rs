@@ -7,6 +7,8 @@ use crate::{fast_hash::FxHashMap, streaming::in_view_distance};
 use glam::{DVec3, Vec3};
 
 #[cfg(test)]
+mod sort_tests;
+#[cfg(test)]
 mod tile_tests;
 #[cfg(test)]
 mod tile_width_tests;
@@ -258,7 +260,52 @@ impl<T> Resident<T> {
     /// lies inside it and the frustum test rounds monotonically, so a column
     /// the frustum rejects holds no section it would accept. `radius` is the
     /// render distance in chunks.
+    #[cfg(test)]
     pub fn visible(
+        &self,
+        camera: DVec3,
+        radius: i32,
+        frustum: &Frustum,
+        reachable: impl Fn(SectionKey) -> bool,
+        beyond: impl Fn(i32, i32) -> bool,
+        out: &mut Vec<Visible>,
+    ) {
+        crate::spans::time("visibility_collect", || {
+            self.gather_visible(camera, radius, frustum, reachable, beyond, out);
+        });
+        // Stable deterministic distance/key order is a renderer contract:
+        // upload origins and indirect draw records consume this same order.
+        crate::spans::time("visibility_sort", || {
+            out.sort_unstable_by_key(|v| (v.distance, v.key));
+        });
+    }
+
+    /// Identical visible-set semantics as `visible`, but the caller supplies
+    /// a scratch vector to reuse across large-frame radix sorting. This avoids
+    /// malloc/free and keeps the small-frame comparison-sort fast path.
+    pub fn visible_with_sort_scratch(
+        &self,
+        camera: DVec3,
+        radius: i32,
+        frustum: &Frustum,
+        reachable: impl Fn(SectionKey) -> bool,
+        beyond: impl Fn(i32, i32) -> bool,
+        out: &mut Vec<Visible>,
+        scratch: &mut Vec<Visible>,
+    ) {
+        crate::spans::time("visibility_collect", || {
+            self.gather_visible(camera, radius, frustum, reachable, beyond, out);
+        });
+        crate::spans::time("visibility_sort", || {
+            sort_visible_adaptive(out, scratch);
+        });
+    }
+
+    /// Append the original per-column culling output without reordering.
+    /// Keeping this method separate permits exact per-stage benchmarking and
+    /// low-overhead optional `HORIZON_SPIKES` timing in actual game frames.
+    #[inline]
+    fn gather_visible(
         &self,
         camera: DVec3,
         radius: i32,
@@ -316,7 +363,67 @@ impl<T> Resident<T> {
                 }
             }
         }
-        out.sort_unstable_by_key(|v| (v.distance, v.key));
+    }
+}
+
+/// Sort by the **exact** existing (distance-bits, signed section-key) key.
+/// The stable LSD radix passes group equal distances, which are then sorted
+/// using Rust's original unstable key comparator. Scratch memory is reusable
+/// between frames and is owned by the renderer, never the world sections.
+///
+/// `Visible` is trivially Copy; after an even/odd number of radix passes the
+/// scratch buffers may exchange allocations, but the sorted result always
+/// ends in `values`. No allocations occur once scratch capacity is sufficient.
+fn radix_distance_then_key(values: &mut Vec<Visible>, scratch: &mut Vec<Visible>) {
+    if values.len() < 2 {
+        return;
+    }
+    let len = values.len();
+    scratch.resize(len, values[0]);
+    for byte in 0..8u32 {
+        let shift = byte * 8;
+        let mut counts = [0usize; 256];
+        for v in values.iter() {
+            counts[((v.distance >> shift) & 255) as usize] += 1;
+        }
+        if counts.contains(&len) {
+            continue;
+        }
+        let mut next = 0usize;
+        for bucket in &mut counts {
+            let n = *bucket;
+            *bucket = next;
+            next += n;
+        }
+        for &v in values.iter() {
+            let bucket = ((v.distance >> shift) & 255) as usize;
+            scratch[counts[bucket]] = v;
+            counts[bucket] += 1;
+        }
+        std::mem::swap(values, scratch);
+    }
+    let mut start = 0;
+    while start < values.len() {
+        let distance = values[start].distance;
+        let mut end = start + 1;
+        while end < values.len() && values[end].distance == distance {
+            end += 1;
+        }
+        if end - start > 1 {
+            values[start..end].sort_unstable_by_key(|v| v.key);
+        }
+        start = end;
+    }
+}
+
+/// Comparison sort has lower fixed cost on short lists. The optimized A/B
+/// benchmark found radix faster for 1,355+ records, but slower below 600;
+/// 1024 is a conservative crossover, not a visibility semantics boundary.
+fn sort_visible_adaptive(values: &mut Vec<Visible>, scratch: &mut Vec<Visible>) {
+    if values.len() < 1024 {
+        values.sort_unstable_by_key(|v| (v.distance, v.key));
+    } else {
+        radix_distance_then_key(values, scratch);
     }
 }
 

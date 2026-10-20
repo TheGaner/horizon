@@ -399,6 +399,9 @@ pub struct Renderer {
     pub multi_draw: bool,
     /// Per-frame scratch, kept to avoid allocating every frame.
     visible: Vec<resident::Visible>,
+    /// Reusable scratch for the long-list distance radix sort. Short lists
+    /// continue using Rust's ordinary unstable comparison sorting.
+    visible_sort_scratch: Vec<resident::Visible>,
     visible_lods: Vec<lod::Visible>,
     translucent_draws: Vec<(u64, usize, [u32; 5], (u32, Option<u32>))>,
     origins: Vec<[f32; 4]>,
@@ -2068,6 +2071,7 @@ impl Renderer {
             indirect_capacity: 1024,
             multi_draw,
             visible: Vec::new(),
+            visible_sort_scratch: Vec::new(),
             visible_lods: Vec::new(),
             translucent_draws: Vec::new(),
             origins: Vec::new(),
@@ -2887,13 +2891,14 @@ impl Renderer {
         let mut visible = std::mem::take(&mut self.visible);
         visible.clear();
         crate::spans::time("visibility", || {
-            self.sections.visible(
+            self.sections.visible_with_sort_scratch(
                 camera,
                 (frame.detail_distance / 16.0) as i32,
                 &view,
                 |k| !culling || reachable.contains(k),
                 |x, z| !cutout.is_empty() && cutout.contains(&(x, z)),
                 &mut visible,
+                &mut self.visible_sort_scratch,
             )
         });
         let mut visible_lods = std::mem::take(&mut self.visible_lods);
