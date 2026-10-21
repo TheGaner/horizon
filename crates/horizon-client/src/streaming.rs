@@ -365,10 +365,11 @@ impl GenerationScan {
                     wanted.push((input.ranges.distance(x, z), x, z));
                 }
             }
-            // Forced chunks must have a 3x3 resident neighbourhood before
-            // scheduled ticks can start (`ticking_chunk`). Nondecorating
-            // generators use margin=1, but may still contain saved ticks.
-            let reach = (margin - 1).max(1);
+            // A level-31 forced ticket block-ticks its neighbouring chunks
+            // (level 32). Each of those needs a resident 3x3 neighbourhood
+            // (`ticking_chunk`), hence two extra columns from the ticket.
+            // Nondecorating generators need this too.
+            let reach = (margin - 1).max(2);
             for &(fx, fz) in input.ranges.forced {
                 for dz in -reach..=reach {
                     for dx in -reach..=reach {
@@ -1403,9 +1404,10 @@ impl Ranges<'_> {
         if dx * dx + dz * dz <= r * r {
             return true;
         }
-        // A forced chunk needs all eight neighbours even for flat worlds
-        // without decorations, or its saved ticks never become eligible.
-        let reach = (margin - 1).max(1);
+        // A forced level-31 ticket block-ticks its adjacent level-32
+        // chunks too; their 3x3 resident neighbourhood extends two columns
+        // from the forced one, even in nondecorating flat worlds.
+        let reach = (margin - 1).max(2);
         self.forced
             .iter()
             .any(|f| (x - f.0).abs() <= reach && (z - f.1).abs() <= reach)
@@ -1446,9 +1448,9 @@ mod tests {
 
     #[test]
     fn nondecorating_forced_chunk_requests_full_ticking_neighbourhood() {
-        // A real official Java 26.3 frozen command-block chunk with a +1
-        // tick (6,6) must tick on the Horizon server after cold restart.
-        // Missing neighbouring chunks previously blocked `ticking_chunk`.
+        // Java 26.3 level-31 force tickets block-tick all eight neighbouring
+        // chunks. Their 3x3 readiness requires a 5x5 resident area (two
+        // chunks' reach), even in flat worlds without decorations.
         let forced = [(6, 6)].into_iter().collect();
         let ranges = Ranges {
             center: (0, 0),
@@ -1456,14 +1458,16 @@ mod tests {
             extra: &[],
             forced: &forced,
         };
-        for z in 5..=7 {
-            for x in 5..=7 {
+        for z in 4..=8 {
+            for x in 4..=8 {
                 assert!(ranges.requested(x, z, false), "missing ({x},{z})");
                 assert!(ranges.chunk_kept(x, z, false), "dropped ({x},{z})");
                 assert!(!ranges.unloaded(x, z, false), "unloaded ({x},{z})");
             }
         }
-        assert!(!ranges.requested(8, 8, false));
+        // The adjacent block-ticking chunk (7,6) also gets its neighbours.
+        assert!(ranges.requested(8, 7, false));
+        assert!(!ranges.requested(9, 9, false));
     }
 
     #[test]
@@ -1595,9 +1599,9 @@ mod tests {
             }
         }
         for &(fx, fz) in input.ranges.forced {
-            // A loaded forced chunk always needs its eight neighbours to
-            // activate scheduled ticks, including nondecorating flat worlds.
-            let forced_reach = if input.decorates { 2 } else { 1 };
+            // The block-ticking neighbours of a force-loaded chunk each
+            // need their own 3x3 resident neighbourhood, even for flatgen.
+            let forced_reach = 2;
             for dz in -forced_reach..=forced_reach {
                 for dx in -forced_reach..=forced_reach {
                     let (x, z) = (fx + dx, fz + dz);
