@@ -94,6 +94,10 @@ public final class LocatorBarClient {
     private static volatile boolean state;
     /** Only the player-drop oracle enables original-codec item-entity telemetry. */
     private static volatile boolean items;
+    /** Exact entity lifetime observations, opt-in only for source-hashed tests. */
+    private static volatile boolean entityLife;
+    /** Objective and score-reset packets not included in normal state logging. */
+    private static volatile boolean objectiveWire;
     private static final Map<UUID, String> NAMES = new LinkedHashMap<>();
 
     public static void main(String[] args) throws Exception {
@@ -129,8 +133,12 @@ public final class LocatorBarClient {
                     case "chat" -> chat = w[1].equals("on");
                     case "state" -> state = w[1].equals("on");
                     case "items" -> items = w[1].equals("on");
+                    case "entitylife" -> entityLife = w[1].equals("on");
+                    case "objectives" -> objectiveWire = w[1].equals("on");
                     case "drop" -> players.get(w[1]).drop(w[2]);
                     case "throw" -> players.get(w[1]).throwInventorySlot(w[2]);
+                    case "select" -> players.get(w[1]).selectHotbar(Integer.parseInt(w[2]));
+                    case "click" -> players.get(w[1]).clickInventory(w[2]);
                     case "end" -> {
                         try (PrintWriter out = new PrintWriter(Files.newBufferedWriter(output, StandardCharsets.UTF_8))) {
                             for (Player p : players.values()) {
@@ -198,6 +206,9 @@ public final class LocatorBarClient {
         private volatile int inventoryStateId;
         /** Track dropped items by entity id, but never compare the random id. */
         private final java.util.Set<Integer> itemEntities = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        /** Mapped only within one TCP receiver, not between servers/players. */
+        private final Map<Integer, Integer> itemOrdinals = new java.util.HashMap<>();
+        private int nextItemOrdinal;
 
         Player(String name) {
             this.name = name;
@@ -241,19 +252,45 @@ public final class LocatorBarClient {
             record("sent " + mode + " action=" + action.ordinal());
         }
 
-        /** The inventory screen maps Q to THROW button 0 and Ctrl+Q to button 1. */
-        void throwInventorySlot(String mode) throws Exception {
-            byte button = switch (mode) {
+        /** The inventory screen maps Q to THROW button 0 and Ctrl+Q to button 1.
+         * Optional :SLOT tests every menu slot, rather than just hotbar.0.
+         */
+        void throwInventorySlot(String spec) throws Exception {
+            String[] parts = spec.split(":", -1);
+            if (parts.length > 2) throw new IllegalArgumentException("throw spec " + spec);
+            byte button = switch (parts[0]) {
                 case "single" -> 0;
                 case "all" -> 1;
-                default -> throw new IllegalArgumentException("unknown inventory throw kind " + mode);
+                default -> throw new IllegalArgumentException("unknown inventory throw kind " + spec);
             };
+            short slot = (short) (parts.length == 2 ? Integer.parseInt(parts[1]) : 36);
             send(new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(
-                0, inventoryStateId, (short) 36, button,
+                0, inventoryStateId, slot, button,
                 net.minecraft.world.inventory.ContainerInput.THROW,
                 new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>(),
                 net.minecraft.network.HashedStack.EMPTY));
-            record("sent gui " + mode + " button=" + button);
+            record("sent gui " + spec + " button=" + button);
+        }
+
+        /** Uses the 26.3 vanilla codec for hotbar changes; 0..8 is a client slot. */
+        void selectHotbar(int slot) throws Exception {
+            if (slot < 0 || slot > 8) throw new IllegalArgumentException("hotbar " + slot);
+            send(new net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket(slot));
+            record("sent select " + slot);
+        }
+
+        /** General inventory click, 'slot:button:mode' (the real ContainerInput enum). */
+        void clickInventory(String spec) throws Exception {
+            String[] parts = spec.split(":", -1);
+            if (parts.length != 3) throw new IllegalArgumentException("click spec " + spec);
+            short slot = Short.parseShort(parts[0]);
+            byte button = Byte.parseByte(parts[1]);
+            var mode = net.minecraft.world.inventory.ContainerInput.valueOf(parts[2]);
+            send(new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(
+                0, inventoryStateId, slot, button, mode,
+                new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>(),
+                net.minecraft.network.HashedStack.EMPTY));
+            record("sent click " + spec);
         }
 
         void still() throws Exception {
@@ -336,17 +373,43 @@ public final class LocatorBarClient {
                         id = l.playerId();
                     }
                     if (state) recordState(p);
-                    if (items && p instanceof net.minecraft.network.protocol.game.ClientboundAddEntityPacket a
+                    if ((items || entityLife)
+                        && p instanceof net.minecraft.network.protocol.game.ClientboundAddEntityPacket a
                         && a.getType() == net.minecraft.world.entity.EntityTypes.ITEM) {
                         itemEntities.add(a.getId());
-                        record("item-added");
-                    } else if (items && p instanceof net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket d
+                        if (items) record("item-added");
+                        if (entityLife) {
+                            int ordinal = ++nextItemOrdinal;
+                            itemOrdinals.put(a.getId(), ordinal);
+                            record("entity-spawn #" + ordinal);
+                        }
+                    } else if ((items || entityLife)
+                        && p instanceof net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket d
                         && itemEntities.contains(d.id())) {
                         for (var value : d.packedItems()) {
                             if (value.value() instanceof net.minecraft.world.item.ItemStack stack) {
-                                record("item-data " + item(stack));
+                                if (items) record("item-data " + item(stack));
+                                if (entityLife) record("entity-meta #" + itemOrdinals.get(d.id()) + " " + item(stack));
                             }
                         }
+                    }
+                    if (entityLife && p instanceof net.minecraft.network.protocol.game.ClientboundTakeItemEntityPacket take) {
+                        Integer ordinal = itemOrdinals.get(take.getItemId());
+                        if (ordinal != null) record("entity-take #" + ordinal + " count=" + take.getAmount());
+                    }
+                    if (entityLife && p instanceof net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket rm) {
+                        rm.entityIds().forEach(itemId -> {
+                            Integer ordinal = itemOrdinals.remove(itemId);
+                            if (ordinal != null) {
+                                record("entity-remove #" + ordinal);
+                                itemEntities.remove(itemId);
+                            }
+                        });
+                    }
+                    if (objectiveWire && p instanceof net.minecraft.network.protocol.game.ClientboundSetObjectivePacket objective) {
+                        record("objective " + objective.getMethod() + " " + objective.getObjectiveName());
+                    } else if (objectiveWire && p instanceof net.minecraft.network.protocol.game.ClientboundResetScorePacket reset) {
+                        record("reset-score " + reset.owner() + " " + reset.objectiveName());
                     }
                     if (p instanceof net.minecraft.network.protocol.game.ClientboundAddEntityPacket a
                         && a.getType() == net.minecraft.world.entity.EntityTypes.PLAYER) {

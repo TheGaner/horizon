@@ -100,8 +100,35 @@ pub(super) fn scoreboard_network_delta(before: &Scoreboard, after: &Scoreboard) 
             }));
         }
     }
-    for (slot_id, slot) in sb::display_slots().into_iter().enumerate() {
+    // Mojang's ServerScoreboard.stopTrackingObjective emits METHOD_REMOVE
+    // instead of clearing the *final* display reference for an objective
+    // that was deleted. Earlier slots are cleared normally, and hiding an
+    // objective (which still exists) still sends a slot-clear packet.
+    // Its final slot goes away during removeObjective, not via an explicit
+    // setDisplayObjective command. Without this distinction we send extra
+    // `SetDisplayObjective(..., null)` packets on objective deletion.
+    let display_slots = sb::display_slots();
+    let last_removed_slot = tracked_before
+        .difference(&tracked_after)
+        .filter(|name| after.objective(name).is_none())
+        .filter_map(|name| {
+            display_slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| {
+                    before.display.get(*slot) == Some(name) && after.display.get(*slot).is_none()
+                })
+                .map(|(index, _)| (name.to_owned(), index))
+                .last()
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (slot_id, slot) in display_slots.into_iter().enumerate() {
         if before.display.get(&slot) != after.display.get(&slot) {
+            if let Some(name) = before.display.get(&slot)
+                && last_removed_slot.get(name) == Some(&slot_id)
+            {
+                continue;
+            }
             out.push(C::SetDisplayObjective(play::SetDisplayObjective {
                 slot: slot_id as i32,
                 objective: after.display.get(&slot).cloned().unwrap_or_default(),
@@ -130,14 +157,29 @@ pub(super) fn scoreboard_network_delta(before: &Scoreboard, after: &Scoreboard) 
         }
     }
     for (holder, scores) in &before.scores {
-        for objective in scores.keys() {
-            if tracked_before.contains(objective)
-                && tracked_after.contains(objective)
-                && after
-                    .scores
-                    .get(holder)
-                    .is_none_or(|s| !s.contains_key(objective))
-            {
+        let removed: Vec<_> = scores
+            .keys()
+            .filter(|objective| {
+                tracked_before.contains(*objective)
+                    && tracked_after.contains(*objective)
+                    && after
+                        .scores
+                        .get(holder)
+                        .is_none_or(|s| !s.contains_key(*objective))
+            })
+            .collect();
+        // Mojang onPlayerRemoved broadcasts one null-objective reset,
+        // even if the holder had several displayed objectives. Emitting
+        // multiple null resets can incorrectly repeat client UI changes.
+        if !removed.is_empty() && after.scores.get(holder).is_none_or(|s| s.is_empty()) {
+            out.push(C::ResetScore(play::ResetScore {
+                owner: holder.clone(),
+                objective: None,
+            }));
+        } else {
+            // onPlayerScoreRemoved is scoped to the objective while the
+            // holder still has other score entries (including hidden ones).
+            for objective in removed {
                 out.push(C::ResetScore(play::ResetScore {
                     owner: holder.clone(),
                     objective: Some(objective.clone()),
@@ -912,6 +954,78 @@ mod scoreboard_packet_tests {
             .collect();
         assert_eq!(values, [1, 2, 5]);
         assert!(scoreboard_network_delta(&board, &board).is_empty());
+    }
+
+    #[test]
+    fn resetting_last_score_is_holder_wide_but_other_scores_are_objective_scoped() {
+        let mut before = board();
+        before.set_display_objective("sidebar", Some("cbview"));
+        before.set("Alice", "cbview", 5);
+        let mut after = before.clone();
+        after.reset_one("Alice", "cbview");
+        let packets = scoreboard_network_delta(&before, &after);
+        assert!(matches!(packets.as_slice(),
+            [C::ResetScore(p)] if p.owner == "Alice" && p.objective.is_none()));
+        let _ = before.add_objective(
+            "hidden",
+            "dummy",
+            serde_json::json!("hidden"),
+            sb::RenderType::Integer,
+            false,
+            None,
+        );
+        before.set("Alice", "hidden", 1);
+        after = before.clone();
+        after.reset_one("Alice", "cbview");
+        let packets = scoreboard_network_delta(&before, &after);
+        assert!(matches!(packets.as_slice(),
+            [C::ResetScore(p)] if p.owner == "Alice" && p.objective.as_deref() == Some("cbview")));
+    }
+
+    #[test]
+    fn resetting_multiple_tracked_scores_sends_one_holder_wide_reset() {
+        let mut before = board();
+        let _ = before.add_objective(
+            "other",
+            "dummy",
+            serde_json::json!("other"),
+            sb::RenderType::Integer,
+            false,
+            None,
+        );
+        before.set_display_objective("sidebar", Some("cbview"));
+        before.set_display_objective("list", Some("other"));
+        before.set("Alice", "cbview", 4);
+        before.set("Alice", "other", 9);
+        let mut after = before.clone();
+        after.reset_all("Alice");
+        let packets = scoreboard_network_delta(&before, &after);
+        assert!(matches!(packets.as_slice(),
+            [C::ResetScore(p)] if p.owner == "Alice" && p.objective.is_none()));
+    }
+
+    #[test]
+    fn deleting_last_tracked_objective_sends_no_final_display_clear() {
+        let mut before = board();
+        before.set_display_objective("sidebar", Some("cbview"));
+        let mut after = before.clone();
+        after.remove_objective("cbview");
+        let packets = scoreboard_network_delta(&before, &after);
+        assert!(matches!(packets.as_slice(),
+            [C::SetObjective(p)] if p.method == 1 && p.name == "cbview"));
+    }
+
+    #[test]
+    fn deleting_objective_with_two_slots_clears_first_then_removes_it() {
+        let mut before = board();
+        before.set_display_objective("list", Some("cbview"));
+        before.set_display_objective("below_name", Some("cbview"));
+        let mut after = before.clone();
+        after.remove_objective("cbview");
+        let packets = scoreboard_network_delta(&before, &after);
+        assert!(matches!(packets.as_slice(), [
+            C::SetDisplayObjective(clear), C::SetObjective(remove)
+        ] if clear.slot == 0 && clear.objective.is_empty() && remove.method == 1));
     }
 
     #[test]

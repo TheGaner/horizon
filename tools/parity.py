@@ -51,7 +51,11 @@ TARGET = LOCAL / "parity-target"
 PROFILE = {
     "CARGO_PROFILE_RELEASE_LTO": "false",
     "CARGO_PROFILE_RELEASE_CODEGEN_UNITS": "16",
-    "CARGO_PROFILE_RELEASE_INCREMENTAL": "true",
+    # rustc 1.90 release incremental + 16 codegen units can leave an
+    # invalid cross-CGU archive (rust-lld: undefined hidden .llvm symbol)
+    # after a changed Horizon binary. Prefer reproducible nonincremental
+    # probe builds over repeatedly retrying a corrupted multi-GB cache.
+    "CARGO_PROFILE_RELEASE_INCREMENTAL": "false",
     # Probes built in the dev profile keep its overflow checks and debug
     # assertions, but run optimised.
     "CARGO_PROFILE_DEV_OPT_LEVEL": "3",

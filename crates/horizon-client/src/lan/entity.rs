@@ -411,6 +411,16 @@ impl ServerEntity {
                 }));
             }
             self.meta.clone_from(&e.meta);
+        } else if self.tick == 0 && e.kind == "minecraft:item" && !self.meta.is_empty() {
+            // Mojang 26.3 ServerEntity.sendPairingData sends the non-default
+            // item stack on pair, while the ItemEntity's initially dirty
+            // SynchedEntityData is broadcast again on the first following
+            // ServerEntity.sendChanges (packDirty). The second packet is
+            // after the player's slot correction, not in the initial pair.
+            out.push(play::Clientbound::SetEntityData(SetEntityData {
+                id: e.id,
+                values: self.meta.clone(),
+            }));
         }
         if e.attributes != self.attributes {
             let changed = changed_attributes(&e.attributes, &self.attributes);
@@ -798,6 +808,39 @@ mod tests {
         let mut out = Vec::new();
         s.send_changes(e, &Riding::default(), &mut out);
         out
+    }
+
+    #[test]
+    fn item_initial_data_is_paired_then_replayed_once_on_first_update() {
+        let mut e = state(0.0);
+        e.kind = "minecraft:item".into();
+        e.meta = vec![(8, serializer::ITEM_STACK, Value::Item(None))];
+        let mut tracker = added(&e);
+        let mut paired = Vec::new();
+        tracker.pairing(&e, 100, &Riding::default(), &mut paired);
+        assert!(matches!(
+            paired.as_slice(),
+            [
+                play::Clientbound::AddEntity(_),
+                play::Clientbound::SetEntityData(_)
+            ]
+        ));
+        let first = changes(&mut tracker, &e);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|p| matches!(p, play::Clientbound::SetEntityData(_)))
+                .count(),
+            1
+        );
+        let second = changes(&mut tracker, &e);
+        assert_eq!(
+            second
+                .iter()
+                .filter(|p| matches!(p, play::Clientbound::SetEntityData(_)))
+                .count(),
+            0
+        );
     }
 
     #[test]

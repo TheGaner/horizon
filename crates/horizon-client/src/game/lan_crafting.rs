@@ -163,7 +163,15 @@ impl Game<'_> {
         }
         g.craft_result = menu.slot(0).cloned();
         host.play.entry(conn).or_default().crafting.inventory = Some(menu);
-        host.hub.inventory_clicked(conn, p, &self.world, &changed);
+        if p.input != 4 {
+            host.hub.inventory_clicked(conn, p, &self.world, &changed);
+        }
+        // ContainerInput.THROW (Q/Ctrl+Q in the inventory menu): vanilla
+        // pairs the dropped item (AddEntity + item data) before the owner's
+        // changed inventory slot. Spawning happens on the *next* tracker
+        // tick, so answering the click immediately inverts that wire order.
+        // Leave menu_sent dirty for sync_player_state, which runs *after*
+        // track_entities on that same next tick and sends the correction.
         true
     }
 
