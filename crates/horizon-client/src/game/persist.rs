@@ -122,59 +122,17 @@ impl Game<'_> {
             (s.block_ticks.clone(), s.fluid_ticks.clone())
         });
         let loaded = !blocks.is_empty() || !fluids.is_empty();
-        let registered = self
+        if self
             .block_ticks
             .add_chunk(
                 pos,
                 ChunkTicks::from_saved(blocks),
                 ChunkTicks::from_saved(fluids),
             )
-            .is_ok();
-        if registered && loaded {
+            .is_ok()
+            && loaded
+        {
             self.tick_chunks.wait(key);
-        }
-        if registered {
-            // `CommandBlockEntity.loadAdditional` re-arms automatic impulse
-            // blocks when a saved chunk is reconstructed, even without a
-            // pending tick on disk. Read only this chunk's saved block-entity
-            // positions rather than scanning every loaded entity each time.
-            let rearm: Vec<_> = self
-                .world
-                .chunks
-                .get(&key)
-                .and_then(|c| c.saved.as_deref())
-                .map(|saved| {
-                    saved
-                        .block_entity_order
-                        .iter()
-                        .copied()
-                        .filter(|&p| {
-                            let Some(horizon_client::containers::BlockEntity::CommandBlock(block)) =
-                                self.world.block_entities.get(&p)
-                            else {
-                                return false;
-                            };
-                            let registry = self.pack.assets.registry;
-                            let state = self.world.block(p.0, p.1, p.2);
-                            registry
-                                .state(state)
-                                .and_then(|s| {
-                                    horizon_client::command_block::Mode::of_block(&s.name)
-                                })
-                                .is_some_and(|mode| {
-                                    horizon_client::command_block::load_schedules(
-                                        mode,
-                                        block.auto,
-                                        block.powered,
-                                    )
-                                })
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            for p in rearm {
-                self.schedule_command_block_tick(p);
-            }
         }
         // The saved list is consumed: later saves take the scheduler's ticks.
         if loaded && let Some(c) = self.world.chunks.get_mut(&key) {

@@ -201,7 +201,7 @@ impl Game<'_> {
         self.with_level(|b, level, ticks| b.schedule_tick(level, ticks, at, 1));
     }
     /// `CommandBlockEntity.scheduleTick`.
-    pub(super) fn schedule_command_block_tick(&mut self, pos: Pos) {
+    fn schedule_command_block_tick(&mut self, pos: Pos) {
         mark_condition_met(&mut self.world, self.pack.assets.registry, pos);
         self.schedule_command_block(pos);
     }

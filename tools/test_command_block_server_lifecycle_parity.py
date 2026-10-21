@@ -7,7 +7,7 @@ Live headless Mojang dedicated server, not an in-memory oracle:
 - stop the server, relaunch that world; verify the one pending tick dispatched
   and the scoreboard shows one execution, including rich LastOutput;
 - unforce-load the chunk, wait until `execute if loaded` proves it is absent;
-  reload it and verify automatic command blocks schedule a second execution;
+  reload the disk-backed chunk; a saved pending tick may execute again (not unconditional rearming);
 - leave a fully saved real-world .mca NBT fixture for other Horizon readers.
 
 Assertions are about original vanilla Java 26.3 world lifecycle only. The
@@ -15,6 +15,7 @@ comparison against Horizon's actual scheduler/client is a separate gate.
 """
 import hashlib
 import json
+import shutil
 from pathlib import Path
 import re
 import sys
@@ -126,6 +127,12 @@ def main():
         note('frozen_disk_save',{'pending_tick':plain(ticks[0],True),
                                  'region_bytes':path.stat().st_size})
         server.stop();server=None
+        # Retain the exact frozen on-disk world before a pending tick can run.
+        pending_snapshot=world/'pending_tick_snapshot'
+        shutil.copytree(world/'world',pending_snapshot)
+        (pending_snapshot/'session.lock').unlink(missing_ok=True)
+        pending_region=pending_snapshot/'dimensions/minecraft/overworld/region/r.0.0.mca'
+        pending_hash=hashlib.sha256(pending_region.read_bytes()).hexdigest()
 
         server=Vanilla(world,extra=PROPS)
         assert score(server,1)==1
@@ -157,7 +164,7 @@ def main():
             raise AssertionError(f'chunk did not reload after forceload add: {reloaded!r}')
         assert score(server,2)==2
         note('in_process_reload',{'scoreboard_executions':2,
-                                  'automatic_impulse_rearms_on_loading':True})
+                                  'saved_pending_tick_replayed_on_loading':True})
         # A command result alone does not always dirty the owning chunk in
         # vanilla; mark the neighbour as changed before asserting that
         # save-all flush persisted the updated LastOutput/SuccessCount.
@@ -177,7 +184,8 @@ def main():
         lab.write_json(report,{
             'schema':1,'minecraft':lock['minecraft']['version'],'manifest_sha1':lock['minecraft']['manifest_sha1'],
             'steps':details,'region_sha256':hashlib.sha256(path.read_bytes()).hexdigest(),
-            'world_directory':str(world),'source_hashes':hashes,
+            'world_directory':str(world),'pending_tick_world_directory':str(pending_snapshot),
+            'pending_tick_region_sha256':pending_hash,'source_hashes':hashes,
             'scope':'Real official Minecraft Java 26.3 headless ServerLevel freeze/save/stop/restart and in-process chunk unload/reload. Horizon server behavior unverified.'})
         print('PASS official vanilla Java 26.3 live ServerLevel command-block disk scheduler/restart/reload',flush=True)
     finally:

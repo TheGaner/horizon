@@ -6961,6 +6961,11 @@ impl Game<'_> {
             self.level.write(&save_root)?;
         }
         self.load_world_state();
+        // Restore saved objectives before any resident chunk dispatches a
+        // pending block tick. Dedicated servers with no player would leave
+        // this lazy until the first scoreboard command and command blocks
+        // loaded from vanilla regions could execute against an empty board.
+        self.load_scoreboard();
         Ok(())
     }
     /// Streaming and region storage for one dimension of a world.
@@ -7027,6 +7032,7 @@ impl Game<'_> {
                 res.threads(),
             )
         };
+        streaming.forced = horizon_client::save::read_forced_chunks(&save.root)?;
         streaming.radius = self.settings.render_distance;
         streaming.biome_blend = self.settings.biome_blend;
         streaming.smooth_lighting = self.settings.smooth_lighting;
@@ -9068,6 +9074,7 @@ impl Game<'_> {
             self.save.flush();
         }
         self.save_entities(wait)?;
+        horizon_client::save::write_forced_chunks(&self.save.root, &self.streaming.forced)?;
         self.save_raids();
         Ok(())
     }

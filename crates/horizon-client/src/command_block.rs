@@ -191,14 +191,6 @@ pub fn tick_action(mode: Mode, met: bool, conditional: bool) -> Option<bool> {
     }
 }
 
-/// `CommandBlockEntity.loadAdditional` calls `setAutomatic` on an initially
-/// false value. For a command block reloaded from chunk NBT, that schedules a
-/// one-tick update whenever it is automatic, not powered and not a chain.
-/// This happens even if the block already executed before the chunk unloaded.
-pub fn load_schedules(mode: Mode, auto: bool, powered: bool) -> bool {
-    auto && !powered && mode != Mode::Sequence
-}
-
 /// `CommandBlock.tick`: a repeating block ticks again next tick while powered
 /// or always active.
 pub fn repeats(mode: Mode, powered: bool, auto: bool) -> bool {
@@ -295,48 +287,6 @@ mod tests {
             Tag::compound(restored.save()).get("LastOutput"),
             Some(&output)
         );
-    }
-
-    #[test]
-    fn load_rearms_automatic_impulse_once_even_after_execution() {
-        // Measured against a real 26.3 headless ServerLevel: an automatic
-        // impulse executes again after forceload remove -> actual unload ->
-        // forceload add. Restoring a pending tick must not duplicate it.
-        assert!(load_schedules(Mode::Redstone, true, false));
-        assert!(load_schedules(Mode::Auto, true, false));
-        assert!(!load_schedules(Mode::Sequence, true, false));
-        assert!(!load_schedules(Mode::Redstone, true, true));
-        assert!(!load_schedules(Mode::Redstone, false, false));
-        use horizon_core::{
-            position::BlockPos,
-            ticks::{ChunkTicks, SavedTick, ScheduledTick, TickPriority, TickTypeId},
-        };
-        let pos = BlockPos::new(96, 64, 96);
-        let kind = TickTypeId(1);
-        let mut ticks = ChunkTicks::from_saved(vec![SavedTick {
-            kind,
-            pos,
-            delay: 1,
-            priority: TickPriority::Normal,
-        }]);
-        let duplicate = ScheduledTick {
-            kind,
-            pos,
-            trigger_tick: 42,
-            priority: TickPriority::Normal,
-            sub_tick_order: 0,
-        };
-        assert!(
-            !ticks.schedule(duplicate),
-            "saved 1-tick update takes precedence"
-        );
-        assert_eq!(ticks.count(), 1);
-        let mut without_saved = ChunkTicks::from_saved(Vec::new());
-        assert!(
-            without_saved.schedule(duplicate),
-            "loading an auto impulse without a saved tick must arm it"
-        );
-        assert_eq!(without_saved.count(), 1);
     }
 
     #[test]

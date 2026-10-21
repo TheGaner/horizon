@@ -365,8 +365,10 @@ impl GenerationScan {
                     wanted.push((input.ranges.distance(x, z), x, z));
                 }
             }
-            // Forced chunks and their generation neighbourhood.
-            let reach = margin - 1;
+            // Forced chunks must have a 3x3 resident neighbourhood before
+            // scheduled ticks can start (`ticking_chunk`). Nondecorating
+            // generators use margin=1, but may still contain saved ticks.
+            let reach = (margin - 1).max(1);
             for &(fx, fz) in input.ranges.forced {
                 for dz in -reach..=reach {
                     for dx in -reach..=reach {
@@ -1401,7 +1403,9 @@ impl Ranges<'_> {
         if dx * dx + dz * dz <= r * r {
             return true;
         }
-        let reach = (margin - 1).max(0);
+        // A forced chunk needs all eight neighbours even for flat worlds
+        // without decorations, or its saved ticks never become eligible.
+        let reach = (margin - 1).max(1);
         self.forced
             .iter()
             .any(|f| (x - f.0).abs() <= reach && (z - f.1).abs() <= reach)
@@ -1439,6 +1443,28 @@ fn section_indexes(mut bits: u32) -> impl Iterator<Item = i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nondecorating_forced_chunk_requests_full_ticking_neighbourhood() {
+        // A real official Java 26.3 frozen command-block chunk with a +1
+        // tick (6,6) must tick on the Horizon server after cold restart.
+        // Missing neighbouring chunks previously blocked `ticking_chunk`.
+        let forced = [(6, 6)].into_iter().collect();
+        let ranges = Ranges {
+            center: (0, 0),
+            radius: 2,
+            extra: &[],
+            forced: &forced,
+        };
+        for z in 5..=7 {
+            for x in 5..=7 {
+                assert!(ranges.requested(x, z, false), "missing ({x},{z})");
+                assert!(ranges.chunk_kept(x, z, false), "dropped ({x},{z})");
+                assert!(!ranges.unloaded(x, z, false), "unloaded ({x},{z})");
+            }
+        }
+        assert!(!ranges.requested(8, 8, false));
+    }
 
     #[test]
     fn view_distance_is_vanillas_shape() {
@@ -1536,7 +1562,7 @@ mod tests {
         }
     }
 
-    // Original scheduling scan, without snapshot bookkeeping, for differential
+    // Reference scheduling scan, without snapshot bookkeeping, for differential
     // correctness and timing. Keep this independent of the production gate.
     fn baseline_candidates(input: GenerationInputs<'_>, capacity: usize) -> Vec<(i64, i32, i32)> {
         if input.remote || input.generating.len() >= capacity {
@@ -1569,8 +1595,11 @@ mod tests {
             }
         }
         for &(fx, fz) in input.ranges.forced {
-            for dz in -(margin - 1)..=(margin - 1) {
-                for dx in -(margin - 1)..=(margin - 1) {
+            // A loaded forced chunk always needs its eight neighbours to
+            // activate scheduled ticks, including nondecorating flat worlds.
+            let forced_reach = if input.decorates { 2 } else { 1 };
+            for dz in -forced_reach..=forced_reach {
+                for dx in -forced_reach..=forced_reach {
                     let (x, z) = (fx + dx, fz + dz);
                     if missing(x, z) {
                         wanted.push((input.ranges.distance(x, z), x, z));
