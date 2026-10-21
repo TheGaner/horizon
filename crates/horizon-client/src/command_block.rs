@@ -118,8 +118,9 @@ impl CommandBlock {
             condition_met: flag("conditionMet", false),
         }
     }
-    /// `CommandBlockEntity.saveAdditional`. The last output is written as a
-    /// plain string component.
+    /// `CommandBlockEntity.saveAdditional`. Text is encoded with the vanilla
+    /// component codec: plain literals are NBT strings, styled/rich text
+    /// remains an NBT compound or list rather than losing its formatting.
     pub fn save(&self) -> Vec<(&'static str, Tag)> {
         let mut out = vec![
             ("Command", Tag::String(self.command.as_str().into())),
@@ -132,7 +133,10 @@ impl CommandBlock {
         if self.track_output
             && let Some(last) = &self.last_output
         {
-            out.push(("LastOutput", Tag::String(last.plain().as_str().into())));
+            out.push((
+                "LastOutput",
+                crate::scoreboard::component_tag(&last.component()),
+            ));
         }
         out.push((
             "UpdateLastExecution",
@@ -252,5 +256,25 @@ mod tests {
         let tag = Tag::compound(quiet.save());
         assert!(tag.get("LastOutput").is_none() && tag.get("LastExecution").is_none());
         assert_eq!(CommandBlock::load(&tag).last_output, None);
+    }
+
+    #[test]
+    fn styled_last_output_survives_nbt_roundtrip() {
+        let command = CommandBlock {
+            last_output: Some(Text::colored("Error", crate::text::RED)),
+            ..CommandBlock::default()
+        };
+        let saved = Tag::compound(command.save());
+        let expected = Tag::compound([
+            ("color", Tag::String("red".into())),
+            ("text", Tag::String("Error".into())),
+        ]);
+        assert_eq!(saved.get("LastOutput"), Some(&expected));
+        let restored = CommandBlock::load(&saved);
+        assert_eq!(restored.last_output_string(), "Error");
+        assert_eq!(
+            Tag::compound(restored.save()).get("LastOutput"),
+            Some(&expected)
+        );
     }
 }
