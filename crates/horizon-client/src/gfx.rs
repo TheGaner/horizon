@@ -60,6 +60,8 @@ pub fn outline_vertices(edges: &[[f64; 6]], camera: glam::DVec3) -> Vec<[f32; 6]
 
 mod arena;
 mod cull;
+#[cfg(test)]
+mod draw_list_tests;
 mod flat;
 mod java_stages;
 mod lod;
@@ -2398,6 +2400,9 @@ impl Renderer {
         first: u32,
         count: u32,
     ) {
+        // Includes only section draw command recording, not encoder.finish
+        // or GPU execution. Multiple passes are summed in a frame.
+        let _draw_encode_span = crate::spans::scope("draw_sections_encode_cpu");
         let (mut i, end) = (first as usize, (first + count) as usize);
         while i < end {
             let (page, index_page) = self.draw_pages[i];
@@ -2926,6 +2931,7 @@ impl Renderer {
             });
         }
         let draw_list_span = crate::spans::scope("draw_list");
+        let origins_span = crate::spans::scope("draw_origins");
         self.origins.clear();
         self.origins.extend(
             visible
@@ -2933,6 +2939,8 @@ impl Renderer {
                 .map(|v| section_instance(v.origin))
                 .chain(visible_lods.iter().map(|v| lod::instance(v.origin))),
         );
+        drop(origins_span);
+        let instance_upload_span = crate::spans::scope("draw_instances_upload_cpu");
         if !self.origins.is_empty() {
             self.uploads.buffer(
                 &mut encoder,
@@ -2941,6 +2949,7 @@ impl Renderer {
                 bytemuck::cast_slice(&self.origins),
             );
         }
+        drop(instance_upload_span);
         // Solid sections front to back, then translucent ones back to front,
         // as one list of indirect draws over the section arena.
         self.draws.clear();
@@ -2963,6 +2972,7 @@ impl Renderer {
             .and_then(|cull| cull.begin(&self.device).then_some(cull));
         self.phase2_draws.clear();
         self.phase2_pages.clear();
+        let face_draw_span = crate::spans::scope("draw_face_ranges");
         for (i, v) in visible.iter().enumerate() {
             let s = self.sections.get(v.slot);
             let first_phase = cull.as_ref().is_none_or(|c| c.first(v.slot));
@@ -2987,6 +2997,8 @@ impl Renderer {
                 None => {}
             }
         }
+        drop(face_draw_span);
+        let lod_draw_span = crate::spans::scope("draw_lod_face_ranges");
         // Distant terrain tiles are never occlusion tested: phase 1.
         for (i, v) in visible_lods.iter().enumerate() {
             let s = &self.lods[&v.key].mesh;
@@ -2997,10 +3009,13 @@ impl Renderer {
                 self.draw_pages.push((s.page, None));
             });
         }
+        drop(lod_draw_span);
         let phase1_draws = self.draws.len() as u32;
         drop(draw_list_span);
+        let draw_partition_span = crate::spans::scope("draw_phase2_merge");
         self.draws.extend_from_slice(&self.phase2_draws);
         self.draw_pages.extend_from_slice(&self.phase2_pages);
+        drop(draw_partition_span);
         let culling = cull.is_some();
         let solid_draws = self.draws.len() as u32;
         // LevelRenderer: nearby sections each frame, plus a rotating eighth
