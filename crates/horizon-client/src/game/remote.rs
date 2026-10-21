@@ -3522,9 +3522,14 @@ impl Game<'_> {
                 Ok(true)
             }
             KeyCode::KeyQ => {
-                let all = self.keys.contains(&KeyCode::ControlLeft);
+                // Match the local drop path: only *physically* held Ctrl
+                // changes Q from DROP_ITEM to DROP_ALL_ITEMS. In particular
+                // toggle-sprint must not masquerade as held Ctrl, and the
+                // right Ctrl key must work over multiplayer too.
+                let action = super::remote_drop_packet_action(&self.physical_keys);
+                let all = action == 4;
                 self.send(S::PlayerAction(play::PlayerAction {
-                    action: if all { 4 } else { 5 },
+                    action,
                     pos: [0; 3],
                     direction: 0,
                     sequence: 0,

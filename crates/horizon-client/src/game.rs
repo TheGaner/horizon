@@ -982,6 +982,15 @@ fn ticking_chunk(world: &World, x: i32, z: i32) -> bool {
 fn drop_whole_stack(physical_keys: &HashSet<KeyCode>) -> bool {
     physical_keys.contains(&KeyCode::ControlLeft) || physical_keys.contains(&KeyCode::ControlRight)
 }
+/// ServerboundPlayerActionPacket: DROP_ALL_ITEMS=4, DROP_ITEM=5.
+/// Never infer the whole-stack modifier from a latched sprint mapping.
+fn remote_drop_packet_action(physical_keys: &HashSet<KeyCode>) -> i32 {
+    if drop_whole_stack(physical_keys) {
+        4
+    } else {
+        5
+    }
+}
 
 fn select_creative_tab(
     creative: &mut Creative,
@@ -12475,6 +12484,15 @@ mod tests {
                     physical_keys.insert(KeyCode::ControlRight);
                 }
                 assert_eq!(drop_whole_stack(&physical_keys), held != 0);
+                // The remote PlayerAction packet uses exactly the same
+                // physical Ctrl predicate; a latch of the sprint mapping
+                // cannot manufacture a DROP_ALL_ITEMS packet.
+                for _repeat in 0..5 {
+                    assert_eq!(
+                        remote_drop_packet_action(&physical_keys),
+                        if held != 0 { 4 } else { 5 }
+                    );
+                }
                 physical_keys.remove(&KeyCode::ControlLeft);
                 physical_keys.remove(&KeyCode::ControlRight);
                 assert!(!drop_whole_stack(&physical_keys));
