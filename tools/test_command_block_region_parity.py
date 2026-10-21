@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real Horizon RegionFile -> original vanilla 26.3 RegionFile reader parity.
 
-A focused native Rust test uses SaveDir to write a command-block chunk into
+A focused native Rust release-profile test uses SaveDir to write a command-block chunk into
 an actual .mca region, drops the writer, reloads twice, changes styled output
 and saves again, verifying one pending scheduled block tick. Then real Java
 26.3 RegionFile, NbtIo and BlockEntity.loadStatic decode the *unchanged*
@@ -48,7 +48,7 @@ def main():
     classes.mkdir(exist_ok=True)
     cp=os.pathsep.join(map(str,[jars['server'],*libs]))
     test='save::tests::command_block_region_disk_reopen_preserves_rich_output_and_pending_ticks'
-    run('rust',['cargo','test','--locked','-p','horizon-client','--lib',test,'--','--exact','--nocapture'],
+    run('rust',['cargo','test','--locked','--release','-p','horizon-client','--lib',test,'--','--exact','--nocapture'],
         basepath/'rust.log',{'HORIZON_COMMAND_BLOCK_REGION_FIXTURE_DIR':str(fixture)})
     region=fixture/'dimensions/minecraft/overworld/region/r.-1.0.mca'
     if not region.is_file():raise AssertionError('Horizon produced no region file')
