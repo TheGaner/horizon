@@ -295,7 +295,14 @@ impl Game<'_> {
             DataRef::Block(p) => {
                 let key = (p[0], p[1], p[2]);
                 if let Some((_, new)) = save::decode_block_entity(&tag) {
+                    let old_auto = match self.world.block_entities.get(&key) {
+                        Some(horizon_client::containers::BlockEntity::CommandBlock(c)) => {
+                            Some(c.auto)
+                        }
+                        _ => None,
+                    };
                     self.world.block_entities.insert(key, new);
+                    self.command_block_automatic_nbt_changed(key, old_auto);
                     let state = self.world.block(p[0], p[1], p[2]);
                     // Redraw what shows the block entity (signs, banners).
                     let _ = self.world.set(p[0], p[1], p[2], state);

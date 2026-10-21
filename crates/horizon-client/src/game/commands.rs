@@ -1806,6 +1806,10 @@ impl Game<'_> {
         let Some(e) = self.world.block_entities.get(&key) else {
             return false;
         };
+        let old_auto = match e {
+            horizon_client::containers::BlockEntity::CommandBlock(c) => Some(c.auto),
+            _ => None,
+        };
         let name = self.data_block_name(pos);
         let before = horizon_client::save::encode_block_entity(key, e, &name);
         let Ok((mut tag, _)) = horizon_world::nbt::parse_snbt(nbt) else {
@@ -1826,6 +1830,7 @@ impl Game<'_> {
             return false;
         }
         self.world.block_entities.insert(key, new);
+        self.command_block_automatic_nbt_changed(key, old_auto);
         let state = self.world.block(pos[0], pos[1], pos[2]);
         let _ = self.world.set(pos[0], pos[1], pos[2], state);
         true

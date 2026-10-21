@@ -197,6 +197,19 @@ pub fn repeats(mode: Mode, powered: bool, auto: bool) -> bool {
     mode == Mode::Auto && (powered || auto)
 }
 
+/// `CommandBlockEntity.setAutomatic`: an explicit NBT or UI update from
+/// redstone-triggered to always-active schedules one tick, unless this block
+/// needs a redstone signal or is a chain block. This is NOT a rule for
+/// cold-loading existing `auto:1b` block entities from a saved chunk.
+pub fn automatic_transition_schedules(
+    mode: Mode,
+    was_auto: bool,
+    now_auto: bool,
+    powered: bool,
+) -> bool {
+    !was_auto && now_auto && !powered && mode != Mode::Sequence
+}
+
 /// `CommandBlock.setPoweredAndUpdate`: a rising signal schedules the impulse
 /// or repeating block's tick unless it is always active anyway.
 pub fn power_schedules(mode: Mode, was_powered: bool, powered: bool, auto: bool) -> bool {
@@ -235,6 +248,23 @@ mod tests {
         assert!(!power_schedules(Mode::Redstone, true, true, false));
         assert!(!power_schedules(Mode::Redstone, false, true, true));
         assert!(!power_schedules(Mode::Sequence, false, true, false));
+    }
+
+    #[test]
+    fn automatic_nbt_false_to_true_transition_schedules_once() {
+        for mode in [Mode::Redstone, Mode::Auto] {
+            assert!(automatic_transition_schedules(mode, false, true, false));
+            assert!(!automatic_transition_schedules(mode, true, true, false));
+            assert!(!automatic_transition_schedules(mode, false, false, false));
+            assert!(!automatic_transition_schedules(mode, true, false, false));
+            assert!(!automatic_transition_schedules(mode, false, true, true));
+        }
+        assert!(!automatic_transition_schedules(
+            Mode::Sequence,
+            false,
+            true,
+            false
+        ));
     }
 
     #[test]
