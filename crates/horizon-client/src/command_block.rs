@@ -106,7 +106,14 @@ impl CommandBlock {
             last_output: track_output
                 .then(|| tag.get("LastOutput"))
                 .flatten()
-                .map(|t| crate::scoreboard::comp_text(&crate::scoreboard::tag_to_json(t))),
+                .map(|t| {
+                    let component = crate::scoreboard::tag_to_json(t);
+                    // Rendering into visible Text spans can resolve translations
+                    // and flatten nested hover/click metadata. Keep the decoded
+                    // component itself as the serialization source so saving
+                    // an unedited command result does not lose those fields.
+                    crate::scoreboard::comp_text(&component).with_component(component)
+                }),
             update_last_execution,
             last_execution: if update_last_execution {
                 number(tag.get("LastExecution")).unwrap_or(-1)
@@ -184,6 +191,14 @@ pub fn tick_action(mode: Mode, met: bool, conditional: bool) -> Option<bool> {
     }
 }
 
+/// `CommandBlockEntity.loadAdditional` calls `setAutomatic` on an initially
+/// false value. For a command block reloaded from chunk NBT, that schedules a
+/// one-tick update whenever it is automatic, not powered and not a chain.
+/// This happens even if the block already executed before the chunk unloaded.
+pub fn load_schedules(mode: Mode, auto: bool, powered: bool) -> bool {
+    auto && !powered && mode != Mode::Sequence
+}
+
 /// `CommandBlock.tick`: a repeating block ticks again next tick while powered
 /// or always active.
 pub fn repeats(mode: Mode, powered: bool, auto: bool) -> bool {
@@ -256,6 +271,72 @@ mod tests {
         let tag = Tag::compound(quiet.save());
         assert!(tag.get("LastOutput").is_none() && tag.get("LastExecution").is_none());
         assert_eq!(CommandBlock::load(&tag).last_output, None);
+    }
+
+    #[test]
+    fn translated_nested_last_output_preserves_hover_and_scalar_args() {
+        // Shape saved by a real 26.3 scoreboard command block, including
+        // a nested translatable objective with a hover event and scalar args.
+        let output = horizon_world::nbt::parse_snbt(
+            r##"{text:"[00:26:45] ",extra:[{translate:"commands.scoreboard.players.add.success.single",with:[1,{translate:"chat.square_brackets",with:[{text:"cbhit",hover_event:{action:"show_text",value:"cbhit"}}]},"#probe",2]}]}"##,
+        ).expect("real vanilla nested output fixture").0;
+        let raw = Tag::compound([
+            (
+                "Command",
+                Tag::String("scoreboard players add #probe cbhit 1".into()),
+            ),
+            ("TrackOutput", Tag::Byte(1)),
+            ("SuccessCount", Tag::Int(1)),
+            ("LastOutput", output.clone()),
+        ]);
+        let restored = CommandBlock::load(&raw);
+        assert!(restored.last_output_string().contains("[00:26:45]"));
+        assert_eq!(
+            Tag::compound(restored.save()).get("LastOutput"),
+            Some(&output)
+        );
+    }
+
+    #[test]
+    fn load_rearms_automatic_impulse_once_even_after_execution() {
+        // Measured against a real 26.3 headless ServerLevel: an automatic
+        // impulse executes again after forceload remove -> actual unload ->
+        // forceload add. Restoring a pending tick must not duplicate it.
+        assert!(load_schedules(Mode::Redstone, true, false));
+        assert!(load_schedules(Mode::Auto, true, false));
+        assert!(!load_schedules(Mode::Sequence, true, false));
+        assert!(!load_schedules(Mode::Redstone, true, true));
+        assert!(!load_schedules(Mode::Redstone, false, false));
+        use horizon_core::{
+            position::BlockPos,
+            ticks::{ChunkTicks, SavedTick, ScheduledTick, TickPriority, TickTypeId},
+        };
+        let pos = BlockPos::new(96, 64, 96);
+        let kind = TickTypeId(1);
+        let mut ticks = ChunkTicks::from_saved(vec![SavedTick {
+            kind,
+            pos,
+            delay: 1,
+            priority: TickPriority::Normal,
+        }]);
+        let duplicate = ScheduledTick {
+            kind,
+            pos,
+            trigger_tick: 42,
+            priority: TickPriority::Normal,
+            sub_tick_order: 0,
+        };
+        assert!(
+            !ticks.schedule(duplicate),
+            "saved 1-tick update takes precedence"
+        );
+        assert_eq!(ticks.count(), 1);
+        let mut without_saved = ChunkTicks::from_saved(Vec::new());
+        assert!(
+            without_saved.schedule(duplicate),
+            "loading an auto impulse without a saved tick must arm it"
+        );
+        assert_eq!(without_saved.count(), 1);
     }
 
     #[test]
