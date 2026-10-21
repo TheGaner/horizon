@@ -515,6 +515,16 @@ def default_build_jobs():
     return jobs
 
 
+def artifacts_to_prebuild(selected, records):
+    cold = any("artifacts" not in records.get(name, {}) for name in selected)
+    artifacts = [["all", "", "release"]] if cold and len(selected) > 1 else []
+    for name in selected:
+        for artifact in records.get(name, {}).get("artifacts", []):
+            if artifact not in artifacts:
+                artifacts.append(artifact)
+    return artifacts
+
+
 def prebuild(artifacts, jobs):
     """Build every recorded probe in one Cargo run so harnesses don't serialise on its lock."""
     environment = run_environment()
@@ -1217,12 +1227,12 @@ def main():
             finished_run([])
         return 0
 
-    # Harnesses that never ran here have no recorded probes: build them all.
-    artifacts = [["all", "", "release"]] if any("artifacts" not in records.get(name, {}) for name in selected) else []
-    for name in selected:
-        for artifact in records.get(name, {}).get("artifacts", []):
-            if artifact not in artifacts:
-                artifacts.append(artifact)
+    # Cold single-harness runs should build their own probe (the harness already
+    # does so). Building *every* workspace bin/example just to discover that
+    # one probe is wasteful. Multi-harness runs still prebuild the complete
+    # workspace when any selected harness has no recorded artifacts, avoiding
+    # concurrent Cargo-lock contention on discovery runs.
+    artifacts = artifacts_to_prebuild(selected, records)
     config = host_config()
     hosts = [host for host in (config.get("default", []) if args.hosts is None else args.hosts.split(","))
              if host and host != HOST]
@@ -1238,7 +1248,7 @@ def main():
     remotes = [RemoteExecutor(host, config["hosts"][host], artifacts, config.get("local_only", {}), args.timeout)
                for host in hosts]
     try:
-        if jobs:
+        if jobs and artifacts:
             print("Building probes...", flush=True)
             started = time.monotonic()
             built, errors = prebuild(artifacts, default_build_jobs())
