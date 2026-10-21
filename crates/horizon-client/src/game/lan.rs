@@ -821,6 +821,12 @@ impl Game<'_> {
         if !self.admin_feedback.is_empty() {
             self.send_admin_feedback(&mut host, None);
         }
+        // Updates produced by command blocks before the LAN poll belong to
+        // the players already connected. Send before processing new joins;
+        // a new player instead receives one authoritative snapshot below.
+        for packet in self.score.pending_packets.drain(..) {
+            host.hub.broadcast(&packet);
+        }
         let state = self.lan_host_state(&host);
         // A dedicated server runs the hub without a host player.
         if state.is_some() || host.hub.config.dedicated {
@@ -880,6 +886,15 @@ impl Game<'_> {
                     }
                     HostEvent::Joined(conn) => {
                         self.lan_guest_joined(&mut host, conn, state.as_ref(), &entities, spawn);
+                        // ServerScoreboard.startTrackingObjective for a late
+                        // joiner: definition, display slots, current scores.
+                        // This player didn't receive any earlier mutations.
+                        for packet in super::scoreboard::scoreboard_network_delta(
+                            &horizon_client::scoreboard::Scoreboard::default(),
+                            &self.score.board,
+                        ) {
+                            host.hub.send_to(conn, &packet);
+                        }
                         if self.options.dedicated.is_some()
                             && let Some(g) = host.hub.guest(conn)
                         {
@@ -944,6 +959,13 @@ impl Game<'_> {
                     }
                 }
             }
+        }
+        // ServerScoreboard mutations during this tick (including individual
+        // conditional chain links) go to every online player in source order.
+        // Deliver before the tick's end-of-network flush, not as one final
+        // snapshot that loses intermediate scoreboard values.
+        for packet in self.score.pending_packets.drain(..) {
+            host.hub.broadcast(&packet);
         }
         self.lan_flush_effects(&mut host);
         self.tick_guests(&mut host);

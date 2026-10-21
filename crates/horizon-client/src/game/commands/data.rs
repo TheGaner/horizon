@@ -193,7 +193,21 @@ impl Game<'_> {
     }
     fn raw_mut(&mut self, t: Target) -> Option<&mut Tag> {
         match t {
+            Target::Player if self.lan_acting.is_some() => {
+                let conn = self.lan_acting?;
+                self.lan
+                    .as_mut()?
+                    .hub
+                    .guest_mut(conn)
+                    .map(|guest| guest.saved.get_or_insert_with(empty))
+            }
             Target::Player => Some(self.level.player_extra.get_or_insert_with(empty)),
+            Target::Guest(conn) => self
+                .lan
+                .as_mut()?
+                .hub
+                .guest_mut(conn)
+                .map(|guest| guest.saved.get_or_insert_with(empty)),
             Target::Mob(id)
             | Target::Item(id)
             | Target::Stand(id)

@@ -92,6 +92,8 @@ public final class LocatorBarClient {
     private static volatile boolean players;
     private static volatile boolean chat;
     private static volatile boolean state;
+    /** Only the player-drop oracle enables original-codec item-entity telemetry. */
+    private static volatile boolean items;
     private static final Map<UUID, String> NAMES = new LinkedHashMap<>();
 
     public static void main(String[] args) throws Exception {
@@ -126,6 +128,9 @@ public final class LocatorBarClient {
                     case "players" -> LocatorBarClient.players = w[1].equals("on");
                     case "chat" -> chat = w[1].equals("on");
                     case "state" -> state = w[1].equals("on");
+                    case "items" -> items = w[1].equals("on");
+                    case "drop" -> players.get(w[1]).drop(w[2]);
+                    case "throw" -> players.get(w[1]).throwInventorySlot(w[2]);
                     case "end" -> {
                         try (PrintWriter out = new PrintWriter(Files.newBufferedWriter(output, StandardCharsets.UTF_8))) {
                             for (Player p : players.values()) {
@@ -189,6 +194,10 @@ public final class LocatorBarClient {
         private final Map<Integer, String> seen = new java.util.HashMap<>();
         private final Object replyLock = new Object();
         private int replies;
+        /** Last inventory menu state so GUI Q uses the real menu sequence. */
+        private volatile int inventoryStateId;
+        /** Track dropped items by entity id, but never compare the random id. */
+        private final java.util.Set<Integer> itemEntities = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
         Player(String name) {
             this.name = name;
@@ -215,6 +224,36 @@ public final class LocatorBarClient {
             synchronized (lines) {
                 lines.add("step=" + step + " " + line);
             }
+        }
+
+        /** Send precisely the Java 26.3 packet for Q or Ctrl+Q.
+         * Physical-key/latch mapping is separately tested at Horizon's actual
+         * keyboard entry point; this codec client tests authoritative results.
+         */
+        void drop(String mode) throws Exception {
+            var action = switch (mode) {
+                case "single" -> net.minecraft.network.protocol.game.ServerboundPlayerActionPacket.Action.DROP_ITEM;
+                case "all" -> net.minecraft.network.protocol.game.ServerboundPlayerActionPacket.Action.DROP_ALL_ITEMS;
+                default -> throw new IllegalArgumentException("unknown drop kind " + mode);
+            };
+            send(new net.minecraft.network.protocol.game.ServerboundPlayerActionPacket(
+                action, net.minecraft.core.BlockPos.ZERO, net.minecraft.core.Direction.DOWN, 0));
+            record("sent " + mode + " action=" + action.ordinal());
+        }
+
+        /** The inventory screen maps Q to THROW button 0 and Ctrl+Q to button 1. */
+        void throwInventorySlot(String mode) throws Exception {
+            byte button = switch (mode) {
+                case "single" -> 0;
+                case "all" -> 1;
+                default -> throw new IllegalArgumentException("unknown inventory throw kind " + mode);
+            };
+            send(new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(
+                0, inventoryStateId, (short) 36, button,
+                net.minecraft.world.inventory.ContainerInput.THROW,
+                new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>(),
+                net.minecraft.network.HashedStack.EMPTY));
+            record("sent gui " + mode + " button=" + button);
         }
 
         void still() throws Exception {
@@ -297,6 +336,18 @@ public final class LocatorBarClient {
                         id = l.playerId();
                     }
                     if (state) recordState(p);
+                    if (items && p instanceof net.minecraft.network.protocol.game.ClientboundAddEntityPacket a
+                        && a.getType() == net.minecraft.world.entity.EntityTypes.ITEM) {
+                        itemEntities.add(a.getId());
+                        record("item-added");
+                    } else if (items && p instanceof net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket d
+                        && itemEntities.contains(d.id())) {
+                        for (var value : d.packedItems()) {
+                            if (value.value() instanceof net.minecraft.world.item.ItemStack stack) {
+                                record("item-data " + item(stack));
+                            }
+                        }
+                    }
                     if (p instanceof net.minecraft.network.protocol.game.ClientboundAddEntityPacket a
                         && a.getType() == net.minecraft.world.entity.EntityTypes.PLAYER) {
                         String who = NAMES.getOrDefault(a.getUUID(), "uuid?");
@@ -358,9 +409,16 @@ public final class LocatorBarClient {
                 && g.getEvent() == net.minecraft.network.protocol.game.ClientboundGameEventPacket.CHANGE_GAME_MODE) {
                 record("gamemode " + (int) g.getParam());
             } else if (p instanceof net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket c) {
+                if (c.getContainerId() == 0) inventoryStateId = c.getStateId();
                 record("slot " + c.getContainerId() + " " + c.getSlot() + " " + item(c.getItem()));
             } else if (p instanceof net.minecraft.network.protocol.game.ClientboundSetPlayerInventoryPacket i) {
                 record("inventory " + i.slot() + " " + item(i.contents()));
+            } else if (p instanceof net.minecraft.network.protocol.game.ClientboundSetScorePacket score) {
+                // Server-driven command-block scoreboard effects are visible
+                // to each player only when an objective is displayed.
+                record("score " + score.owner() + " " + score.objectiveName() + " " + score.score());
+            } else if (p instanceof net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket display) {
+                record("display " + display.getSlot() + " " + display.getObjectiveName());
             } else if (p instanceof net.minecraft.network.protocol.game.ClientboundUpdateMobEffectPacket e && e.getEntityId() == id) {
                 record("effect " + e.getEffect().getRegisteredName() + " " + e.getEffectAmplifier() + " " + e.getEffectDurationTicks());
             } else if (p instanceof net.minecraft.network.protocol.game.ClientboundRemoveMobEffectPacket e && e.entityId() == id) {

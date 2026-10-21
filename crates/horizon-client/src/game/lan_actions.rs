@@ -727,7 +727,25 @@ impl Game<'_> {
                 }
                 4 | 5 => {
                     if !spectator {
-                        self.as_guest(host, conn, |g| g.drop_held(a.action == 4));
+                        // LocalPlayer.drop is client-predicted: Q removes one
+                        // item, Ctrl+Q removes the stack *before* the packet
+                        // reaches ServerGamePacketListenerImpl. Vanilla does
+                        // not send a second inventory slot update here.
+                        //
+                        // When an unrelated change is still unsent, retain
+                        // that pending authoritative update instead of
+                        // incorrectly treating it as client prediction.
+                        let slot = 36 + host.hub.guests[gi].selected;
+                        let before = host.hub.guests[gi].menu_slot(slot);
+                        let aligned = host.hub.guests[gi].menu_sent[slot] == before;
+                        if self
+                            .as_guest(host, conn, |g| g.drop_held(a.action == 4))
+                            .is_some()
+                            && aligned
+                        {
+                            let after = host.hub.guests[gi].menu_slot(slot);
+                            host.hub.guests[gi].menu_sent[slot] = after;
+                        }
                     }
                 }
                 6 => {

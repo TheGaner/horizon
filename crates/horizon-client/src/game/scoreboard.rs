@@ -17,8 +17,9 @@ use horizon_client::{
     tab_list::TabPlayer,
     text::Text,
 };
+use horizon_protocol::packets::play::{self as play, Clientbound as C};
 use horizon_world::nbt::Tag;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// What `ServerPlayer` last recorded for the criteria that follow the player.
 #[derive(Default)]
@@ -39,6 +40,119 @@ pub(super) struct ScoreState {
     pub stopwatches: horizon_client::stopwatches::Stopwatches,
     loaded: bool,
     recorded: Recorded,
+    /// Ordered scoreboard mutations waiting for server clients. Do not
+    /// coalesce across command blocks: vanilla sends every intermediate
+    /// ClientboundSetScorePacket even within one game tick.
+    pub(super) pending_packets: Vec<C>,
+}
+
+/// The already-tracked visible objectives' wire snapshots after a command.
+///
+/// Only displayed objectives are tracked by ServerScoreboard; after an
+/// objective is put on sidebar the client first receives its definition,
+/// then its display slot, then every score. Do not squash score changes
+/// from successive chain command blocks: each command generates its own
+/// ordered packet. Team scoreboard packets are a separate outstanding gate.
+fn scoreboard_number_format(format: &sb::NumberFormat) -> play::NumberFormat {
+    match format {
+        sb::NumberFormat::Blank => play::NumberFormat::Blank,
+        sb::NumberFormat::Styled(style) => play::NumberFormat::Styled(sb::json_to_tag(style)),
+        sb::NumberFormat::Fixed(component) => {
+            play::NumberFormat::Fixed(horizon_client::lan::data::component_nbt(component))
+        }
+    }
+}
+
+pub(super) fn scoreboard_network_delta(before: &Scoreboard, after: &Scoreboard) -> Vec<C> {
+    let mut out = Vec::new();
+    let tracked_before: BTreeSet<_> = before.display.values().cloned().collect();
+    let tracked_after: BTreeSet<_> = after.display.values().cloned().collect();
+    for name in tracked_after.difference(&tracked_before) {
+        if let Some(objective) = after.objective(name) {
+            out.push(C::SetObjective(play::SetObjective {
+                name: name.clone(),
+                method: 0,
+                display: Some((
+                    horizon_client::lan::data::component_nbt(&objective.display_name),
+                    i32::from(objective.render_type == sb::RenderType::Hearts),
+                    objective
+                        .number_format
+                        .as_ref()
+                        .map(scoreboard_number_format),
+                )),
+            }));
+        }
+    }
+    // A displayed objective may change its name, render mode or number
+    // format without changing the slot that displays it.
+    for name in tracked_after.intersection(&tracked_before) {
+        if let (Some(old), Some(new)) = (before.objective(name), after.objective(name))
+            && old != new
+        {
+            out.push(C::SetObjective(play::SetObjective {
+                name: name.clone(),
+                method: 2,
+                display: Some((
+                    horizon_client::lan::data::component_nbt(&new.display_name),
+                    i32::from(new.render_type == sb::RenderType::Hearts),
+                    new.number_format.as_ref().map(scoreboard_number_format),
+                )),
+            }));
+        }
+    }
+    for (slot_id, slot) in sb::display_slots().into_iter().enumerate() {
+        if before.display.get(&slot) != after.display.get(&slot) {
+            out.push(C::SetDisplayObjective(play::SetDisplayObjective {
+                slot: slot_id as i32,
+                objective: after.display.get(&slot).cloned().unwrap_or_default(),
+            }));
+        }
+    }
+    for (holder, scores) in &after.scores {
+        for (objective, score) in scores {
+            if !tracked_after.contains(objective) {
+                continue;
+            }
+            let old = before.scores.get(holder).and_then(|s| s.get(objective));
+            if old == Some(score) && tracked_before.contains(objective) {
+                continue;
+            }
+            out.push(C::SetScore(play::SetScore {
+                owner: holder.clone(),
+                objective: objective.clone(),
+                score: score.value,
+                display: score
+                    .display
+                    .as_ref()
+                    .map(horizon_client::lan::data::component_nbt),
+                number_format: score.number_format.as_ref().map(scoreboard_number_format),
+            }));
+        }
+    }
+    for (holder, scores) in &before.scores {
+        for objective in scores.keys() {
+            if tracked_before.contains(objective)
+                && tracked_after.contains(objective)
+                && after
+                    .scores
+                    .get(holder)
+                    .is_none_or(|s| !s.contains_key(objective))
+            {
+                out.push(C::ResetScore(play::ResetScore {
+                    owner: holder.clone(),
+                    objective: Some(objective.clone()),
+                }));
+            }
+        }
+    }
+    for name in tracked_before.difference(&tracked_after) {
+        out.push(C::SetObjective(play::SetObjective {
+            name: name.clone(),
+            method: 1,
+            display: None,
+        }));
+    }
+    out
 }
 
 fn in_range(v: i32, (lo, hi): IntRange) -> bool {
@@ -179,8 +293,18 @@ impl Game<'_> {
             | Target::Boat(id)
             | Target::Cart(id)
             | Target::Other(id) => self.persist.raw.get(&id),
+            // A remote player must use their own persisted player data;
+            // the local world's player_extra belongs to the host, not to
+            // the guest whose command happens to be executing.
+            Target::Player if self.lan_acting.is_some() => self
+                .lan_acting
+                .and_then(|conn| self.command_guest(conn))
+                .and_then(|guest| guest.saved.as_ref()),
             Target::Player => self.level.player_extra.as_ref(),
-            Target::Guest(_) | Target::Orb(_) | Target::Arrow(_) => None,
+            Target::Guest(conn) => self
+                .command_guest(conn)
+                .and_then(|guest| guest.saved.as_ref()),
+            Target::Orb(_) | Target::Arrow(_) => None,
         };
         match raw.and_then(|r| r.get("Tags")) {
             Some(Tag::List(l)) => l
@@ -494,6 +618,9 @@ impl Game<'_> {
         )
     }
     pub(super) fn cmd_scoreboard(&mut self, id: &str, ctx: &Context) -> super::commands::R<i32> {
+        // Local/offline worlds have no network subscribers: avoid an
+        // unbounded packet queue and the full scoreboard copy per command.
+        let before = self.lan.as_ref().map(|_| self.score.board.clone());
         let mut env = GameEnv { g: self };
         let result = scoreboard_cmd::execute(id, ctx, &mut env).unwrap_or_else(|| {
             Err(horizon_client::command::CommandError::tr(
@@ -501,6 +628,11 @@ impl Game<'_> {
                 &[],
             ))
         });
+        if let Some(before) = before {
+            self.score
+                .pending_packets
+                .extend(scoreboard_network_delta(&before, &self.score.board));
+        }
         self.sync_score_registries();
         result
     }
@@ -721,6 +853,82 @@ impl Env for GameEnv<'_, '_> {
     }
     fn feedback(&mut self, message: Text) {
         self.g.feedback(message);
+    }
+}
+
+#[cfg(test)]
+mod scoreboard_packet_tests {
+    use super::*;
+
+    fn board() -> Scoreboard {
+        let mut board = Scoreboard::default();
+        assert!(board.add_objective(
+            "cbview",
+            "dummy",
+            serde_json::json!("cbview"),
+            sb::RenderType::Integer,
+            false,
+            None,
+        ));
+        board
+    }
+
+    #[test]
+    fn tracking_sidebar_sends_definition_before_display_and_scores() {
+        let original = board();
+        let mut displayed = original.clone();
+        displayed.set("Alice", "cbview", 0);
+        displayed.set_display_objective("sidebar", Some("cbview"));
+        let events = scoreboard_network_delta(&original, &displayed);
+        assert!(
+            matches!(events.first(), Some(C::SetObjective(p)) if p.name == "cbview" && p.method == 0)
+        );
+        assert!(
+            matches!(events.get(1), Some(C::SetDisplayObjective(p)) if p.slot == 1 && p.objective == "cbview")
+        );
+        assert!(
+            matches!(events.get(2), Some(C::SetScore(p)) if p.owner == "Alice" && p.score == 0)
+        );
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn intermediate_command_chain_values_are_not_coalesced() {
+        let mut board = board();
+        board.set_display_objective("sidebar", Some("cbview"));
+        board.set("Alice", "cbview", 0);
+        let mut queue = Vec::new();
+        for wanted in [1, 2, 5] {
+            let before = board.clone();
+            board.set("Alice", "cbview", wanted);
+            queue.extend(scoreboard_network_delta(&before, &board));
+        }
+        let values: Vec<_> = queue
+            .iter()
+            .filter_map(|p| match p {
+                C::SetScore(p) if p.owner == "Alice" => Some(p.score),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(values, [1, 2, 5]);
+        assert!(scoreboard_network_delta(&board, &board).is_empty());
+    }
+
+    #[test]
+    fn hiding_objective_untracks_it_instead_of_replaying_old_scores() {
+        let mut board = board();
+        board.set_display_objective("sidebar", Some("cbview"));
+        board.set("Alice", "cbview", 5);
+        let mut hidden = board.clone();
+        hidden.set_display_objective("sidebar", None);
+        let events = scoreboard_network_delta(&board, &hidden);
+        assert!(
+            matches!(events.first(), Some(C::SetDisplayObjective(p)) if p.slot == 1 && p.objective.is_empty())
+        );
+        assert!(
+            matches!(events.last(), Some(C::SetObjective(p)) if p.method == 1 && p.name == "cbview")
+        );
+        assert!(events.iter().all(|p| !matches!(p, C::SetScore(_))));
     }
 }
 
