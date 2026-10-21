@@ -3922,4 +3922,145 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(flying_survival, 0);
     }
+    #[test]
+    fn command_block_region_disk_reopen_preserves_rich_output_and_pending_ticks() {
+        use crate::containers::BlockEntity;
+        use crate::text::{RED, Text};
+        use horizon_core::ticks::{SavedTick, TickPriority, TickTypeId};
+        let fixture_root = std::env::var_os("HORIZON_COMMAND_BLOCK_REGION_FIXTURE_DIR");
+        let root = fixture_root.as_ref().map_or_else(
+            || {
+                std::env::temp_dir().join(format!(
+                    "horizon-command-block-region-{}",
+                    std::process::id()
+                ))
+            },
+            PathBuf::from,
+        );
+        if fixture_root.is_some() {
+            assert!(
+                !root.exists(),
+                "refusing to overwrite an existing fixture directory"
+            );
+        } else {
+            let _ = fs::remove_dir_all(&root);
+        }
+        let palette = root.join("resources/assets/minecraft/textures/colormap");
+        fs::create_dir_all(&palette).unwrap();
+        for name in ["grass", "foliage", "dry_foliage"] {
+            let image = fs::File::create(palette.join(format!("{name}.png"))).unwrap();
+            let mut encoder = png::Encoder::new(image, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[25, 70, 40])
+                .unwrap();
+        }
+        let biome_dir = root.join("resources/data/minecraft/worldgen/biome");
+        fs::create_dir_all(&biome_dir).unwrap();
+        fs::write(biome_dir.join("plains.json"), "{}").unwrap();
+        let biomes = Biomes::load(&root.join("resources")).unwrap();
+        let registry = BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            (
+                "states",
+                Tag::List(vec![
+                    string("minecraft:air"),
+                    string("minecraft:command_block"),
+                ]),
+            ),
+            (
+                "defaults",
+                Tag::compound([
+                    ("minecraft:air", Tag::Int(0)),
+                    ("minecraft:command_block", Tag::Int(1)),
+                ]),
+            ),
+        ]))
+        .unwrap();
+        let make_tables = || {
+            SaveTables::for_heightmaps(crate::assets::Properties::for_tests(&[
+                (true, false, false, false),
+                (false, false, true, true),
+            ]))
+        };
+        let mut tables = make_tables();
+        tables.block_names = vec!["minecraft:air".into(), "minecraft:command_block".into()];
+        tables.block_ids = tables
+            .block_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i as u16))
+            .collect();
+        tables.default_state = vec![true, true];
+
+        let pos = (-1, 64, 16);
+        let pending = SavedTick {
+            kind: TickTypeId(1),
+            pos: BlockPos::new(pos.0, pos.1, pos.2),
+            delay: 7,
+            priority: TickPriority::High,
+        };
+        let mut chunk = Chunk::empty(-1, 1);
+        chunk.set(15, pos.1, 0, 1);
+        let rich = crate::command_block::CommandBlock {
+            command: "Searge".into(),
+            last_output: Some(Text::colored("alert", RED)),
+            success_count: 1,
+            last_execution: 42,
+            powered: true,
+            ..Default::default()
+        };
+        chunk
+            .block_entities
+            .push((pos, BlockEntity::CommandBlock(Box::new(rich))));
+        chunk.saved = Some(Arc::new(ChunkExtras {
+            block_ticks: vec![pending],
+            ..Default::default()
+        }));
+        let folder = root.join("dimensions/minecraft/overworld");
+        {
+            let dir = SaveDir::new(folder.clone());
+            let mut clone = make_tables();
+            clone.block_names = tables.block_names.clone();
+            clone.block_ids = tables.block_ids.clone();
+            clone.default_state = tables.default_state.clone();
+            dir.tables.set(Arc::new(clone)).ok().unwrap();
+            assert_eq!(dir.save(&[Arc::new(chunk)], &registry, &biomes).unwrap(), 1);
+            assert!(folder.join("region/r.-1.0.mca").is_file());
+        }
+        for cycle in 0..2 {
+            let dir = SaveDir::new(folder.clone());
+            let mut clone = make_tables();
+            clone.block_names = tables.block_names.clone();
+            clone.block_ids = tables.block_ids.clone();
+            clone.default_state = tables.default_state.clone();
+            dir.tables.set(Arc::new(clone)).ok().unwrap();
+            let mut reopened = dir.load(-1, 1, &registry, &biomes).unwrap();
+            assert_eq!(reopened.get(15, 64, 0), 1);
+            assert_eq!(reopened.saved.as_ref().unwrap().block_ticks, vec![pending]);
+            let (_, BlockEntity::CommandBlock(ref mut command)) = reopened.block_entities[0] else {
+                panic!("command block lost on disk reload");
+            };
+            assert_eq!(command.command, "Searge");
+            assert_eq!(command.last_execution, 42);
+            let actual = Tag::compound(command.save());
+            assert_eq!(
+                actual.get("LastOutput"),
+                Some(&Tag::compound([
+                    ("color", string("red")),
+                    ("text", string(if cycle == 0 { "alert" } else { "updated" })),
+                ]))
+            );
+            if cycle == 0 {
+                command.last_output = Some(Text::colored("updated", RED));
+                dir.save(&[Arc::new(reopened)], &registry, &biomes).unwrap();
+            }
+        }
+        if fixture_root.is_none() {
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
 }
