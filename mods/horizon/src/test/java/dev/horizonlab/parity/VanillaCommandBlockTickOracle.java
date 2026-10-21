@@ -37,6 +37,7 @@ public final class VanillaCommandBlockTickOracle {
     static final BlockPos WEST = new BlockPos(-1, 64, 0);
     static final BlockPos EAST = new BlockPos(1,64,0);
     static Method tick, neighbor;
+    static Field lastExecution;
     static Object unsafe;
     static Method allocate;
 
@@ -65,13 +66,18 @@ public final class VanillaCommandBlockTickOracle {
         @Override public boolean hasNeighborSignal(BlockPos p) { return inputSignal && p.equals(ROOT); }
         @Override public LevelTicks<Block> getBlockTicks() { return queue; }
         @Override public GameRules getGameRules() { return rules; }
+        // Test nonempty commands without invoking a nonexistent full server dispatcher.
+        @Override public boolean isCommandBlockEnabled() { return false; }
         @Override public long getGameTime() { return clock; }
         @Override public long nextSubTickCount() { return subTick++; }
         @Override public void updateNeighbourForOutputSignal(BlockPos p, Block source) { updates++; }
+        @Override public void blockEntityChanged(BlockPos p) { /* no actual chunks in this stub */ }
     }
 
     static World world;
     static CommandBlockEntity root, behind, chain;
+    static Boolean lastReturn;
+    static List<CommandBlockEntity> chainPath = List.of();
 
     static <T> T alloc(Class<T> cls) throws Exception { return cls.cast(allocate.invoke(unsafe, cls)); }
     static BlockState block(String mode, boolean conditional) {
@@ -91,6 +97,7 @@ public final class VanillaCommandBlockTickOracle {
         world.queue = new TickQueue();
         world.rules = new GameRules(FeatureFlags.DEFAULT_FLAGS);
         world.clock=0;world.subTick=0;world.updates=0;world.inputSignal=false;
+        lastReturn=null;
         var state=block(mode,cond);
         world.states.put(ROOT,state);
         root=new CommandBlockEntity(ROOT,state);
@@ -100,18 +107,45 @@ public final class VanillaCommandBlockTickOracle {
         world.entities.put(ROOT,root);
         changeBehind(hasBehind, behindSuccess);
         chain=null;
+        chainPath=List.of();
+    }
+    static void clearPath() {
+        for (int i=1;i<=8;i++) {
+            var pos=ROOT.offset(i,0,0);
+            world.entities.remove(pos);world.states.remove(pos);
+        }
+        chain=null;chainPath=List.of();
     }
     static void changeChain(boolean present,boolean conditional,boolean powered,boolean auto) {
-        world.entities.remove(EAST);world.states.remove(EAST);chain=null;
+        clearPath();
         if (!present) return;
-        var state=block("chain",conditional);
-        world.states.put(EAST,state);
-        chain=new CommandBlockEntity(EAST,state);
-        chain.getCommandBlock().setCommand("Searge");
-        chain.setAutomatic(auto);
-        chain.setPowered(powered);
-        chain.setLevel(world);
-        world.entities.put(EAST,chain);
+        createPath(1, conditional ? "1" : "0", (powered ? "1" : "0")+(auto ? "1" : "0"), 0);
+    }
+    static void createPath(int count,String conditionalMask,String activationMask,int turnAt) {
+        if (count<0 || count>8 || conditionalMask.length()!=count || activationMask.length()!=count*2) {
+            throw new IllegalArgumentException("bad path specification");
+        }
+        clearPath();
+        var all=new ArrayList<CommandBlockEntity>();
+        for (int i=1;i<=count;i++) {
+            var pos=ROOT.offset(i,0,0);
+            var state=block("chain",conditionalMask.charAt(i-1)=='1');
+            if (i==turnAt) state=state.setValue(CommandBlock.FACING,Direction.NORTH);
+            world.states.put(pos,state);
+            var entity=new CommandBlockEntity(pos,state);
+            entity.getCommandBlock().setCommand("Searge");
+            entity.setAutomatic(activationMask.charAt((i-1)*2+1)=='1');
+            entity.setPowered(activationMask.charAt((i-1)*2)=='1');
+            entity.setLevel(world);
+            world.entities.put(pos,entity);
+            all.add(entity);
+        }
+        chainPath=List.copyOf(all);
+        chain=all.isEmpty()?null:all.get(0);
+    }
+    static void configurePath(int count,int limit,String condMask,String activeMask,int turnAt) {
+        world.rules.set(GameRules.MAX_COMMAND_SEQUENCE_LENGTH,limit,null);
+        createPath(count,condMask,activeMask,turnAt);
     }
     static void changeBehind(boolean present,int success) {
         world.entities.remove(WEST);
@@ -149,15 +183,21 @@ public final class VanillaCommandBlockTickOracle {
         }
         var cb=root.getCommandBlock();
         String chainState="-";
-        if (chain!=null) {
-            var cc=chain.getCommandBlock();
-            chainState=world.getBlockState(EAST).getValue(CommandBlock.CONDITIONAL)+":"+
-                chain.isPowered()+":"+chain.isAutomatic()+":"+chain.wasConditionMet()+":"+
-                cc.getSuccessCount()+":"+cc.getLastOutput().getString();
+        if (!chainPath.isEmpty()) {
+            var entries=new ArrayList<String>();
+            for (var entity:chainPath) {
+                var cc=entity.getCommandBlock();
+                entries.add(world.getBlockState(entity.getBlockPos()).getValue(CommandBlock.CONDITIONAL)+":"+
+                    entity.isPowered()+":"+entity.isAutomatic()+":"+entity.wasConditionMet()+":"+
+                    cc.getSuccessCount()+":"+cc.getLastOutput().getString());
+            }
+            chainState=String.join(";",entries);
         }
+        long executed;
+        try {executed=lastExecution.getLong(cb);} catch (IllegalAccessException e) {throw new IllegalStateException(e);}
         return world.clock+"|"+root.getMode()+"|"+world.getBlockState(ROOT).getValue(CommandBlock.CONDITIONAL)+
             "|"+root.isPowered()+"|"+root.isAutomatic()+"|"+root.wasConditionMet()+"|"+
-            cb.getSuccessCount()+"|"+world.updates+"|"+q+"|"+cb.getCommand()+"|"+cb.getLastOutput().getString()+"|"+chainState;
+            cb.getSuccessCount()+"|"+world.updates+"|"+q+"|"+cb.getCommand()+"|"+cb.getLastOutput().getString()+"|"+chainState+"|"+executed+"|"+(lastReturn==null?"-":lastReturn.toString());
     }
     public static void main(String[] args) throws Exception {
         ParityData.init();
@@ -168,11 +208,15 @@ public final class VanillaCommandBlockTickOracle {
         neighbor.setAccessible(true);
         tick=CommandBlock.class.getDeclaredMethod("tick",BlockState.class,ServerLevel.class,BlockPos.class,RandomSource.class);
         tick.setAccessible(true);
+        lastExecution=net.minecraft.world.level.BaseCommandBlock.class.getDeclaredField("lastExecution");
+        lastExecution.setAccessible(true);
         var out=new StringBuilder();
         for(String line:Files.readAllLines(Path.of(args[0]))) {
             String[] w=line.split(" ");
             switch(w[0]) {
                 case "reset" -> reset(w[1],Boolean.parseBoolean(w[2]),Boolean.parseBoolean(w[3]),Boolean.parseBoolean(w[4]),Integer.parseInt(w[5]),w.length>6 && w[6].equals("searge"));
+                case "command" -> root.getCommandBlock().setCommand(w[1].equals("empty") ? "" : w[1].equals("searge") ? "Searge" : "noop");
+                case "invoke" -> lastReturn=root.getCommandBlock().performCommand(world);
                 case "signal" -> signal(Boolean.parseBoolean(w[1]));
                 case "auto" -> root.setAutomatic(Boolean.parseBoolean(w[1]));
                 case "mode" -> {
@@ -185,6 +229,7 @@ public final class VanillaCommandBlockTickOracle {
                 }
                 case "back" -> changeBehind(Boolean.parseBoolean(w[1]),Integer.parseInt(w[2]));
                 case "chain" -> changeChain(Boolean.parseBoolean(w[1]),Boolean.parseBoolean(w[2]),Boolean.parseBoolean(w[3]),Boolean.parseBoolean(w[4]));
+                case "path" -> configurePath(Integer.parseInt(w[1]),Integer.parseInt(w[2]),w[3],w[4],Integer.parseInt(w[5]));
                 case "success" -> root.getCommandBlock().setSuccessCount(Integer.parseInt(w[1]));
                 case "tick" -> advance();
                 default -> throw new IllegalArgumentException(line);

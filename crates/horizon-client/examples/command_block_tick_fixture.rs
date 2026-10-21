@@ -13,6 +13,7 @@ struct Chain {
     condition_met: bool,
     success: i32,
     last_output: String,
+    turns_north: bool,
 }
 
 struct Case {
@@ -20,7 +21,9 @@ struct Case {
     mode: Mode,
     conditional: bool,
     behind: Option<i32>,
-    chain: Option<Chain>,
+    chain: Vec<Chain>,
+    max_chain: usize,
+    last_return: Option<bool>,
     time: i64,
     scheduled: Vec<(i64, Mode)>,
     output_updates: usize,
@@ -33,7 +36,9 @@ impl Default for Case {
             mode: Mode::Redstone,
             conditional: false,
             behind: None,
-            chain: None,
+            chain: Vec::new(),
+            max_chain: 65536,
+            last_return: None,
             time: 0,
             scheduled: Vec::new(),
             output_updates: 0,
@@ -92,26 +97,87 @@ impl Case {
         }
     }
     fn change_chain(&mut self, present: bool, conditional: bool, powered: bool, auto: bool) {
-        self.chain = present.then_some(Chain {
-            conditional,
-            powered,
-            auto,
-            ..Chain::default()
-        });
+        self.chain = if present {
+            vec![Chain {
+                conditional,
+                powered,
+                auto,
+                ..Chain::default()
+            }]
+        } else {
+            Vec::new()
+        };
+    }
+    fn change_path(
+        &mut self,
+        count: usize,
+        limit: usize,
+        conditions: &str,
+        active: &str,
+        turn_at: usize,
+    ) {
+        assert!((1..=8).contains(&count));
+        assert_eq!(conditions.len(), count);
+        assert_eq!(active.len(), count * 2);
+        assert!(
+            conditions
+                .bytes()
+                .chain(active.bytes())
+                .all(|b| b == b'0' || b == b'1')
+        );
+        self.max_chain = limit;
+        self.chain = (0..count)
+            .map(|idx| Chain {
+                conditional: conditions.as_bytes()[idx] == b'1',
+                powered: active.as_bytes()[idx * 2] == b'1',
+                auto: active.as_bytes()[idx * 2 + 1] == b'1',
+                turns_north: turn_at == idx + 1,
+                ..Chain::default()
+            })
+            .collect();
+    }
+    fn invoke_root(&mut self) -> bool {
+        if self.block.last_execution == self.time {
+            return false;
+        }
+        if self.block.command.eq_ignore_ascii_case("Searge") {
+            self.block.success_count = 1;
+            self.block.last_output = Some(horizon_client::text::Text::literal("#itzlipofutzli"));
+            return true;
+        }
+        self.block.success_count = 0;
+        self.block.last_execution = if self.block.update_last_execution {
+            self.time
+        } else {
+            -1
+        };
+        true
     }
     fn execute_chain(&mut self) {
-        if let Some(chain) = self.chain.as_mut() {
+        for index in 0..self.chain.len().min(self.max_chain) {
+            let preceding_success = if index == 0 {
+                self.block.success_count
+            } else {
+                self.chain[index - 1].success
+            };
+            let chain = &mut self.chain[index];
             if chain.powered || chain.auto {
-                chain.condition_met = !chain.conditional || self.block.success_count > 0;
+                // Vanilla resolves the predecessor opposite *this node's*
+                // facing; a north-turning node has no south predecessor in
+                // our east-only test world, even when the west block succeeded.
+                chain.condition_met =
+                    !chain.conditional || (!chain.turns_north && preceding_success > 0);
                 if chain.condition_met {
-                    // Its real Java BaseCommandBlock executes Searge directly,
-                    // without the MinecraftServer command dispatcher.
+                    // Real Java BaseCommandBlock handles Searge without Brigadier.
                     chain.success = 1;
                     chain.last_output = "#itzlipofutzli".to_owned();
                     self.output_updates += 1;
                 } else if chain.conditional {
                     chain.success = 0;
                 }
+            }
+            if chain.turns_north {
+                break;
             }
         }
     }
@@ -136,12 +202,10 @@ impl Case {
             }
             match command_block::tick_action(self.mode, was, self.conditional) {
                 Some(true) => {
-                    if self.block.command.eq_ignore_ascii_case("Searge") {
-                        self.block.success_count = 1;
-                        self.block.last_output =
-                            Some(horizon_client::text::Text::literal("#itzlipofutzli"));
-                    } else {
+                    if self.block.command.is_empty() {
                         self.block.success_count = 0;
+                    } else {
+                        self.invoke_root();
                     }
                     self.execute_chain();
                 }
@@ -169,17 +233,22 @@ impl Case {
                 }
             ));
         }
-        let chain_state = self.chain.as_ref().map_or_else(
-            || "-".to_owned(),
-            |c| {
-                format!(
-                    "{}:{}:{}:{}:{}:{}",
-                    c.conditional, c.powered, c.auto, c.condition_met, c.success, c.last_output
-                )
-            },
-        );
+        let chain_state = if self.chain.is_empty() {
+            "-".to_owned()
+        } else {
+            self.chain
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{}:{}:{}:{}:{}:{}",
+                        c.conditional, c.powered, c.auto, c.condition_met, c.success, c.last_output
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(";")
+        };
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.time,
             match self.mode {
                 Mode::Redstone => "REDSTONE",
@@ -195,7 +264,10 @@ impl Case {
             schedule,
             self.block.command,
             self.block.last_output_string(),
-            chain_state
+            chain_state,
+            self.block.last_execution,
+            self.last_return
+                .map_or_else(|| "-".to_owned(), |v| v.to_string())
         )
     }
 }
@@ -235,6 +307,18 @@ fn main() {
                 boolean(w[4]).then(|| w[5].parse::<i32>().unwrap()),
                 w.get(6) == Some(&"searge"),
             ),
+            "command" => {
+                state.block.set_command(match w[1] {
+                    "empty" => "",
+                    "searge" => "Searge",
+                    "noop" => "noop",
+                    _ => panic!("unknown command kind"),
+                });
+                // Vanilla CommandBlockEntity.setCommand marks the BE changed,
+                // which notifies the neighboring comparator as well.
+                state.output_updates += 1;
+            }
+            "invoke" => state.last_return = Some(state.invoke_root()),
             "signal" => state.signal(boolean(w[1])),
             "auto" => state.set_auto(boolean(w[1])),
             "mode" => state.set_mode(mode(w[1])),
@@ -243,6 +327,13 @@ fn main() {
             "chain" => {
                 state.change_chain(boolean(w[1]), boolean(w[2]), boolean(w[3]), boolean(w[4]))
             }
+            "path" => state.change_path(
+                w[1].parse().unwrap(),
+                w[2].parse().unwrap(),
+                w[3],
+                w[4],
+                w[5].parse().unwrap(),
+            ),
             "success" => state.block.success_count = w[1].parse().unwrap(),
             "tick" => state.tick(),
             _ => panic!("unsupported: {line}"),
