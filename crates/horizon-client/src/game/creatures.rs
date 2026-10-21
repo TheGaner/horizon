@@ -1687,7 +1687,31 @@ impl Game<'_> {
         let Some(mut host) = self.lan.take() else {
             return self.projectile_hit(p, hit);
         };
+        // A thrown ender pearl must send the player's position correction even
+        // when it lands at their feet (zero/negligible displacement). Vanilla
+        // sends ClientboundPlayerPositionPacket for the teleport itself;
+        // `leave_guest` normally sends one only when it detects movement.
+        // Track the guest's teleport id so a moving pearl cannot send two.
+        let before_teleport = host
+            .hub
+            .guests
+            .iter()
+            .find(|g| g.conn == conn)
+            .map(|g| g.teleport_counter);
         let result = self.as_guest(&mut host, conn, |g| g.projectile_hit(p, hit));
+        if matches!(&p.kind, ProjectileKind::EnderPearl)
+            && p.owner == Some(Who::Player)
+            && result.as_ref().is_some_and(std::result::Result::is_ok)
+            && let Some((i, guest)) = host
+                .hub
+                .guests
+                .iter()
+                .enumerate()
+                .find(|(_, g)| g.conn == conn)
+            && before_teleport == Some(guest.teleport_counter)
+        {
+            host.hub.teleport(i, None);
+        }
         // The mob hit now answers to the guest (LivingEntity.lastHurtByPlayer).
         if result.is_some()
             && let Hit::Entity {

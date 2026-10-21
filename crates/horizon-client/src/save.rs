@@ -1831,8 +1831,16 @@ pub fn read_forced_chunks(dimension_root: &Path) -> Result<std::collections::Has
         return Ok(Default::default());
     }
     let root = read_dat(&path).ok_or("cannot decode existing chunk_tickets.dat")?;
-    let Some(Tag::List(entries)) = root.get("data").and_then(|d| d.get("tickets")) else {
+    let Some(Tag::Compound(data)) = root.get("data") else {
         return Err("invalid chunk tickets saved data".into());
+    };
+    // Vanilla 26.3 writes `{data:{},DataVersion:5023}` after
+    // `/forceload remove all`. Omission means no tickets, not corruption.
+    let Some(tickets) = data.get(&"tickets".into()) else {
+        return Ok(Default::default());
+    };
+    let Tag::List(entries) = tickets else {
+        return Err("invalid chunk tickets list".into());
     };
     if entries.iter().any(|entry| {
         text(entry.get("type")).as_deref() == Some("minecraft:forced")
@@ -1921,6 +1929,10 @@ pub fn write_forced_chunks(
             ("type", Tag::String("minecraft:forced".into())),
         ])
     }));
+    // `TicketStorage` omits an empty `tickets` field altogether.
+    if entries.is_empty() {
+        fields.remove(&"tickets".into());
+    }
     write_dat(&path, root)
 }
 
@@ -4098,6 +4110,32 @@ mod tests {
                 .and_then(|v| v.get("tickets")),
             Some(&Tag::List(vec![tickets[0].clone()]))
         );
+        // Official vanilla after `/forceload remove all`: data compound
+        // exists but has no tickets key. Loading must succeed, and a no-op
+        // save must preserve the precise NBT bytes.
+        write_dat(
+            &path,
+            Tag::compound([
+                ("DataVersion", Tag::Int(DATA_VERSION)),
+                ("data", Tag::Compound(Default::default())),
+            ]),
+        )
+        .unwrap();
+        let vanilla_empty = std::fs::read(&path).unwrap();
+        assert!(read_forced_chunks(&root).unwrap().is_empty());
+        write_forced_chunks(&root, &std::collections::HashSet::new()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vanilla_empty);
+        write_forced_chunks(&root, &new).unwrap();
+        assert_eq!(read_forced_chunks(&root).unwrap(), new);
+        write_forced_chunks(&root, &std::collections::HashSet::new()).unwrap();
+        assert!(
+            read_dat(&path)
+                .unwrap()
+                .get("data")
+                .and_then(|data| data.get("tickets"))
+                .is_none()
+        );
+
         let malformed = Tag::compound([
             ("DataVersion", Tag::Int(DATA_VERSION)),
             (
