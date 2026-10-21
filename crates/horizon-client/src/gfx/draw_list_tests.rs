@@ -406,3 +406,156 @@ fn draw_list_distant_lod_first_phase_and_instance_offsets_match_reference() {
         }
     }
 }
+
+/// Test-only precomputed active group/prefix metadata. This requires extra
+/// memory per resident mesh and rebuild on remesh, so it must outperform the
+/// original `FaceGroups::ranges` in a *paired* benchmark to be useful.
+#[derive(Clone)]
+struct PrefixFaces {
+    faces: FaceGroups,
+    active: [(u8, u32, u32); FACE_GROUPS],
+    len: usize,
+}
+
+impl PrefixFaces {
+    fn new(faces: FaceGroups) -> Self {
+        let mut active = [(0, 0, 0); FACE_GROUPS];
+        let mut first = 0;
+        let mut len = 0;
+        for group in 0..FACE_GROUPS {
+            let quads = faces.quads[group];
+            if quads != 0 {
+                active[len] = (group as u8, first, quads);
+                len += 1;
+            }
+            first += quads;
+        }
+        Self { faces, active, len }
+    }
+
+    fn ranges(&self, eye: Vec3, mut emit: impl FnMut(u32, u32)) {
+        let mut run: Option<(u32, u32)> = None;
+        for &(group, first, quads) in &self.active[..self.len] {
+            if self.faces.visible(group as usize, eye) {
+                run = Some(match run {
+                    Some((start, len)) => (start, len + quads),
+                    None => (first, quads),
+                });
+            } else if let Some((start, len)) = run.take() {
+                emit(start, len);
+            }
+        }
+        if let Some((start, len)) = run {
+            emit(start, len);
+        }
+    }
+}
+
+fn build_with_prefix(items: &[Item], prefix: &[PrefixFaces], eye: Vec3, out: &mut List) {
+    assert_eq!(items.len(), prefix.len());
+    out.clear();
+    append_origins(items, out);
+    for (i, (s, prepared)) in items.iter().zip(prefix).enumerate() {
+        let (draws, pages) = if s.first_phase {
+            (&mut out.draws, &mut out.pages)
+        } else {
+            (&mut out.phase2, &mut out.phase2_pages)
+        };
+        prepared.ranges(eye - Vec3::from(s.origin), |first, quads| {
+            draws.push([
+                quads * 6,
+                u32::from(s.first_phase),
+                0,
+                (s.start + u64::from(first) * 4) as u32,
+                i as u32,
+            ]);
+            pages.push((s.page, None));
+        });
+    }
+    merge_phases(out);
+}
+
+#[test]
+fn prefixed_faces_match_original_ranges_with_camera_and_churn() {
+    let items = sample(1800, 109);
+    for eye in [Vec3::ZERO, Vec3::splat(-700.), Vec3::new(37., -54., 11.)] {
+        let prefixes = items
+            .iter()
+            .map(|s| PrefixFaces::new(s.faces))
+            .collect::<Vec<_>>();
+        let mut actual = List::default();
+        let mut cached = List::default();
+        build(&items, eye, &mut actual);
+        build_with_prefix(&items, &prefixes, eye, &mut cached);
+        assert_eq!(actual, cached);
+        for (original, prefix) in items.iter().zip(&prefixes) {
+            let point = eye - Vec3::from(original.origin);
+            let mut reference = Vec::new();
+            let mut proposed = Vec::new();
+            original.faces.ranges(point, |f, c| reference.push((f, c)));
+            prefix.ranges(point, |f, c| proposed.push((f, c)));
+            assert_eq!(proposed, reference);
+        }
+    }
+}
+
+/// Paired CPU cost of a potentially cached face-group prefix table. Does not
+/// include renderer `wgpu` calls; memory overhead and preparation are printed.
+#[test]
+#[ignore = "optimized research only: cargo test --profile fast --lib prefixed_face_cpu_speed -- --ignored --nocapture"]
+fn prefixed_face_cpu_speed() {
+    for (name, count) in [
+        ("small_rd8", 570),
+        ("meadow_rd16", 2965),
+        ("peak_rd32", 10707),
+        ("meadow_rd32", 13680),
+    ] {
+        let items = sample(count, 37);
+        let at = Instant::now();
+        let prefixes = items
+            .iter()
+            .map(|s| PrefixFaces::new(s.faces))
+            .collect::<Vec<_>>();
+        let prepare_us = at.elapsed().as_secs_f64() * 1e6;
+        for (view, eye) in [
+            ("overview", Vec3::ZERO),
+            ("off_axis", Vec3::new(220., -200., 310.)),
+        ] {
+            let mut original = List::default();
+            let mut prefix = List::default();
+            for _ in 0..5 {
+                build(&items, eye, &mut original);
+                build_with_prefix(&items, &prefixes, eye, &mut prefix);
+            }
+            assert_eq!(original, prefix);
+            let mut old = Vec::new();
+            let mut new = Vec::new();
+            for i in 0..48 {
+                for cache_first in [i % 2 == 0, i % 2 != 0] {
+                    let at = Instant::now();
+                    if cache_first {
+                        build_with_prefix(&items, &prefixes, eye, &mut prefix);
+                        new.push(at.elapsed().as_secs_f64() * 1e6);
+                        black_box(prefix.draws.len());
+                    } else {
+                        build(&items, eye, &mut original);
+                        old.push(at.elapsed().as_secs_f64() * 1e6);
+                        black_box(original.draws.len());
+                    }
+                }
+            }
+            assert_eq!(original, prefix);
+            let old = p(&mut old);
+            let new = p(&mut new);
+            println!(
+                "draw_prefix,scene={name},view={view},sections={count},draws={},prepare_us={prepare_us:.3},bytes_per_prepared={},baseline_p50_us={:.3},prefix_p50_us={:.3},baseline_p95_us={:.3},prefix_p95_us={:.3}",
+                original.draws.len(),
+                std::mem::size_of::<PrefixFaces>(),
+                old.0,
+                new.0,
+                old.1,
+                new.1
+            );
+        }
+    }
+}
