@@ -327,6 +327,14 @@ pub fn merge_nearby_items(
     if items.len() < 2 {
         return;
     }
+    // Stationary items only scan on tick 40, 80, etc. Return before making
+    // a full spatial index when *no active, mergeable item* is due to scan.
+    // No earlier item may alter the candidate state before this first scan.
+    let Some(first_due) = items.iter().position(|item| {
+        actively_ticking(item) && item_can_merge(item, &max_stack) && item_merge_scan_due(item)
+    }) else {
+        return;
+    };
     let mut removed = vec![false; items.len()];
     // A single per-tick spatial grid turns distant pairs into constant-sized
     // neighbourhood lookups. Sorted candidate indexes preserve the exact
@@ -342,18 +350,15 @@ pub fn merge_nearby_items(
         .values()
         .all(|cell| cell.len() <= MAX_INDEXED_CELL);
     let mut nearby = Vec::new();
-    for i in 0..items.len() {
-        if removed[i] || !actively_ticking(&items[i]) || !item_can_merge(&items[i], &max_stack) {
-            continue;
-        }
-        // ItemEntity.tick: crossing an integer block coordinate checks every
-        // 2 ticks, otherwise every 40; the entity tickCount, not its Age.
-        let a = &items[i];
-        let crossed = (a.previous.x.floor() != a.position.x.floor())
-            || (a.previous.y.floor() != a.position.y.floor())
-            || (a.previous.z.floor() != a.position.z.floor());
-        let period = if crossed { 2 } else { 40 };
-        if !a.tick_count.is_multiple_of(period) {
+    for i in first_due..items.len() {
+        // The first initiator was just validated. Check later initiators at
+        // their actual iteration time, since earlier merges may change them.
+        if i != first_due
+            && (removed[i]
+                || !actively_ticking(&items[i])
+                || !item_can_merge(&items[i], &max_stack)
+                || !item_merge_scan_due(&items[i]))
+        {
             continue;
         }
         if indexed {
@@ -505,6 +510,14 @@ fn merge_nearby_items_scan_reference(
         next += 1;
         keep
     });
+}
+
+/// ItemEntity's own check cadence, independent of saved Age.
+fn item_merge_scan_due(a: &ItemEntity) -> bool {
+    let crossed = (a.previous.x.floor() != a.position.x.floor())
+        || (a.previous.y.floor() != a.position.y.floor())
+        || (a.previous.z.floor() != a.position.z.floor());
+    a.tick_count.is_multiple_of(if crossed { 2 } else { 40 })
 }
 
 fn item_can_merge(item: &ItemEntity, max_stack: &impl Fn(&str) -> u32) -> bool {
@@ -1407,6 +1420,63 @@ mod item_merge_parity_tests {
                         "merge mismatch scene={scene} n={count} sample={repetition}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn merge_preflight_never_skips_the_first_due_item_or_frozen_entity() {
+        for scene in ["sparse", "clusters", "dense"] {
+            let mut items = merge_load(48, scene);
+            for entity in &mut items {
+                entity.tick_count = 39;
+                entity.previous = entity.position;
+            }
+            let before = items.clone();
+            merge_nearby_items(&mut items, |_| 64, |_| true);
+            assert_eq!(format!("{items:?}"), format!("{before:?}"));
+            // The only due item is deliberately late in the entity list.
+            items[47].tick_count = 40;
+            let mut baseline = items.clone();
+            merge_nearby_items_scan_reference(&mut baseline, |_| 64, |_| true);
+            merge_nearby_items(&mut items, |_| 64, |_| true);
+            assert_eq!(
+                format!("{items:?}"),
+                format!("{baseline:?}"),
+                "scene={scene}"
+            );
+            // If its chunk is not ticking, it must not initiate a scan.
+            let mut dormant = before;
+            dormant[47].tick_count = 40;
+            let frozen = dormant.clone();
+            merge_nearby_items(&mut dormant, |_| 64, |e| e.id != 48);
+            assert_eq!(format!("{dormant:?}"), format!("{frozen:?}"));
+        }
+    }
+
+    #[test]
+    #[ignore = "manual idle-tick benchmark for assessing avoidable spatial index builds"]
+    fn item_merge_unscheduled_tick_benchmark() {
+        use std::hint::black_box;
+        for scene in ["sparse", "clusters", "dense"] {
+            for count in [64usize, 256, 1024, 4096] {
+                let mut source = merge_load(count, scene);
+                for item in &mut source {
+                    item.tick_count = 39;
+                    item.previous = item.position;
+                }
+                let rounds = if count >= 4096 { 12 } else { 40 };
+                let start = std::time::Instant::now();
+                for _ in 0..rounds {
+                    let mut items = source.clone();
+                    merge_nearby_items(&mut items, |_| 64, |_| true);
+                    assert_eq!(items.len(), count);
+                    black_box(&items);
+                }
+                println!(
+                    "ITEM_MERGE_IDLE scene={scene} n={count} ns_per_iter={}",
+                    start.elapsed().as_nanos() / rounds as u128
+                );
             }
         }
     }
