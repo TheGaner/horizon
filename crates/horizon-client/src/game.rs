@@ -9725,6 +9725,20 @@ impl Game<'_> {
             border,
             game_time: self.world.game_time as f32,
             shader_game_time: ((self.world.game_time % 24000) as f32 + alpha as f32) / 24000.0,
+            shadow_rect: self
+                .gui
+                .atlas
+                .sprites
+                .get("misc/shadow")
+                .map_or([0.0; 4], |r| [r.u0, r.v0, r.u1, r.v1]),
+            shadow_sampling: self
+                .gui
+                .atlas
+                .sampling
+                .get("misc/shadow")
+                .map_or([0.0; 4], |flags| {
+                    [f32::from(flags.blur), f32::from(flags.clamp), 0.0, 0.0]
+                }),
             crumbling_sprite: self
                 .gui
                 .atlas
@@ -12193,6 +12207,8 @@ fn loading_frame(hud: &HudBatch) -> Frame<'_> {
         shader_game_time: 0.0,
         end_portal_sprites: [[0.0; 4]; 2],
         crumbling_sprite: [0.0; 4],
+        shadow_rect: [0.0; 4],
+        shadow_sampling: [0.0; 4],
         ticks: 0,
         darkness: (0.0, 0.0),
         night_vision: 0.0,

@@ -1274,6 +1274,38 @@ mod tests {
     }
 
     #[test]
+    fn vanilla_shadow_clamp_metadata_is_available_to_the_3d_renderer() {
+        let root = std::env::temp_dir().join(format!("horizon-335-shadow-{}", std::process::id()));
+        let dir = root.join("assets/minecraft/textures/misc");
+        fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shadow.png");
+        let mut encoder = png::Encoder::new(fs::File::create(&png).unwrap(), 16, 16);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&vec![255; 16 * 16 * 4])
+            .unwrap();
+        fs::write(
+            png.with_extension("png.mcmeta"),
+            r#"{"texture":{"clamp":true}}"#,
+        )
+        .unwrap();
+        let atlas = HudAtlas::build(&root).unwrap();
+        assert_eq!(
+            atlas.sampling.get("misc/shadow"),
+            Some(&TextureSampling {
+                blur: false,
+                clamp: true
+            })
+        );
+        let rect = atlas.sprites["misc/shadow"];
+        assert!(rect.u1 > rect.u0 && rect.v1 > rect.v0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn packed_resource_overlay_changes_sampler_without_changing_png() {
         use crate::hud_layout::{self, Blend, GuiDraw};
         use std::borrow::Cow;

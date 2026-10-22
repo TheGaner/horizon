@@ -118,6 +118,10 @@ struct Globals {
     crumbling_sprite: [f32; 4],
     /// Framebuffer size, selection stroke width, perspective layering scale.
     outline_params: [f32; 4],
+    /// Standalone 3D entity-shadow atlas region (u0, v0, u1, v1).
+    shadow_rect: [f32; 4],
+    /// PNG.mcmeta texture blur/clamp override, from selected packs.
+    shadow_sampling: [f32; 4],
 }
 pub type SectionKey = (i32, i32, i32);
 struct SectionGpu {
@@ -221,6 +225,8 @@ pub struct Frame<'a> {
     /// A destroy-stage sprite: projected UVs repeat inside a rect of this size, from the
     /// origin each crack vertex carries (`breaking::stage_light`).
     pub crumbling_sprite: [f32; 4],
+    pub shadow_rect: [f32; 4],
+    pub shadow_sampling: [f32; 4],
     pub ticks: u64,
     /// The darkness effect on the lightmap: the brightness it takes off the
     /// gamma option and the pulsing scale subtracted from the light.
@@ -2931,6 +2937,8 @@ impl Renderer {
                 0.0,
             ],
             outline_params: outline_params(self.config.width, self.config.height),
+            shadow_rect: frame.shadow_rect,
+            shadow_sampling: frame.shadow_sampling,
         };
         self.uploads
             .buffer(&mut encoder, &self.globals, 0, bytemuck::bytes_of(&globals));

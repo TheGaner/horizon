@@ -5,6 +5,10 @@
 use crate::{blocks::BlockFacts, hud::Rect, mesher::Vertex, world::World};
 use glam::DVec3;
 
+/// Distinct material ID: shadow texture sampling must not change entity,
+/// block or enchantment-glint samplers that share the same GPU atlas.
+pub const SHADOW_LAYER: u32 = 14;
+
 /// Vanilla renderer shadow radius and strength for an entity type id.
 pub fn shadow_params(entity: &str) -> (f32, f32) {
     let id = entity.strip_prefix("minecraft:").unwrap_or(entity);
@@ -113,7 +117,7 @@ pub fn shadow(
                             sprite.u0 + (sprite.u1 - sprite.u0) * u(wx),
                             sprite.v0 + (sprite.v1 - sprite.v0) * v(wz),
                         ],
-                        layer: 0,
+                        layer: SHADOW_LAYER,
                         color,
                         light: 240 | 240 << 8,
                     });
@@ -126,6 +130,13 @@ pub fn shadow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shadow_uses_a_material_distinct_from_ordinary_entities() {
+        // EntityBatch's material 0 still draws layer 14 as an ordinary
+        // translucent entity run; only entity.wgsl switches sampler there.
+        assert_eq!(SHADOW_LAYER, 14);
+        assert!(![0, 2, 4, 6, 7, 8, 9, 10, 11, 12, 13].contains(&SHADOW_LAYER));
+    }
     #[test]
     fn vanilla_radii() {
         assert_eq!(shadow_params("minecraft:zombie"), (0.5, 1.0));

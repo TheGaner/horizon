@@ -19,6 +19,8 @@ struct Globals {
     crumbling_sprite: vec4<f32>,
     // Selection outline parameters (read by terrain.wgsl).
     outline_params: vec4<f32>,
+    shadow_rect: vec4<f32>,
+    shadow_sampling: vec4<f32>,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;
 @group(0) @binding(1) var atlas: texture_2d<f32>;
@@ -144,6 +146,38 @@ fn linear_fog(d: f32, start: f32, end: f32) -> f32 {
     if d >= end { return 1.0; }
     return (d - start) / (end - start);
 }
+// Only the shadow material (layer 14) reads the per-PNG texture flags.
+// The shadow graphic occupies a RECT of the shared atlas. Four bilinear taps
+// and repeat/clamp addressing must each stay within this standalone image.
+fn shadow_texel(at: vec2<i32>) -> vec4<f32> {
+    let atlas_size = vec2<f32>(textureDimensions(atlas));
+    let rect = globals.shadow_rect;
+    let origin = vec2<i32>(round(rect.xy * atlas_size));
+    let extent = max(vec2<i32>(round((rect.zw - rect.xy) * atlas_size)), vec2<i32>(1));
+    var local = at;
+    if globals.shadow_sampling.y > 0.5 {
+        local = clamp(local, vec2<i32>(0), extent - vec2<i32>(1));
+    } else {
+        local = ((local % extent) + extent) % extent;
+    }
+    return textureLoad(atlas, origin + local, 0);
+}
+fn shadow_sample(uv: vec2<f32>) -> vec4<f32> {
+    let rect = globals.shadow_rect;
+    let atlas_size = vec2<f32>(textureDimensions(atlas));
+    let extent = max(round((rect.zw - rect.xy) * atlas_size), vec2<f32>(1.0));
+    let pixel = (uv - rect.xy) / (rect.zw - rect.xy) * extent;
+    if globals.shadow_sampling.x > 0.5 {
+        let shifted = pixel - vec2<f32>(0.5);
+        let origin = vec2<i32>(floor(shifted));
+        let f = fract(shifted);
+        let top = mix(shadow_texel(origin), shadow_texel(origin + vec2<i32>(1, 0)), f.x);
+        let bottom = mix(shadow_texel(origin + vec2<i32>(0, 1)), shadow_texel(origin + vec2<i32>(1, 1)), f.x);
+        return mix(top, bottom, f.y);
+    }
+    return shadow_texel(vec2<i32>(floor(pixel)));
+}
+
 @fragment fn fs_entity(in: Out, @builtin(front_facing) front: bool) -> @location(0) vec4<f32> {
     var uv = in.uv;
     if in.overlay == 6u { uv.y = in.wrap.x + fract(in.uv.y) * in.wrap.y; }
@@ -151,7 +185,11 @@ fn linear_fog(d: f32, start: f32, end: f32) -> f32 {
         // Each crack's stage sprite origin comes in its light bytes (breaking::stage_light).
         uv = in.wrap + fract(in.uv) * globals.crumbling_sprite.zw;
     }
+    // Other entity materials retain the existing sampling path.
     var color = textureSample(atlas, atlas_sampler, uv) * select(in.back_color, in.color, front);
+    if in.overlay == 14u {
+        color = shadow_sample(uv) * select(in.back_color, in.color, front);
+    }
     if in.overlay == 9u || in.overlay == 10u {
         // rendertype_end_portal: end_sky and PORTAL_LAYERS (15 for portals, 16
         // for gateways) layers of end_portal.png projected from the screen.
