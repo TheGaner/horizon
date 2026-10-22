@@ -46,7 +46,7 @@ use std::{
     },
 };
 
-pub const VERSION_NAME: &str = "26.3";
+pub const VERSION_NAME: &str = horizon_core::VANILLA_VERSION;
 
 /// Snapshot live block entities and custom names for a save batch without
 /// mutating the world. Each map is visited once, retaining its iteration order
@@ -154,7 +154,15 @@ pub fn dimension_dir(world: &Path, dimension: &str) -> PathBuf {
 }
 /// `DirectoryLock`: `session.lock` holds "\u{2603}" (UTF-16BE) under an exclusive
 /// file lock for as long as the world is open, so two instances cannot share it.
-pub struct SessionLock(#[allow(dead_code)] fs::File);
+pub struct SessionLock(fs::File);
+impl Drop for SessionLock {
+    /// `DirectoryLock.close`: release the lock, then close the file. Closing
+    /// alone keeps the lock while any copy of the descriptor lives on, such as
+    /// the one a process spawned on another thread holds until its `exec`.
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
 impl SessionLock {
     pub fn acquire(world: &Path) -> Result<Self> {
         use std::io::Write;
@@ -1487,6 +1495,7 @@ struct Writer {
 #[derive(Default)]
 struct Outstanding {
     count: Mutex<usize>,
+    error: Mutex<Option<String>>,
     done: Condvar,
 }
 /// One dimension folder (`dimensions/minecraft/<name>`). Region files are
@@ -1622,11 +1631,22 @@ impl SaveDir {
             let mut writer = self.writer.lock().map_err(|_| "writer poisoned")?;
             let writer = writer.get_or_insert_with(|| self.start_writer());
             if writer.send.send((entities, batch)).is_err() {
+                *self
+                    .outstanding
+                    .error
+                    .lock()
+                    .map_err(|_| "writer poisoned")? = Some("the region writer stopped".into());
+                *self
+                    .outstanding
+                    .count
+                    .lock()
+                    .map_err(|_| "writer poisoned")? -= 1;
+                self.outstanding.done.notify_all();
                 return Err("the region writer stopped".into());
             }
         }
         if wait {
-            self.flush();
+            self.flush()?;
         }
         Ok(())
     }
@@ -1657,11 +1677,16 @@ impl SaveDir {
                         .filter(|(k, _, seq)| newest(k, *seq))
                         .map(|(k, r, _)| (*k, r))
                         .collect();
-                    if let Err(e) = write_region_records(&root, cache, folder, &records) {
-                        log::warn!("Horizon: failed to write {folder} files: {e}");
+                    let result = write_region_records(&root, cache, folder, &records);
+                    if let Err(e) = &result {
+                        let message = format!("failed to write {folder} files: {e}");
+                        log::warn!("Horizon: {message}");
+                        *outstanding.error.lock().unwrap() = Some(message);
                     }
-                    // Readers find the files (and a fresh region cache) from here on.
-                    if let Ok(mut pending) = pending.lock() {
+                    // Keep failed snapshots readable; never report them as durable.
+                    if result.is_ok()
+                        && let Ok(mut pending) = pending.lock()
+                    {
                         for (k, _, seq) in &batch {
                             if pending
                                 .get(&(entities, k.0, k.1))
@@ -1681,15 +1706,41 @@ impl SaveDir {
         Writer { send, thread }
     }
     /// Wait until every queued write is on disk.
-    pub fn flush(&self) {
-        let Ok(mut count) = self.outstanding.count.lock() else {
-            return;
-        };
+    pub fn flush(&self) -> Result<()> {
+        let mut count = self
+            .outstanding
+            .count
+            .lock()
+            .map_err(|_| "writer poisoned")?;
         while *count > 0 {
-            count = match self.outstanding.done.wait(count) {
-                Ok(c) => c,
-                Err(_) => return,
-            };
+            count = self
+                .outstanding
+                .done
+                .wait(count)
+                .map_err(|_| "writer poisoned")?;
+        }
+        self.write_result()
+    }
+    /// Poll durability without holding up the event loop. Errors remain visible
+    /// to every waiter, including a later synchronous shutdown.
+    pub fn writes_finished(&self) -> Result<bool> {
+        let count = self
+            .outstanding
+            .count
+            .lock()
+            .map_err(|_| "writer poisoned")?;
+        self.write_result()?;
+        Ok(*count == 0)
+    }
+    fn write_result(&self) -> Result<()> {
+        match &*self
+            .outstanding
+            .error
+            .lock()
+            .map_err(|_| "writer poisoned")?
+        {
+            Some(error) => Err(error.clone().into()),
+            None => Ok(()),
         }
     }
     /// Write `chunks` into their region files and wait until they are on disk.
@@ -3710,6 +3761,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]
+    fn write_completion_polls_without_waiting_and_keeps_latest_snapshot() {
+        let dir = std::env::temp_dir().join(format!("horizon-save-poll-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let save = super::SaveDir::new(dir.clone());
+        let lock = super::SessionLock::acquire(&dir).unwrap();
+        let path = save.region_path("entities", 0, 0);
+        let region = super::cached_region(&save.entity_regions, (0, 0), &path, true)
+            .unwrap()
+            .unwrap();
+        // Hold the actual region lock, rather than relying on disk speed or sleeps.
+        let blocked = region.lock().unwrap();
+        let entity = |version| Tag::compound([("version", Tag::Int(version))]);
+        save.save_entities_later(vec![((1, 2), vec![entity(1)])])
+            .unwrap();
+        save.save_entities_later(vec![((1, 2), vec![entity(2)])])
+            .unwrap();
+        assert!(!save.writes_finished().unwrap());
+        assert_eq!(save.load_entities(1, 2), vec![entity(2)]);
+        assert!(super::SessionLock::acquire(&dir).is_err());
+        drop(blocked);
+        save.flush().unwrap();
+        assert!(save.writes_finished().unwrap());
+        let reopened = super::SaveDir::new(dir.clone());
+        assert_eq!(reopened.load_entities(1, 2), vec![entity(2)]);
+        save.save_entities_later(vec![((1, 2), vec![])]).unwrap();
+        save.flush().unwrap();
+        assert!(
+            super::SaveDir::new(dir.clone())
+                .load_entities(1, 2)
+                .is_empty()
+        );
+        drop((reopened, save, lock));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn failed_async_writes_are_readable_and_never_reported_durable() {
+        let dir = std::env::temp_dir().join(format!("horizon-save-failure-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file where a directory is needed causes a real writer I/O error.
+        std::fs::write(dir.join("entities"), b"blocked").unwrap();
+        let save = super::SaveDir::new(dir.clone());
+        let entity = Tag::compound([("version", Tag::Int(3))]);
+        save.save_entities_later(vec![((0, 0), vec![entity.clone()])])
+            .unwrap();
+        assert!(save.flush().is_err());
+        assert!(save.writes_finished().is_err());
+        assert_eq!(save.load_entities(0, 0), vec![entity]);
+        // The failure stays visible on subsequent barriers too.
+        assert!(save.flush().is_err());
+        drop(save);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn session_lock_is_exclusive() {
         let dir = std::env::temp_dir().join(format!("horizon-lock-{}", std::process::id()));
         let first = super::SessionLock::acquire(&dir).expect("first lock");
@@ -3720,6 +3827,19 @@ mod tests {
         );
         drop(first);
         assert!(super::SessionLock::acquire(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// #749: a copy of the lock's descriptor (a child process spawned on
+    /// another thread holds one until it execs) must not keep a released
+    /// world locked.
+    #[test]
+    fn session_lock_releases_while_a_descriptor_copy_lives() {
+        let dir = std::env::temp_dir().join(format!("horizon-lock-copy-{}", std::process::id()));
+        let lock = super::SessionLock::acquire(&dir).expect("first lock");
+        let copy = lock.0.try_clone().unwrap();
+        drop(lock);
+        assert!(super::SessionLock::acquire(&dir).is_ok());
+        drop(copy);
         let _ = std::fs::remove_dir_all(&dir);
     }
     #[test]

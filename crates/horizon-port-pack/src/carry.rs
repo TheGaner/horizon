@@ -24,7 +24,7 @@ pub struct Report {
     pub outside: Vec<String>,
     /// Files of the mod's own content the game would refuse, kept in
     /// `outside/` too, with why: a path vanilla does not read (upper case),
-    /// JSON that does not parse, a vanilla tag the mod replaces.
+    /// JSON that does not parse.
     pub unreadable: BTreeMap<String, String>,
     pub recipes_upgraded: usize,
     pub loot_tables_upgraded: usize,
@@ -114,6 +114,52 @@ pub fn template(name: &str, properties: &BTreeSet<String>) -> Option<&'static st
     };
     fits.min_by_key(|&(extra, t)| (extra, hint(t)))
         .map(|(_, t)| t)
+}
+
+/// [`template`] for a blockstate file. A wall's sides are `none`, `low` or
+/// `tall`; sides and `up` that are `true` or `false` are a vine's (Chipped's
+/// vines), which the names alone take for a wall.
+pub fn block_template(name: &str, blockstate: &Value) -> Option<&'static str> {
+    let t = template(name, &properties(blockstate))?;
+    let boolean = ["north", "east", "south", "west"]
+        .iter()
+        .flat_map(|side| values(blockstate, side))
+        .any(|v| v == "true" || v == "false");
+    Some(if t == "minecraft:cobblestone_wall" && boolean {
+        "minecraft:vine"
+    } else {
+        t
+    })
+}
+
+/// The values a blockstate file tests a property for.
+fn values(blockstate: &Value, property: &str) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    for key in blockstate["variants"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(k, _)| k)
+    {
+        for pair in key.split(',') {
+            if let Some((k, v)) = pair.split_once('=')
+                && k == property
+            {
+                out.insert(v.to_owned());
+            }
+        }
+    }
+    for part in blockstate["multipart"].as_array().into_iter().flatten() {
+        let when = &part["when"];
+        let mut conditions: Vec<&Value> = vec![when];
+        for or in ["OR", "AND"] {
+            conditions.extend(when[or].as_array().into_iter().flatten());
+        }
+        for v in conditions.iter().filter_map(|c| c[property].as_str()) {
+            out.extend(v.trim_start_matches('!').split('|').map(str::to_owned));
+        }
+    }
+    out
 }
 
 /// The property names a blockstate file uses.
@@ -563,13 +609,12 @@ fn unreadable(name: &str, bytes: &mut Vec<u8>) -> Option<String> {
             Err(_) => return Some(format!("does not parse as JSON: {e}")),
         },
     };
+    // A vanilla or convention tag that replaces is kept: the game honours it
+    // as a data pack's, with a warning (docs/mods.md). A tag of the mod's own
+    // that replaces: no pack before it defines the tag, so it is the same tag
+    // added to (Towns and Towers' biome tags).
     let shared_tag = name.starts_with("data/minecraft/tags/") || name.starts_with("data/c/tags/");
-    if shared_tag && value.get("replace").and_then(Value::as_bool) == Some(true) {
-        return Some("replaces a shared tag; a content mod may only add to it".into());
-    }
-    // A tag of the mod's own that replaces: no pack before it defines the
-    // tag, so it is the same tag added to (Towns and Towers' biome tags).
-    let own_tag = name.starts_with("data/") && name.contains("/tags/");
+    let own_tag = !shared_tag && name.starts_with("data/") && name.contains("/tags/");
     if own_tag && let Some(o) = value.as_object_mut().filter(|o| o.contains_key("replace")) {
         o.remove("replace");
         *bytes = serde_json::to_vec_pretty(&value).expect("a parsed value serializes");
@@ -1020,7 +1065,7 @@ pub fn carry(
         }
     } else {
         for (b, state) in &blockstates {
-            match template(b, &properties(state)) {
+            match block_template(b, state) {
                 Some(t) => {
                     write_decl("block", b, &json!({"template": t}))?;
                     report.blocks.insert(b.clone(), t.to_owned());
@@ -1310,6 +1355,18 @@ mod tests {
             template("gem_block", &properties(&json!({"variants": {"": {}}}))),
             Some("minecraft:stone")
         );
+        // Walls and vines have the same sides and up; their values tell them apart.
+        let wall = json!({"multipart": [{"when": {"up": "true"}},
+            {"when": {"north": "low"}}, {"when": {"east": "tall"}},
+            {"when": {"south": "low"}}, {"when": {"west": "low"}}]});
+        assert_eq!(
+            block_template("gem_wall", &wall),
+            Some("minecraft:cobblestone_wall")
+        );
+        let vine = json!({"multipart": [{"when": {"up": "true"}},
+            {"when": {"up": "false", "north": "false", "east": "false", "south": "false",
+                "west": "false"}}, {"when": {"north": "true"}}]});
+        assert_eq!(block_template("gem_vine", &vine), Some("minecraft:vine"));
         let odd = json!({"variants": {"charge=1,mode=fast": {}}});
         assert_eq!(template("gem_core", &properties(&odd)), None);
     }
@@ -1376,13 +1433,13 @@ mod tests {
                     "location": "gem:hut", "projection": "rigid",
                     "processors": {"processors": [{"processor_type": "lithostitched:block_swap"}]}}}]}"#,
             ),
-            // What the game would refuse: vanilla skips these files alone.
-            ("assets/gem/lang/ry_UA.json", r#"{"item.gem.gem": "Gem"}"#),
-            ("data/gem/tags/item/empty.json", ""),
             (
                 "data/minecraft/tags/worldgen/biome/has_structure/village_plains.json",
                 r#"{"replace": true, "values": []}"#,
             ),
+            // What the game would refuse: vanilla skips these files alone.
+            ("assets/gem/lang/ry_UA.json", r#"{"item.gem.gem": "Gem"}"#),
+            ("data/gem/tags/item/empty.json", ""),
             (
                 "assets/gem/lang/de_de.json",
                 "\u{feff}{\"item.gem.gem\": \"Juwel\"}",
@@ -1415,17 +1472,25 @@ mod tests {
             &BTreeMap::new(),
         )
         .unwrap();
-        assert_eq!(report.copied, 14);
+        assert_eq!(report.copied, 15);
         let unreadable: Vec<&str> = report.unreadable.keys().map(String::as_str).collect();
         assert_eq!(
             unreadable,
             [
                 "assets/gem/lang/ry_UA.json",
-                "data/gem/tags/item/empty.json",
-                "data/minecraft/tags/worldgen/biome/has_structure/village_plains.json",
+                "data/gem/tags/item/empty.json"
             ]
         );
-        assert_eq!(report.outside.len(), 3);
+        assert_eq!(report.outside.len(), 2);
+        // A vanilla tag that replaces is kept as it is: the game honours it.
+        let replacing: Value = serde_json::from_slice(
+            &fs::read(out.join(
+                "carry/data/minecraft/tags/worldgen/biome/has_structure/village_plains.json",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(replacing, json!({"replace": true, "values": []}));
         assert!(!out.join("carry/data/gem/tags/item/empty.json").exists());
         // A byte-order mark is dropped, the file kept.
         assert_eq!(

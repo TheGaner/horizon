@@ -85,6 +85,8 @@ pub struct HostState {
     pub attributes: Vec<play::AttributeSnapshot>,
     /// `LivingEntity.DATA_LIVING_ENTITY_FLAGS` (the item in use).
     pub living_flags: i8,
+    /// The bed the host sleeps in (`LivingEntity.SLEEPING_POS`).
+    pub bed: Option<[i32; 3]>,
 }
 
 /// Everything the hub needs from the game for one tick.
@@ -103,6 +105,9 @@ pub struct TickCtx<'a> {
     /// TickRateManager: the tick rate and whether the game is frozen.
     pub tick_rate: f32,
     pub tick_frozen: bool,
+    /// `/tick step`: a count that changes with each step started or
+    /// stopped, and the ticks the frozen game still runs (`FixedStep::step_state`).
+    pub tick_steps: (u32, i32),
     /// Block collisions, for ServerGamePacketListenerImpl's moved-wrongly
     /// check (none: moves are not checked against blocks).
     pub collision: Option<&'a BlockCollisionRegistry<'a>>,
@@ -145,6 +150,8 @@ pub struct Hub {
     last_clock: i64,
     last_rate: f32,
     ticking: (f32, bool),
+    /// The `tick_steps` count last broadcast.
+    stepping: u32,
     weather: (bool, f32, f32),
     /// The clock and weather last sent in the levels not in place, by
     /// dimension (`set_dimension` swaps them with the fields above).
@@ -278,6 +285,7 @@ impl Hub {
             last_clock: i64::MIN,
             last_rate: 0.0,
             ticking: (20.0, false),
+            stepping: 0,
             ops: Default::default(),
             weather: (false, 0.0, 0.0),
             level_sync: Default::default(),
@@ -880,7 +888,9 @@ impl Hub {
         }));
         // TickRateManager.updateJoiningPlayer.
         g.send(&ticking_state(ctx.tick_rate, ctx.tick_frozen));
-        g.send(&raw(ids::TICKING_STEP, vec![0]));
+        g.send(&C::TickingStep(play::TickingStep {
+            steps: ctx.tick_steps.1,
+        }));
     }
 
     /// ServerClockManager.createFullSyncPacket: every clock. Horizon keeps the
@@ -1018,6 +1028,7 @@ impl Hub {
             // (`updateJoiningPlayer`).
             if !self.guests.iter().any(|g| g.placed) {
                 self.ticking = (ctx.tick_rate, ctx.tick_frozen);
+                self.stepping = ctx.tick_steps.0;
             }
             if !self
                 .guests
@@ -1145,6 +1156,13 @@ impl Hub {
         if (ctx.tick_rate, ctx.tick_frozen) != self.ticking {
             self.ticking = (ctx.tick_rate, ctx.tick_frozen);
             self.broadcast(&ticking_state(ctx.tick_rate, ctx.tick_frozen));
+        }
+        // ServerTickRateManager.updateStepTicks: a step started or stopped.
+        if ctx.tick_steps.0 != self.stepping {
+            self.stepping = ctx.tick_steps.0;
+            self.broadcast(&C::TickingStep(play::TickingStep {
+                steps: ctx.tick_steps.1,
+            }));
         }
         let w = &world.weather;
         let (raining, rain, thunder) = self.weather;
@@ -1451,6 +1469,7 @@ impl Hub {
         on_ground: bool,
         flags: (bool, bool, bool, bool),
         living_flags: i8,
+        bed: Option<[i32; 3]>,
         skin: u8,
         health: f32,
         equipment: Vec<(u8, Option<horizon_protocol::item::Stack>)>,
@@ -1486,6 +1505,11 @@ impl Hub {
         // Always there: the trackers send the entries that changed, and an
         // item no longer in use is a change back to 0.
         meta.push((8, serializer::BYTE, Value::Byte(living_flags)));
+        // LivingEntity.SLEEPING_POS: the others draw the player lying in it,
+        // a player paired later too.
+        if let Some(bed) = bed.filter(|_| sleeping) {
+            meta.push((14, serializer::OPTIONAL_BLOCK_POS, Value::OptPos(Some(bed))));
+        }
         if (health - 1.0).abs() > f32::EPSILON && health != 20.0 {
             meta.push((9, serializer::FLOAT, Value::Float(health)));
         }
@@ -1549,8 +1573,9 @@ impl Hub {
                 h.position,
                 (h.yaw, h.pitch, h.head_yaw),
                 h.on_ground,
-                (h.sneaking, h.sprinting, false, false),
+                (h.sneaking, h.sprinting, false, h.bed.is_some()),
                 h.living_flags,
+                h.bed,
                 0x7F,
                 h.health,
                 equipment,
@@ -1582,6 +1607,7 @@ impl Hub {
                     g.on_ground,
                     (g.sneaking, g.sprinting, g.fall_flying, g.sleeping),
                     g.living_flags,
+                    g.bed,
                     g.info.model_customisation,
                     g.health,
                     equipment,

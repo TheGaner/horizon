@@ -102,6 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         equipment: Default::default(),
         health: 20.0,
         attributes: Vec::new(),
+        bed: None,
         living_flags: 0,
     };
     loop {
@@ -118,6 +119,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             clock_rate: 1.0,
             tick_rate: 20.0,
             tick_frozen: false,
+            tick_steps: (0, 0),
             collision: None,
         };
         for event in hub.tick(&mut ctx) {

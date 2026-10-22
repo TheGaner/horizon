@@ -25,23 +25,20 @@ to players. Players still prepare their own copy from their official launcher (`
   exporters (`mods/horizon/src/test/java/dev/horizonlab/parity/Vanilla*Exporter.java`) against the jar for block
   behaviours, worldgen bundles and the like. CI does the same through `tools/ci/vanilla-data.sh`, keyed by the
   version in `research-lock.json`.
-- **Version facts baked into the code.** The client jar's own `version.json` states them (26.3: world version 5023,
-  protocol 777, resource pack 97.1, data pack 121.0, Java 25); Horizon copies them by hand today:
-
-  | Where | What |
-  | --- | --- |
-  | `crates/horizon-core/src/lib.rs` | `VANILLA_VERSION` |
-  | `crates/horizon-protocol/src/lib.rs` | `PROTOCOL_VERSION`, `GAME_VERSION` |
-  | `crates/horizon-protocol/src/packets/configuration.rs` | the `minecraft:core` known pack version |
-  | `crates/horizon-world/src/lib.rs`, `crates/horizon-client/src/game/commands/extra.rs` | `DATA_VERSION` (twice) |
-  | `crates/horizon-client/src/save.rs`, `crates/horizon-world/src/datafix/files.rs`, `game/commands/extra.rs` | the version name (three times) |
-  | `crates/horizon-client/src/crash.rs`, `bin/horizon-ctl/launch.rs`, `launcher/src/backend.rs` | `"26.3"` fallbacks |
-  | `tools/perf_bench.py`, `tools/vanilla_client.py` | the vanilla client's `--version` |
+- **Version facts in the code.** The client jar's own `version.json` states them (26.3: world version 5023,
+  protocol 777, resource pack 97.1, data pack 121.0, Java 25). `tools/gen_version_consts.py` writes them into
+  one generated file, `crates/horizon-core/src/version.rs` (`VANILLA_VERSION`, `PROTOCOL_VERSION`,
+  `DATA_VERSION`, the pack formats, Java, `/version`'s build time), and every Rust site reads them from there
+  (`horizon_protocol::PROTOCOL_VERSION`, `horizon_world::DATA_VERSION` and the save's version name are aliases
+  of it; the status, the legacy ping, the crash report, `/version`, the title screens and the default resource
+  folder use it). CI checks the file against the pinned jar (`--check`). Test fixtures that state a version
+  (a level.dat to read, a relay message) keep their literals: they test parsing, not the pin.
 
 - **Generated tables** (each has its generator in `tools/`):
 
   | Output | Generator | Input |
   | --- | --- | --- |
+  | `crates/horizon-core/src/version.rs` | `gen_version_consts.py` | the client jar's `version.json` |
   | `crates/horizon-protocol/src/ids.rs` | `generate_packet_ids.py` | `packets.json` report |
   | `crates/horizon-client/src/lan/tracking.rs` | `generate_entity_tracking.py` | decompiled `EntityTypes` |
   | `crates/horizon-client/src/lan/command_suggestions.rs` | `generate_command_suggestions.py` | `VanillaCommandSuggestionsExporter` |
@@ -100,9 +97,12 @@ latest release (and, with `--snapshots`, the latest snapshot) with the pin and w
 `versions/detect-state.json`, and prints what is new; exit status 0 means "nothing new", 10 "new release",
 11 "new snapshot". It needs only the network, so it can run anywhere:
 
-- **Mac mini, launchd (chosen):** a `~/fleet` launchd agent runs `version_port.py detect --then port` daily at
-  14:00 UTC (Mojang publishes on weekdays around 10:00-14:00 UTC), in a dedicated worktree of `origin/main`,
-  at `~/fleet/load prio low`. The whole port runs where the vanilla data, Java and the harnesses are.
+- **Mac mini, launchd (chosen):** the agent `dev.horizon.version-port` (`tools/ci/dev.horizon.version-port.plist`)
+  runs `tools/ci/version-port-daily.sh` daily at 16:00 Zurich time (14:00 UTC in summer, 15:00 in winter; Mojang
+  publishes on weekdays around 10:00-14:00 UTC), in a dedicated worktree of `origin/main`
+  (`~/code/horizon-parity/port-main`), at nice 10 with low-priority I/O (the plist's `Nice` and
+  `LowPriorityIO`; `~/fleet/load prio low` would lower the calling agent session instead). The whole port runs where the vanilla
+  data, Java and the harnesses are. See "Turning on the daily agent" below.
 - **GitHub Actions:** a scheduled job could run `detect` alone and open a "Minecraft X is out" issue; the Mac mini
   would still have to do the rest, so it adds a hop for nothing. Kept as the fallback if the Mac mini is down for
   long.
@@ -172,32 +172,61 @@ neither, is reported as such.
 
 ### Regenerate
 
-Each generated output has a generator entry in `version_port.py` (`regen`): its command, its input in the version
-store, the files it writes. On a candidate worktree (`port/NEW` from `origin/main`, with `.local/` linking to the
-new version), `regen` runs them all and records, per generator: unchanged, regenerated (with the `--stat`), or
-failed (the generator's own error: a source pattern no longer matches, a report changed shape). Two additions make
-this complete:
+`version_port.py regen NEW` (`tools/port_regen.py`) makes the candidate and regenerates every table in it:
 
-- `version_consts`: a generator for the version facts table above, from `facts.json`. Before it, a small refactor
-  makes every Rust site use the `horizon-core` / `horizon-protocol` constants instead of its own copy, so the pin
-  bump touches one generated file.
-- `horizon-prepare` against the new version: its Java exporters compile and run against the new jar, or fail to
-  compile, which names exactly the vanilla API they used that changed.
+1. **The candidate**: a worktree of the branch `port/NEW` (from `--base`, default `origin/main`) in
+   `~/code/horizon-parity/ports/NEW` (`HORIZON_PORTS`), with `research-lock.json` pinned to NEW: version, the
+   version JSON's sha1, the jars' sha1s, Java. Every tool reads the version from the lock (`lab.VERSION`,
+   `lab.GAME`, `lab.RESOURCES`), so nothing else in the tree names the old one.
+2. **Its `.local/`**, a real directory: `minecraft/NEW` is prepared by `tools/lab.py prepare` itself, from a
+   launcher-shaped copy of the download in the version store (`versions/NEW/launcher`: the version JSON, the client
+   jar and its libraries, verified by sha1) into `versions/NEW/game`, so the candidate's jars, libraries and
+   manifest are exactly what a player's install gives. `datagen/out/reports` links to NEW's reports, `tools` to the
+   shared tools. Nothing is written into `shared-local/`.
+3. **Decompiled sources**: only the classes a generator parses (`EntityTypes`, `BlockStateData`), each decompiled
+   alone with the full jar and its libraries on Vineflower's path, into `versions/NEW/sources/` (seconds instead of
+   a 10-minute full run). The source is not the full run's text (inner classes of the jar's other classes are
+   imported, chained calls are not wrapped), but what the generators read from it is: from 26.3's they write the
+   committed tables byte for byte.
+4. **The generators**, every row of the table above, each recorded in `diff-OLD-NEW/regen.json` as unchanged,
+   regenerated (with its `--numstat`) or failed (with the end of its output and, when an exporter or oracle no
+   longer compiles, javac's errors one per line: they name the vanilla API that changed). Rust outputs are
+   rustfmt'ed. The pin and what regenerated are committed on `port/NEW`, locally; nothing is pushed.
 
-Generators that read decompiled sources (`EntityTypes`, `BlockStateData`) get those two files from the changed-class
-decompilation, so no full Vineflower run is needed for them either.
+The report then lists what was regenerated in its summary and makes each failed generator a rank-1 item, instead of
+guessing which tables the diff made stale. `--only NAME...` reruns some generators; `port NEW` runs `regen` after
+`diff` (`--no-regen` for snapshots).
+
+Three generators run vanilla through Horizon's Java oracles (`VanillaCommandSuggestionsExporter`,
+`VanillaCommandParseOracle`) and one builds `command_parse_fixture` (Horizon's command tree in its own registration
+order, before `vanilla_order.rs` reorders it), so `regen` needs Java and Cargo. `horizon-prepare` (the resources the
+harnesses read) is the next stage's first step.
 
 ### Run every harness against the new version
 
-In the candidate worktree, with `research-lock.json` pinned to NEW and `.local/` linking to the new store
-(`.local/minecraft/NEW` holds `jars/`, `datagen` the new reports, `horizon-client` what the candidate's
-`horizon-prepare` made), `tools/parity.py --all` runs every harness. Each result is one of:
+`version_port.py harnesses NEW [NAME...] --baseline STATE` (`tools/port_harness.py`), in the candidate `regen`
+made:
 
-- **pass**: Horizon already matches NEW there;
-- **oracle does not compile**: vanilla's API changed under the oracle (javac names the symbol);
-- **fails**: behaviour changed (or Horizon's data reading broke); the log has the first differing case.
+1. **horizon-prepare**, built from the candidate and run there: `.local/horizon-client/NEW` and its exporters'
+   outputs. Its `sounds` and `panorama` steps read the version store's launcher-shaped copy, whose asset index and the
+   objects those steps copy (about 370 MB of sounds) are downloaded once per version from Mojang's resource server,
+   each checked against its sha1. Regen's link to the version store's data generator reports is dropped first:
+   horizon-prepare runs the generator itself, into the candidate. When the exporters no longer compile against NEW,
+   the stage goes on and the report gets a rank-1 item with javac's errors (read from the log horizon-prepare names).
+2. **`tools/parity.py --all`** there (or the harnesses named), from scratch.
+3. **Each harness classified**:
+   - **pass**: Horizon already matches NEW there;
+   - **oracle**: its log has javac errors, so vanilla's API changed under the oracle (javac names the symbol);
+   - **fail**: behaviour changed (or Horizon's data reading broke); the log has the first differing case;
 
-The known failures of `main` (`tools/ci/parity_issues.py`'s audit) are subtracted, so only what NEW broke counts.
+   and **newly failing** unless it fails in the baseline too: `--baseline` is a `tools/parity.py` `state.json` from
+   a run on the pinned version (the nightly audit's, or any worktree of `main`), so the known failures of `main` don't
+   count. `--no-run` classifies the last run again against another baseline.
+
+The result is `diff-OLD-NEW/harnesses.json`, with the logs of the harnesses that don't pass copied beside it
+(`harness-logs/`, local only). `report` reads it: a newly failing harness marks the rank-2 item that names it as
+failing (or "oracle no longer compiles"), a newly failing harness no item names gets its own rank-2 item, and the
+summary counts pass / oracle / fail / newly failing.
 
 ### The port report
 
@@ -219,11 +248,27 @@ The known failures of `main` (`tools/ci/parity_issues.py`'s audit) are subtracte
    files and harnesses, the data-diff excerpts that concern it, and the local path of its source diffs.
 3. Everything regenerated cleanly, so the reader knows what not to look at.
 
-`version_port.py publish` opens one GitHub issue per item of ranks 1 to 3 (labels `version-port` and
-`port-NEW`, title `[NEW] <area>: <summary>`; an open issue with that title is updated instead), with the structured
-diff attached (names, signatures, data-report diffs, harness output; no decompiled code), and a Kira card per issue
-(`card_add` with the issue URL, column `todo`) so contributors and agents can claim them. Rank 4 and 5 go into one
-tracking issue.
+`version_port.py publish OLD NEW` (`tools/port_publish.py`) files the report as GitHub issues. **It is a dry run
+by default**: it prints every issue it would create or update and the first bodies (`--show N`; `--check-github`
+reads the open issues and labels, read-only, to tell creates from updates). `--yes` does it; the first `--yes` run
+and the `version-port` label are Ludovic's call.
+
+- **One issue per item** of rank 1, of rank 2 when a harness newly fails on NEW (or its oracle no longer compiles),
+  and of rank 3 when Horizon's comments name one of the changed methods: title `[NEW] <item>`, labels
+  `version-port` and `port-NEW`. An open issue with the same title is updated, and only its generated part
+  (between `<!-- version-port: generated -->` markers) is replaced: what people wrote around it stays.
+- **One tracking issue**, `[NEW] Port to Minecraft NEW`: the facts, the harness counts, a checklist of the item
+  issues (made after them, so it has their numbers), and every other item: rank-2 leads no harness confirmed, rank-3
+  classes Horizon names but none of whose changed methods, new content, unported changes.
+- **Kira**: the board already shows every open issue as a card in To do, with its labels, so contributors and agents
+  claim them there (`task_claim`); `publish` adds one Kira card for the port itself, linking the tracking issue
+  (`~/code/horizon-parity/tools/kira.mjs card_add`, skipped if the board has it).
+- **No decompiled code, ever**: bodies hold names and signatures only (vanilla classes, methods with their JVM
+  descriptors, fields, packets, registry entries, harness names, javac's one-line errors about Horizon's own oracles,
+  Horizon paths, and the local path of the diff). Every vanilla-derived string is quoted, and `assert_no_code`
+  refuses a body with a code block, or a line or quoted span that reads like Java (declarations, statements, braces).
+
+For 26.2 → 26.3 the dry run would file 48 issues (5 of rank 1, 43 of rank 3) and the tracking issue.
 
 ### The switch and the release
 
@@ -238,6 +283,45 @@ A Horizon release then ships as usual (`docs/release-flow.md`), labelled `featur
 title. Its `research-lock.json` makes `horizon-prepare` ask for NEW, so players must have played NEW once in the
 official launcher; the launcher already reads each release's game version from its `research-lock.json`, so players
 who haven't can keep the previous Horizon release. Supporting two Minecraft versions in one build is out of scope.
+
+## Turning on the daily agent
+
+Not installed: it runs Mojang downloads, Cargo, Java and every harness on the Mac mini unattended, and its
+`publish` dry run prepares issues under a new `version-port` label, so both need Ludovic's approval. What it does
+on each run (`tools/ci/version-port-daily.sh`):
+
+1. update its worktree of `origin/main` (`~/code/horizon-parity/port-main`, made on the first run, `.local/` linking
+   the shared data as a parity worktree does);
+2. `version_port.py detect --dry-run` (`--snapshots` with `HORIZON_PORT_SNAPSHOTS=1`): nothing new ends the run;
+3. for a new release: `port NEW` (prepare both, diff, regen into `ports/NEW` on the local branch `port/NEW`, report),
+   `tools/parity.py` on main as the baseline (only what never passed or changed reruns), `harnesses NEW` against
+   that baseline, `report OLD NEW`, and `publish OLD NEW --check-github` (the dry run: the log lists the issues it
+   would file). A snapshot is only prepared, diffed and reported;
+4. `detect` again, so the version is remembered only once its port went through (a failed run retries the next day),
+   and a note on Kira card 28 (`HORIZON_PORT_KIRA_CARD`) saying the report is ready.
+
+It never runs `publish --yes`, never pushes and never changes `shared-local/`. `HORIZON_PORT_VERSION=V` ports V at
+once (by hand, or to replay a version); `HORIZON_PORT_REF` checks out another ref than `origin/main`.
+
+To turn it on, on the Mac mini (as Ludovic, once approved):
+
+```sh
+# 1. The label publish files issues under (once):
+gh label create version-port --repo ludovic111/horizon --color 5319e7 \
+  --description "Work to port Horizon to a new Minecraft release (tools/version_port.py publish)"
+# 2. The script, as a copy from main (it updates its own worktree, so it never runs from a checkout):
+curl -fsSL https://raw.githubusercontent.com/ludovic111/horizon/main/tools/ci/version-port-daily.sh \
+  -o ~/code/horizon-parity/version-port-daily.sh
+# 3. The agent:
+curl -fsSL https://raw.githubusercontent.com/ludovic111/horizon/main/tools/ci/dev.horizon.version-port.plist \
+  | sed "s|@HOME@|$HOME|g" > ~/Library/LaunchAgents/dev.horizon.version-port.plist
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.horizon.version-port.plist
+# A run now, to see it work (log: ~/Library/Logs/horizon-version-port.log):
+launchctl kickstart gui/$(id -u)/dev.horizon.version-port
+```
+
+To turn it off: `launchctl bootout gui/$(id -u)/dev.horizon.version-port` and delete the plist. When the report is
+in, publishing is still by hand: `python3 tools/version_port.py publish OLD NEW` (dry run), then `--yes`.
 
 ## What stays manual, and how small it gets
 
@@ -275,9 +359,51 @@ The report has 499 items: 10 of rank 1, 311 of rank 2, 96 of rank 3, 80 of rank 
 exact. Ranks 2 and 3 are leads, not all work: 173 of their 407 items have a changed method that Horizon's comments
 name. The rest are classes whose changed methods Horizon doesn't name. Many of those are mechanical (26.3 renamed
 `GuiGraphics` to `GuiGraphicsExtractor` and reworked the render pipeline), and 105 are "widely named" buckets
-(classes such as `Entity` that many files mention in passing). Running every harness against the new version (with
-`--results`) is what turns a rank-2 lead into a confirmed failure; the replay cannot do that, because the oracles are
-written against 26.3.
+(classes such as `Entity` that many files mention in passing). Running every harness against the new version is what turns a
+rank-2 lead into a confirmed failure; since the oracles are written against 26.3, the replay runs that stage both ways
+(below).
+
+### `regen`
+
+`regen 26.2` from a branch pinned to 26.3, then `regen 26.3 --base port/26.2`, both from versions downloaded from
+Mojang (`prepare --download`):
+
+| Generator | 26.3 → 26.2 | 26.2 → 26.3 |
+| --- | --- | --- |
+| `version_consts` | regenerated (+8 -8: protocol 776, data version 4903, packs 88.0 / 107.1, build time) | regenerated, back to the committed file |
+| `packet_ids` | regenerated (+134 -142) | regenerated (+142 -134), back to the committed file |
+| `entity_tracking` | regenerated (+10 -13) | regenerated (+13 -10), back to the committed file |
+| `block_state_data` | regenerated (+1 -1: the version in its header; `BlockStateData` is unchanged) | regenerated, back to the committed file |
+| `lan_command_order`, `vanilla_command_order` | failed: `VanillaCommandParseOracle.java:81: no suitable constructor found for CommandSourceStack(...)` and 2 more | unchanged |
+| `command_suggestions` | failed: `ParityData.java:45: cannot find symbol: variable WORLD (class RegistryLayer)`, `WORLD_REGISTRIES` | unchanged |
+
+After the round trip, `port/26.3` equals the branch it started from except `research-lock.json`'s five lines of
+republished 26.3 version JSONs it accepts (which a port cannot know). So every table Horizon commits is what the
+generators make from vanilla's data, and going 26.3 → 26.2 fails exactly where Horizon's oracles use 26.3-only API,
+with javac naming it. The report for 26.2 → 26.3 then has 5 rank-1 items instead of 10: the 5 "regenerate" guesses
+are replaced by the generators' results in its summary. Both regens took under three minutes, most of it building
+`command_parse_fixture`.
+
+### `harnesses`
+
+The 17 harnesses closest to what 26.3 changed (block_properties, chunk_generation, command_exec, command_parse,
+component_patch, datafix, entity_components, first_person, food, hotbar, item_model, lan, light, options,
+resource_pack, save_roundtrip, sound_event; 22 runs with datafix's 6 shards), on the Mac mini at 2 to 3 jobs while CI
+and other sessions ran:
+
+| | 26.3 → 26.2 (`ports/26.2`) | 26.2 → 26.3 (`ports/26.3`) |
+| --- | --- | --- |
+| horizon-prepare | failed: `VanillaHeightmapOracle.java:33: cannot find symbol: variable FULL_CODEC (class BlockState)` (rank 1) | ok, sounds and panorama from the downloaded assets |
+| pass | 1 (`food`) | 17 |
+| oracle no longer compiles | 4: `chunk_generation` (`ServerChunkCache` constructor), `command_exec` (`com.mojang.authlib.services`), `command_parse` and `hotbar` (`RegistryLayer.WORLD`) | 0 |
+| fail | 12 (Horizon's 26.3 packet tables and resources don't build or match 26.2) | 0 |
+| newly failing, against the other direction's run as baseline | 16 | 0 |
+| time | about an hour, most of it datafix's vanilla upgrades | about 85 min, 10 of them horizon-prepare |
+
+So on a real port the stage separates the three cases the report needs: what already works on NEW, oracles whose
+vanilla API moved (javac names the symbol, as for regen), and behaviour that changed; and a candidate that is right
+passes everything it ran. The 26.2 → 26.3 report's summary now reads "harnesses on 26.3: 17 pass, 0 whose oracle no
+longer compiles, 0 fail; 0 newly failing".
 
 ## Implementation status
 
@@ -286,8 +412,11 @@ python3 tools/version_port.py detect --snapshots     # exit 10: new release, 11:
 python3 tools/version_port.py prepare 26.3           # the pinned version: indexes .local, downloads nothing
 python3 tools/version_port.py prepare 26.4           # downloads, verifies, runs the data generator (about 10 s)
 python3 tools/version_port.py diff 26.3 26.4         # summary; the full diff in versions/diff-26.3-26.4/diff.json
+python3 tools/version_port.py regen 26.4            # ports/26.4 on port/26.4: pinned, every table regenerated
 python3 tools/version_port.py report 26.3 26.4 [--results .local/parity-runner/state.json]   # report.md, report.json
-python3 tools/version_port.py port 26.4             # prepare both, diff, report
+python3 tools/version_port.py harnesses 26.4 --baseline .local/parity-runner/state.json   # in ports/26.4
+python3 tools/version_port.py publish 26.3 26.4     # dry run: the issues it would file (--yes files them)
+python3 tools/version_port.py port 26.4             # prepare both, diff, regen, report
 python3 tools/version_port.py gc                     # keep the pinned version and the newest two others
 python3 tools/vanilla_map.py versions/26.3/classes.json net.minecraft.world.food.FoodData   # its Rust files and harnesses
 ```
@@ -298,4 +427,9 @@ python3 tools/vanilla_map.py versions/26.3/classes.json net.minecraft.world.food
 | `detect`, `prepare`, `diff` (facts, packets, registries, blocks, items, commands, data, assets), `gc` | done |
 | Class index (`tools/class_index.py`), class diff with moves, `vanilla_map.json` (`tools/vanilla_map.py`) | done |
 | Port report (`tools/port_report.py`, `report`), `port` | done |
-| Changed-class decompilation, `regen`, `version_consts` refactor, candidate harness run, `publish`, launchd agent | later |
+| `version_consts`: one generated file for the version facts (`tools/gen_version_consts.py`) | done |
+| Tools read the version from the lock (`lab.VERSION`, `lab.GAME`, `lab.RESOURCES`, `lab.version_info()`) | done |
+| `regen` (`tools/port_regen.py`): candidate worktree, its `.local/`, the generators' classes decompiled alone, every generator, `regen.json` in the report | done |
+| Candidate harness run (`tools/port_harness.py`, `harnesses`): horizon-prepare with sounds, every harness, pass / oracle / fail, newly failing against a baseline, in the report | done |
+| `publish` (`tools/port_publish.py`): dry run by default, issues, tracking issue, Kira card | done (never run with `--yes`) |
+| Daily launchd agent (`tools/ci/version-port-daily.sh`, `tools/ci/dev.horizon.version-port.plist`) | written, not installed: needs Ludovic's approval |

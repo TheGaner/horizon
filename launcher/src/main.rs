@@ -8,19 +8,22 @@ mod internet;
 mod markdown;
 mod mcp;
 mod modpacks_page;
+mod mods_page;
 mod perf;
+mod scrollbar;
 mod servers_page;
 mod theme;
 
 use gpui::{
     div, ease_out_quint, prelude::*, px, relative, size, Animation, AnimationExt, AnyElement, App,
     Application, Bounds, ClickEvent, Context, Div, ElementId, FocusHandle, FontWeight, Hsla,
-    KeyDownEvent, PathPromptOptions, ScrollHandle, SharedString, Stateful, Subscription,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
+    KeyDownEvent, PathPromptOptions, SharedString, Stateful, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowOptions,
 };
 use horizon_launcher::account::{self, Accounts, SignIn, SignInState};
 use horizon_launcher::backend::{self, Job, Msg, Release, Running, Settings, Updates};
 use horizon_launcher::telemetry;
+use scrollbar::Scrollbar;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -33,6 +36,7 @@ use theme::Theme;
 enum Page {
     Play,
     Versions,
+    Mods,
     Modpacks,
     Servers,
     Notes,
@@ -40,9 +44,10 @@ enum Page {
 }
 
 impl Page {
-    const ALL: [(Page, &'static str); 6] = [
+    const ALL: [(Page, &'static str); 7] = [
         (Page::Play, "Play"),
         (Page::Versions, "Versions"),
+        (Page::Mods, "Mods"),
         (Page::Modpacks, "Modpacks"),
         (Page::Servers, "Servers"),
         (Page::Notes, "Patch notes"),
@@ -103,6 +108,7 @@ struct Launcher {
     page: Page,
     /// How many times the page changed, for the page transition.
     switches: usize,
+    content_scroll: Scrollbar,
     opening: Option<Opening>,
     updates: Updates,
     checked: Option<Instant>,
@@ -178,6 +184,8 @@ struct Launcher {
     pack_error: Option<String>,
     /// The game starting now plays this pack's profile (its work folder).
     starting_pack: Option<std::path::PathBuf>,
+    /// The Mods page: the browser's search, installs and updates (`mods_page.rs`).
+    mods: mods_page::Mods,
 }
 
 impl Launcher {
@@ -223,6 +231,7 @@ impl Launcher {
             theme: Theme::for_appearance(window.appearance()),
             page: Page::Play,
             switches: 0,
+            content_scroll: Scrollbar::default(),
             opening: (!settings.skip_opening).then(|| {
                 let focus = cx.focus_handle();
                 window.focus(&focus);
@@ -287,6 +296,7 @@ impl Launcher {
             pack_log: VecDeque::new(),
             pack_error: None,
             starting_pack: None,
+            mods: mods_page::Mods::new(cx),
         };
         if this.bench.is_some() {
             this.perf.keep_local_log(false);
@@ -314,6 +324,7 @@ impl Launcher {
         if page != self.page {
             self.page = page;
             self.switches += 1;
+            self.content_scroll = Scrollbar::default();
         }
         self.picker_open = false;
     }
@@ -590,6 +601,7 @@ impl Launcher {
             }
         }
         changed |= self.servers_tick();
+        changed |= self.mods_tick();
         if let Some(sign_in) = &self.sign_in {
             let state = sign_in.state();
             let changed_state = format!("{state:?}") != format!("{:?}", self.sign_in_state);
@@ -638,10 +650,11 @@ impl Launcher {
     }
 
     fn install(&mut self, release: &Release) {
-        let Some((url, size)) = release.asset.clone() else {
+        if release.asset.is_none() {
             return;
-        };
-        let (tag, tx) = (release.tag.clone(), self.tx.clone());
+        }
+        let (release, tx) = (release.clone(), self.tx.clone());
+        let tag = release.tag.clone();
         self.installing = Some((tag.clone(), 0.0));
         self.install_started = Some(Instant::now());
         self.bar = (0., 0.);
@@ -650,7 +663,7 @@ impl Launcher {
             let progress = |p| {
                 let _ = tx.send(Msg::Progress(tag.clone(), p));
             };
-            let result = backend::install(&tag, &url, size, progress);
+            let result = backend::install(&release, progress);
             let _ = tx.send(Msg::Installed(tag, result));
         });
     }
@@ -1502,8 +1515,9 @@ impl Launcher {
             .flex_col()
             .gap(px(32.))
             .child(hero)
-            .child(actions)
-            .child(rows);
+            .child(actions);
+        // The preparation's progress and error right under the buttons, where the player
+        // looks after pressing Prepare, not below the fold (#666).
         if self.preparing {
             let last = self.prepare_log.back().cloned().unwrap_or_default();
             page = page.child(
@@ -1528,6 +1542,7 @@ impl Launcher {
         if let Some(e) = self.prepare_error.clone() {
             page = page.child(notice(e, &t));
         }
+        page = page.child(rows);
         if let Some(e) = self.client_error.clone() {
             page = page.child(notice(e, &t));
         }
@@ -2679,10 +2694,12 @@ impl Render for Launcher {
         self.perf.frame();
         self.servers.note_focus(window);
         self.friend_focused = self.friend_focus.is_focused(window);
+        self.mods.note_focus(window);
         self.args_focused = self.args_focus.is_focused(window);
         let content = match self.page {
             Page::Play => self.play_page(cx),
             Page::Versions => self.versions_page(cx),
+            Page::Mods => self.mods_page(cx),
             Page::Modpacks => self.modpacks_page(cx),
             Page::Servers => self.servers_page(cx),
             Page::Notes => self.notes_page(cx),
@@ -2745,20 +2762,25 @@ impl Render for Launcher {
                     .top(px(theme::RISE * (1. - ui)))
                     .child(self.topbar(cx))
                     .child(
-                        div()
-                            .id("content")
-                            .relative()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_y_scroll()
-                            .child(
+                        self.content_scroll
+                            .wrap(
                                 div()
-                                    .flex()
-                                    .px(px(theme::GUTTER))
-                                    .pt(px(24.))
-                                    .pb(px(48.))
-                                    .child(content),
-                            ),
+                                    .id("content")
+                                    .relative()
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .px(px(theme::GUTTER))
+                                            .pt(px(24.))
+                                            .pb(px(48.))
+                                            .child(content),
+                                    ),
+                                &t,
+                            )
+                            .flex_1(),
                     )
                     .child(self.footer(cx)),
             );

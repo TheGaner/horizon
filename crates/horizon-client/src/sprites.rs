@@ -147,7 +147,11 @@ impl Sprites {
         match self.load(root, name) {
             Ok(layer) => Ok(layer),
             Err(e) => {
-                log::warn!("Horizon: using the missing texture for {name}: {e}");
+                // `MissingTextureAtlasSprite.getLocation()`: vanilla models name the
+                // missing texture on purpose (block/air.json's particle), #853.
+                if name != "minecraft:missingno" {
+                    log::warn!("Horizon: using the missing texture for {name}: {e}");
+                }
                 // MissingTextureAtlasSprite.generateMissingImage: 16x16,
                 // magenta and black quarters.
                 let frame: Vec<u8> = (0..SPRITE_SIZE * SPRITE_SIZE)
@@ -415,7 +419,9 @@ mod tests {
 
     #[test]
     fn native_fire_sprites_register_full_animation_sequences() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
         if !root
             .join("assets/minecraft/textures/block/fire_0.png")
             .exists()

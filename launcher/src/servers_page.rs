@@ -125,7 +125,8 @@ pub(super) struct Servers {
     log: VecDeque<String>,
     log_next: u64,
     log_dir: Option<PathBuf>,
-    console_scroll: ScrollHandle,
+    console_scroll: Scrollbar,
+    create_scroll: Scrollbar,
     /// The action under way, and what it printed.
     busy: Option<String>,
     job_log: VecDeque<String>,
@@ -175,7 +176,8 @@ impl Servers {
             log: VecDeque::new(),
             log_next: 0,
             log_dir: None,
-            console_scroll: ScrollHandle::new(),
+            console_scroll: Scrollbar::default(),
+            create_scroll: Scrollbar::default(),
             busy: None,
             job_log: VecDeque::new(),
             problem: None,
@@ -289,7 +291,7 @@ fn bytes(n: u64) -> String {
 /// A backup's date and kind from its name (`2026-10-19_11-28-57-manual.zip`, UTC), for people.
 /// What a key did in a one-line field.
 #[derive(Debug, PartialEq)]
-enum Key {
+pub(super) enum Key {
     Enter,
     Escape,
     /// Command/Ctrl-V: the caller pastes the clipboard's first line.
@@ -301,7 +303,7 @@ enum Key {
 
 /// Types `key` into `text`. A `selected` suggestion is replaced by what's typed or pasted, and
 /// cleared by Backspace.
-fn type_key(
+pub(super) fn type_key(
     text: &mut String,
     selected: bool,
     key: &str,
@@ -548,7 +550,7 @@ impl Launcher {
                         while s.log.len() > CONSOLE_KEEP {
                             s.log.pop_front();
                         }
-                        s.console_scroll.scroll_to_bottom();
+                        s.console_scroll.handle.scroll_to_bottom();
                     }
                     s.log_next = next;
                 }
@@ -701,7 +703,7 @@ impl Launcher {
         };
         let tx = self.servers.tx.clone();
         self.servers.log.push_back(format!("> {line}"));
-        self.servers.console_scroll.scroll_to_bottom();
+        self.servers.console_scroll.handle.scroll_to_bottom();
         std::thread::spawn(move || {
             let result = servers::Api::open(&dir)
                 .ok_or_else(|| "The server isn't running.".to_string())
@@ -786,6 +788,7 @@ impl Launcher {
         self.servers.text(Field::Seed).clear();
         *self.servers.text(Field::Players) = own_name(&self.accounts).unwrap_or_default();
         self.servers.problem = None;
+        self.servers.create_scroll = Scrollbar::default();
         self.servers.create = Some(Create {
             new_world: true,
             copy: worlds.first().map(|w| w.1.clone()),
@@ -1672,7 +1675,6 @@ impl Launcher {
             .px(px(20.))
             .py(px(12.))
             .overflow_y_scroll()
-            .track_scroll(&self.servers.console_scroll)
             .font_family(theme::MONO)
             .text_size(px(theme::CAPTION.px))
             .line_height(px(19.))
@@ -1685,6 +1687,7 @@ impl Launcher {
                 }))
             })
             .children(lines);
+        let log = self.servers.console_scroll.wrap(log, &t);
         let input = if running {
             self.field(
                 Field::Command,
@@ -2909,7 +2912,7 @@ impl Launcher {
             .bg(t.page)
             .border_1()
             .border_color(t.rule)
-            .child(body)
+            .child(self.servers.create_scroll.wrap(body, &t))
             .child(foot);
         Some(
             div()

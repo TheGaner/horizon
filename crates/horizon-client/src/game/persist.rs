@@ -213,6 +213,7 @@ impl Game<'_> {
                                 no_gravity,
                                 drop_item,
                                 fall_distance,
+                                stuck: Vec3::ZERO,
                                 damage: horizon_client::falling_block::Damage::from_nbt(
                                     &tag,
                                     self.res.facts().get(state).name.ends_with("anvil"),
@@ -273,6 +274,7 @@ impl Game<'_> {
                             self.carts.push(c);
                         }
                     }
+                    "minecraft:ominous_item_spawner" => self.load_ominous_item_spawner(tag),
                     "minecraft:ender_dragon" => {
                         let seed = self.world.random.next_long();
                         if self.dragon.is_none()
@@ -559,7 +561,7 @@ impl Game<'_> {
     /// The entity NBT of every simulated entity in `keys`, plus the unknown
     /// entities kept for them. With `remove`, the entities leave the world
     /// (their chunks unload).
-    fn entity_chunks(
+    pub(super) fn entity_chunks(
         &mut self,
         keys: &HashSet<(i32, i32)>,
         remove: bool,
@@ -684,6 +686,19 @@ impl Game<'_> {
                     .push(c.to_nbt(uuid, raw.as_ref()));
             }
         }
+        for s in &self.ominous_spawners {
+            let at = Vec3::new(s.position[0], s.position[1], s.position[2]);
+            if keys.contains(&chunk_of(at)) {
+                let tag = entity_nbt::ominous_item_spawner_to_nbt(
+                    &s.item,
+                    at,
+                    s.spawn_item_after,
+                    s.uuid,
+                    s.raw.as_deref(),
+                );
+                out.entry(chunk_of(at)).or_default().push(tag);
+            }
+        }
         for c in &self.carts {
             if keys.contains(&chunk_of(c.position)) {
                 let uuid = self
@@ -773,6 +788,8 @@ impl Game<'_> {
                 keep
             });
             self.crystals.retain(|c| !gone(c.position));
+            self.ominous_spawners
+                .retain(|s| !gone(Vec3::new(s.position[0], s.position[1], s.position[2])));
             if self.dragon.as_ref().is_some_and(|d| gone(d.position)) {
                 self.dragon = None;
             }
@@ -858,6 +875,14 @@ impl Game<'_> {
         self.spawn_loaded_entities();
         let keys: HashSet<(i32, i32)> = self.world.chunks.keys().copied().collect();
         let chunks = self.entity_chunks(&keys, false);
+        self.prune_entity_memory();
+        if wait {
+            self.save.save_entities(chunks)
+        } else {
+            self.save.save_entities_later(chunks)
+        }
+    }
+    pub(super) fn prune_entity_memory(&mut self) {
         // Forget entities that no longer exist.
         let alive: HashSet<u32> = self
             .mobs
@@ -873,11 +898,6 @@ impl Game<'_> {
             .collect();
         self.persist.uuids.retain(|id, _| alive.contains(id));
         self.persist.raw.retain(|id, _| alive.contains(id));
-        if wait {
-            self.save.save_entities(chunks)
-        } else {
-            self.save.save_entities_later(chunks)
-        }
     }
     /// Save and remove the entities of chunks that unloaded.
     pub(super) fn unload_entities(&mut self, unloaded: &[Arc<Chunk>]) {

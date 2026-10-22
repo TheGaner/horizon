@@ -484,7 +484,13 @@ impl Game<'_> {
                 })
             },
         ));
-        log("INFO", "Starting minecraft server version 26.3");
+        log(
+            "INFO",
+            &format!(
+                "Starting minecraft server version {}",
+                horizon_core::VANILLA_VERSION
+            ),
+        );
         log("INFO", "Loading properties");
         let game_mode = props.game_mode;
         log(
@@ -689,14 +695,7 @@ impl Game<'_> {
             // MinecraftServer.tickServer records each tick's time, for /tick query (and the status).
             self.clock.record(tick_start.elapsed());
             state.ticked(Instant::now());
-            let rate = self.clock.rate().max(1.0);
-            next += Duration::from_secs_f64(1.0 / f64::from(rate));
-            let now = Instant::now();
-            if next > now {
-                std::thread::sleep(next - now);
-            } else if now - next > Duration::from_secs(2) {
-                next = now;
-            }
+            self.wait_for_next_server_tick(&mut next, paused);
         }
         self.stop_dedicated()
     }

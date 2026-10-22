@@ -62,22 +62,64 @@ def diff():
 
 
 class PortReportTests(unittest.TestCase):
-    def build(self, results=None):
+    def build(self, results=None, regen=None, harnesses=None):
         with mock.patch.object(report, "version_sites", return_value=["crates/p/src/lib.rs:20"]), \
                 mock.patch.object(report, "files_naming", return_value=["crates/p/src/play.rs"]), \
                 mock.patch.object(report, "files_containing", return_value=["crates/w/src/blocks.rs"]):
-            return report.build(diff(), mapping(), "26.2", "26.3", {"id": "26.3"}, results)
+            return report.build(diff(), mapping(), "26.2", "26.3", {"id": "26.3"}, results, regen=regen,
+                                harnesses=harnesses)
+
+    def test_harness_results_count_only_new_failures(self):
+        ran = {"prepare": {"status": "failed", "error": "javac exited 1",
+                           "compile_errors": ["VanillaBlockExporter.java:9: cannot find symbol: class Foo"]},
+               "summary": {"pass": 1, "oracle": 1, "fail": 2, "new": 2, "known": 1},
+               "harnesses": {"food": {"status": "oracle", "baseline": "pass", "new": True, "compile_errors": ["X"]},
+                             "move": {"status": "fail", "baseline": "fail", "new": False},
+                             "light": {"status": "fail", "baseline": "pass", "new": True},
+                             "sky": {"status": "pass", "baseline": "pass", "new": False}}}
+        built = self.build(harnesses=ran)
+        [prepare] = [i for i in built["items"] if i["kind"] == "prepare-failed"]
+        self.assertEqual(prepare["rank"], 1)
+        failed = {h: i for i in built["items"] for h in i.get("failed", [])}
+        self.assertEqual(failed["food"]["oracle"], ["food"])
+        self.assertNotIn("move", failed)  # It fails on the old version too.
+        self.assertEqual(failed["light"]["title"], "Harness light: fails on 26.3")
+        text = report.markdown(built)
+        self.assertIn("1 pass, 1 whose oracle no longer compiles, 2 fail; 2 newly failing, 1 failing on 26.2 too", text)
+        self.assertIn("- javac: `VanillaBlockExporter.java:9: cannot find symbol: class Foo`", text)
+
+    def test_regen_results_replace_the_stale_tables(self):
+        regen = {"new": "26.3", "candidate": "/ports/26.3", "commit": "0123456789abcdef", "generators": {
+            "packet_ids": {"status": "regenerated", "outputs": ["crates/horizon-protocol/src/ids.rs"],
+                           "stat": {"crates/horizon-protocol/src/ids.rs": [142, 134]}},
+            "entity_tracking": {"status": "unchanged", "outputs": ["crates/horizon-client/src/lan/tracking.rs"],
+                                "stat": {}},
+            "lan_command_order": {"status": "failed", "outputs": ["crates/horizon-client/src/lan/command_order.rs"],
+                                  "error": "javac exited 1",
+                                  "compile_errors": ["ParityData.java:45: cannot find symbol: variable WORLD"]}}}
+        built = self.build(regen=regen)
+        self.assertFalse([i for i in built["items"] if i["kind"] == "regenerate"])
+        [failed] = [i for i in built["items"] if i["kind"] == "regen-failed"]
+        self.assertEqual(failed["rank"], 1)
+        self.assertIn("no longer compiles", failed["title"])
+        self.assertEqual(built["summary"]["generators"],
+                         {"packet_ids": "regenerated", "entity_tracking": "unchanged", "lan_command_order": "failed"})
+        text = report.markdown(built)
+        self.assertIn("regenerated 1, unchanged 1, failed 1", text)
+        self.assertIn("`crates/horizon-protocol/src/ids.rs` (+142 -134)", text)
+        self.assertIn("- javac: `ParityData.java:45: cannot find symbol: variable WORLD`", text)
 
     def test_ranks_and_kinds(self):
         built = self.build()
         kinds = [(i["rank"], i["kind"]) for i in built["items"]]
         self.assertEqual(sorted(k for r, k in kinds if r == 1),
-                         ["components", "facts", "protocol", "regenerate", "regenerate", "report-format",
-                          "save-format"])
+                         ["components", "facts", "protocol", "regenerate", "regenerate", "regenerate",
+                          "report-format", "save-format"])
         self.assertEqual([i["id"] for i in built["items"]], list(range(1, len(kinds) + 1)))
         self.assertEqual(kinds, sorted(kinds, key=lambda k: k[0]))
         regenerated = {i["files"][0] for i in built["items"] if i["kind"] == "regenerate"}
-        self.assertEqual(regenerated, {"crates/horizon-protocol/src/ids.rs", "crates/horizon-client/src/lan/tracking.rs"})
+        self.assertEqual(regenerated, {"crates/horizon-core/src/version.rs", "crates/horizon-protocol/src/ids.rs",
+                                       "crates/horizon-client/src/lan/tracking.rs"})
 
     def test_save_format_lists_new_schemas_and_fixes(self):
         save = next(i for i in self.build()["items"] if i["kind"] == "save-format")

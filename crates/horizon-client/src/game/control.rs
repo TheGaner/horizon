@@ -24,6 +24,7 @@ const HELP: &[&str] = &[
     "time TICKS                     set the time of day",
     "summon KIND [X Y Z] [baby]     spawn a mob (in front of the player without a position)",
     "mobs [RADIUS]                  list mobs near the player with their AI state",
+    "hurtlog                        the hurts taken and melee attacks made since the last call, per player (host and guests)",
     "fill X1 Y1 Z1 X2 Y2 Z2 BLOCK   set a box of loaded blocks",
     "resume                         leave the pause menu",
     "screenshot PATH                write the next frame as PNG",
@@ -117,6 +118,9 @@ impl Game<'_> {
         }
         while let Some(request) = self.control.as_ref().and_then(|c| c.try_recv()) {
             self.answer(request, event_loop);
+            if self.pending_save.is_some() {
+                break;
+            }
         }
         if self.control.is_some() {
             self.watch_events();
@@ -140,6 +144,9 @@ impl Game<'_> {
         event_loop: &ActiveEventLoop,
     ) -> Result<Option<Value>> {
         let words: Vec<&str> = line.split_whitespace().collect();
+        if self.pending_save.is_some() && words.first() != Some(&"quit") {
+            return Err("a world save is in progress".into());
+        }
         let arg = |i: usize| {
             words
                 .get(i)
@@ -214,6 +221,25 @@ impl Game<'_> {
             "key" => {
                 let key = key_code(arg(1)?).ok_or_else(|| format!("unknown key {}", words[1]))?;
                 self.require_world()?;
+                // A held edit modifier (`key super down`) and A/C/V/X: the
+                // open book's Select All, Copy, Paste or Cut.
+                if self.book.is_some() && arg(2)? != "up" {
+                    let held = |k: [KeyCode; 2]| k.iter().any(|k| self.keys.contains(k));
+                    let edit = if cfg!(target_os = "macos") {
+                        held([KeyCode::SuperLeft, KeyCode::SuperRight])
+                    } else {
+                        held([KeyCode::ControlLeft, KeyCode::ControlRight])
+                    };
+                    let name = arg(1)?;
+                    let letter = name.chars().next().filter(|_| name.len() == 1);
+                    let shift = held([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+                    if let Some(shortcut) =
+                        horizon_client::clipboard::edit_shortcut(letter, edit, shift, false)
+                    {
+                        self.book_shortcut(shortcut);
+                        return ok();
+                    }
+                }
                 // KeyboardHandler.keyPress: the debug keys see the physical key first.
                 let physical = key;
                 {
@@ -444,6 +470,10 @@ impl Game<'_> {
                 let radius: f64 = words.get(1).map_or(Ok(64.0), |r| r.parse())?;
                 Ok(Some(self.control_mobs(radius)))
             }
+            "hurtlog" => {
+                self.require_world()?;
+                Ok(Some(self.control_hurt_log()))
+            }
             "resume" => {
                 if self.screen == Screen::Paused {
                     self.screen = Screen::Playing;
@@ -625,6 +655,9 @@ impl Game<'_> {
                     server
                         .call(move |g| g.control_save(all).map_err(|e| e.to_string()))
                         .ok_or("the integrated server stopped")??;
+                } else if self.remote.is_none() {
+                    self.begin_control_save(all, reply.clone())?;
+                    return Ok(None);
                 } else {
                     self.control_save(all)?;
                 }
@@ -633,12 +666,11 @@ impl Game<'_> {
             "dragon-hurt" => {
                 // Test hook: damage the dragon's head as the player would.
                 let amount: f32 = arg(1)?.parse()?;
-                self.hit_special(super::dragon::SPECIAL, amount, true);
+                self.hit_special(super::dragon::SPECIAL, amount, true, false);
                 ok()
             }
             "quit" => {
-                self.save_for_exit()?;
-                event_loop.exit();
+                self.begin_closing_save(true)?;
                 ok()
             }
             other => match self.station_command(&words)? {
@@ -697,6 +729,54 @@ impl Game<'_> {
             Screen::WorldOptions => "world-options",
             Screen::CommandBlock => "command-block",
         }
+    }
+
+    /// The hurts and melee attacks each player logged since the last call
+    /// (`PlayerMotion::hurt_log`, `attack_log`), taken out.
+    fn control_hurt_log(&mut self) -> Value {
+        fn drain(
+            name: &str,
+            hurt_log: &mut Vec<horizon_client::health::HurtRecord>,
+            attack_log: &mut Vec<horizon_client::health::AttackRecord>,
+        ) -> Value {
+            let hurts: Vec<Value> = hurt_log
+                .drain(..)
+                .map(|r| {
+                    json!({
+                        "t": r.game_time, "source": r.source, "amount": r.amount,
+                        "blocked": r.blocked, "taken": r.taken, "hurt": r.hurt,
+                        "armor": r.armor, "toughness": r.toughness, "health": r.health,
+                        "fire_ticks": r.fire_ticks, "knockback": r.knockback,
+                    })
+                })
+                .collect();
+            let attacks: Vec<Value> = attack_log
+                .drain(..)
+                .map(|r| {
+                    json!({
+                        "t": r.game_time, "target": r.target, "id": r.id, "killed": r.killed, "amount": r.amount,
+                        "scale": r.scale, "crit": r.crit, "landed": r.landed, "dealt": r.dealt,
+                    })
+                })
+                .collect();
+            json!({ "name": name, "hurts": hurts, "attacks": attacks })
+        }
+        let mut players = Vec::new();
+        if let Some(p) = self.player.as_mut() {
+            players.push(drain("host", &mut p.hurt_log, &mut p.attack_log));
+        }
+        if let Some(host) = self.lan.as_mut() {
+            for g in &mut host.hub.guests {
+                let name = g.name.clone();
+                if let Some(m) = g.motion.as_mut() {
+                    players.push(drain(&name, &mut m.hurt_log, &mut m.attack_log));
+                } else if let Some((mut hurts, mut attacks)) = g.logs_kept.take() {
+                    // Dead, not yet respawned: what its last body logged.
+                    players.push(drain(&name, &mut hurts, &mut attacks));
+                }
+            }
+        }
+        json!({ "ok": true, "players": players })
     }
 
     fn control_status(&self) -> Value {
@@ -761,6 +841,12 @@ impl Game<'_> {
             "pending_observations": self.lod_observe.len(),
             "refined_samples": self.lod.as_ref().map_or(0, |lod| lod.refined_samples()),
         });
+        // The other players' cracks this client draws (LevelRenderer.destroyingBlocks).
+        let destroying: Vec<_> = self
+            .destroying
+            .iter()
+            .map(|(id, (pos, stage, _))| json!({ "id": id, "pos": pos, "stage": stage }))
+            .collect();
         let mut status = json!({
             "screen": self.screen_name(),
             "debug": {
@@ -824,7 +910,9 @@ impl Game<'_> {
         status["lod"]["target_tiles"] = target.into();
         status["lod"]["sampled_target_tiles"] = sampled.into();
         status["pending_uploads"] = self.pending_uploads.len().into();
+        status["destroying"] = json!(destroying);
         status["physical_keys"] = json!(physical_keys);
+        status["heard"] = json!(self.audio.heard);
         // Boats, minecarts, armor stands, item frames and paintings.
         status["objects"] = json!(self.objects_status());
         // Primed TNT, falling blocks, projectiles, tridents and end crystals.
@@ -901,6 +989,8 @@ fn key_code(name: &str) -> Option<KeyCode> {
         "space" => KeyCode::Space,
         "shift" | "lshift" => KeyCode::ShiftLeft,
         "ctrl" | "control" | "lctrl" => KeyCode::ControlLeft,
+        // The edit modifier on macOS (Cmd+A selects all there).
+        "super" | "cmd" | "meta" => KeyCode::SuperLeft,
         "esc" | "escape" => KeyCode::Escape,
         "tab" => KeyCode::Tab,
         "enter" | "return" => KeyCode::Enter,
@@ -909,6 +999,7 @@ fn key_code(name: &str) -> Option<KeyCode> {
         "f3" => KeyCode::F3,
         "f4" => KeyCode::F4,
         "f5" => KeyCode::F5,
+        "f6" => KeyCode::F6,
         "f11" => KeyCode::F11,
         "slash" | "/" => KeyCode::Slash,
         "backspace" => KeyCode::Backspace,

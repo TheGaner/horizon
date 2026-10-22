@@ -8,7 +8,9 @@ small JSON-RPC client, and saves a screenshot of each run. The ui scenario drive
 widget id instead: the title screen, the options (a slider set by id) and the inventory's slots;
 the options scenario reads and sets options.txt values by key; the events scenario waits for
 states (wait-for) and reads the event log; the consume scenario eats and drinks consumables (a
-golden apple, milk, honey, chorus fruit) and checks their effects, remainders and teleport.
+golden apple, milk, honey, chorus fruit) and checks their effects, remainders and teleport; the
+pick scenario middle-clicks slots (AbstractContainerScreen's cloning): a full stack in creative, from
+the hotbar and from an item tab, and nothing in survival.
 
     python3 tools/agent_control_e2e.py                 # both modes
     python3 tools/agent_control_e2e.py --mode mcp      # one of them
@@ -32,6 +34,11 @@ import tempfile
 import time
 from pathlib import Path
 
+try:
+    from . import lab
+except ImportError:
+    import lab
+
 ROOT = Path(__file__).resolve().parents[1]
 LAVAPIPE = Path('/run/opengl-driver/share/vulkan/icd.d/lvp_icd.x86_64.json')
 LOG_KINDS = ['oak_log', 'birch_log', 'spruce_log', 'jungle_log', 'acacia_log', 'dark_oak_log',
@@ -46,7 +53,7 @@ POSITIONAL = {
     'wait_for': ['condition', 'value'],
 }
 # Booleans the game takes as bare words.
-BARE = {'click_slot': ['right', 'shift'], 'click': ['right', 'shift']}
+BARE = {'click_slot': ['right', 'shift'], 'click': ['right', 'middle', 'shift']}
 
 
 class Failed(Exception):
@@ -180,26 +187,44 @@ def scenario(d, out):
         d('click_button', label='Create New World')
     d('type', field='name', replace=True, text='Agent World')
     d('type', field='seed', text='5')  # spawn near a walkable oak
-    created = d('click_button', label='Create New World')
-    assert created['screen'] == 'playing', created
+    d('click_button', label='Create New World')
+    # The world opens a few frames later: in the frame it is prepared off the UI thread behind the
+    # title screen (world_loading.rs), on the server thread once the server has it.
+    d('wait_for', condition='loaded', timeout=400)
     d('wait_ready', seconds=400)
     state = d('state')
     assert state['gamemode'] == 'survival' and state['player']['health'] > 0, state
     d('command', command='time set day')
+    # The spawn is random within the spawn radius, on the first full top face below the
+    # MOTION_BLOCKING height (PlayerSpawnFinder.getLevelRespawnPos): a tree's leaves too, too high
+    # for goto's drops.
+    x, y, z = state['player']['block_pos']
+    ground = y - 1
+    while ground > y - 16 and d('block', x=x, y=ground, z=z)['block'].endswith(('_leaves', 'air')):
+        ground -= 1
+    if ground < y - 1:
+        d('command', command=f'tp @s {x + 0.5} {ground + 1} {z + 0.5}')
+        d('wait', ticks=5)
 
-    # 2. Walk to a tree: the nearest trunk the path finder can reach.
+    # 2. Walk to a tree, the nearest trunk the path finder can reach, and 3. break the log at the
+    # bottom of the trunk (it must end up in the inventory). Low leaves can hide every face of that
+    # log from where the walk stops: then the next tree.
     for _, base, log_id in trunk_bases(d)[:8]:
         x, y, z = base
         try:
             d('goto', x=x + 0.5, y=y, z=z + 0.5, near=2.5, timeout=60)
-            break
         except Failed as e:
             print(f'  cannot reach {log_id} at {base}: {e}')
+            continue
+        try:
+            broke = d('break', x=x, y=y, z=z)
+            break
+        except Failed as e:
+            if 'no face' not in str(e):
+                raise
+            print(f'  {log_id} at {base} is hidden: {e}')
     else:
         raise Failed('no reachable tree near spawn')
-
-    # 3. Break the log at the bottom of the trunk; it must end up in the inventory.
-    broke = d('break', x=x, y=y, z=z)
     assert broke['block_before'].startswith(log_id), broke
     assert broke['drops'].get(log_id, 0) >= 1, broke
     if broke['picked_up'].get(log_id, 0) < 1:
@@ -269,8 +294,8 @@ def ui_scenario(d, out):
     tree = widgets(d)
     assert tree['game']['kind'] == 'button' and any(w['kind'] == 'field' for w in tree.values()), tree
     d('type', field='name', replace=True, text='UI World')
-    created = d('click', id='create-new-world')
-    assert created['screen'] == 'playing', created
+    d('click', id='create-new-world')
+    d('wait_for', condition='loaded', timeout=400)  # a few frames later, as in the survival scenario
     d('wait_ready', seconds=400)
 
     # 2. Options from the pause menu: a slider set by id moves its value and label.
@@ -423,15 +448,62 @@ def consume_scenario(d, out):
     return {'teleported': [round(m, 2) for m in moved]}
 
 
+def pick_scenario(d, out):
+    # The pick block button (middle) over a container screen clones only with infinite materials:
+    # AbstractContainerScreen.mouseClicked sends CLONE, which fills the empty hand with a full stack
+    # of the slot's item (#1048: it clicked like the left button and took the slot's stack).
+    d('click', id='singleplayer')
+    if 'game' not in widgets(d):
+        d('click', id='create-new-world')
+    d('type', field='name', replace=True, text='Pick')
+    d('click', id='create-new-world')
+    d('wait_for', condition='loaded', timeout=400)
+    d('command', command='gamemode creative')
+    d('command', command='clear @s')
+    d('give', item='oak_log', count=2)
+
+    def carried():
+        return d('inventory')['carried']
+
+    # 1. An item tab: the hotbar slot's stack is cloned, the slot keeps its 2 logs.
+    assert d('open_inventory')['screen'] == 'creative'
+    tree = widgets(d)
+    assert tree['slot-0']['stack'] == {'item': 'minecraft:oak_log', 'count': 2}, tree['slot-0']
+    d('click', id='slot-0', middle=True)
+    assert carried() == {'item': 'minecraft:oak_log', 'count': 64}, carried()
+    assert widgets(d)['slot-0']['stack']['count'] == 2
+    d('close')
+    d('command', command='clear @s')
+    d('give', item='oak_log', count=2)
+
+    # 2. The tab's own display slot gives a full stack too, not one item.
+    d('open_inventory')
+    shown = widgets(d)['slot-900']['stack']
+    d('click', id='slot-900', middle=True)
+    assert carried() == {'item': shown['item'], 'count': 64}, (shown, carried())
+    d('close')
+
+    # 3. Survival: the middle button over a slot does nothing.
+    d('command', command='gamemode survival')
+    d('command', command='clear @s')
+    d('give', item='oak_log', count=2)
+    assert d('open_inventory')['screen'] == 'inventory'
+    d('click', id='slot-0', middle=True)
+    assert carried() is None, carried()
+    assert widgets(d)['slot-0']['stack'] == {'item': 'minecraft:oak_log', 'count': 2}
+    d('close')
+    return {'cloned': shown['item']}
+
+
 SCENARIOS = {'survival': scenario, 'ui': ui_scenario, 'options': options_scenario, 'events': events_scenario,
-             'consume': consume_scenario}
+             'consume': consume_scenario, 'pick': pick_scenario}
 
 
 def run(mode, ctl, out, resources, which='survival'):
     work = Path(tempfile.mkdtemp(prefix=f'hzac-{mode}-'))
     (work / '.local').mkdir()
     (work / '.local/horizon-client').mkdir()
-    os.symlink(resources, work / '.local/horizon-client/26.3')
+    os.symlink(resources, work / '.local/horizon-client' / lab.VERSION)
     socket = work / 'c.sock'
     env = game_env(os.environ.get('VSCREEN', 'agent-control'))
     driver = (Cli if mode == 'cli' else Mcp)(ctl, socket, work, env)
@@ -472,7 +544,7 @@ def main():
         meta = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--no-deps'], cwd=ROOT,
                                          capture_output=True, text=True, check=True).stdout)
         bins = Path(meta['target_directory']) / 'fast'
-    resources = (ROOT / '.local/horizon-client/26.3').resolve()
+    resources = (lab.RESOURCES).resolve()
     if not (resources / 'horizon-resources.json').exists():
         sys.exit(f'no prepared resources in {resources}')
     out = Path(args.out)

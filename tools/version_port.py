@@ -8,12 +8,20 @@
     version_port.py diff OLD NEW                  facts, packets, registries, blocks, items, commands,
                                                   data packs, assets, lang and classes, with the Horizon
                                                   code each changed class concerns: diff-OLD-NEW/diff.json
+    version_port.py regen NEW [--base REF]        a port/NEW worktree pinned to NEW with every generated table
+                                                  regenerated (tools/port_regen.py): diff-OLD-NEW/regen.json
+    version_port.py harnesses NEW [--baseline S]  horizon-prepare and every harness in the candidate, each pass,
+                                                  oracle (no longer compiles) or fail, and newly failing against
+                                                  a run on the pinned version (tools/port_harness.py)
     version_port.py report OLD NEW [--results S]  the ranked port report: diff-OLD-NEW/report.md and .json
-    version_port.py port NEW [--old OLD]          prepare both, diff, report
+    version_port.py publish OLD NEW [--yes]       the report's work items as GitHub issues (tools/port_publish.py);
+                                                  a dry run without --yes
+    version_port.py port NEW [--old OLD]          prepare both, diff, regen, report
     version_port.py gc [--keep VERSION...]        keep the pinned, the newest two others and --keep
 
 The downloads are for development only: they go to the version store (~/code/horizon-parity/versions,
-HORIZON_VERSIONS overrides it), never into the repository, and nothing from them is shipped. The pinned
+HORIZON_VERSIONS overrides it), never into the repository, and nothing from them is shipped. Candidate
+worktrees go to ~/code/horizon-parity/ports/NEW (HORIZON_PORTS overrides it). The pinned
 version is not downloaded: its files are read where tools/lab.py prepared them (.local/).
 
 detect exits 0 when nothing is new, 10 for a new release and 11 for a new snapshot (with --snapshots).
@@ -33,15 +41,19 @@ import urllib.request
 import zipfile
 
 try:
-    from . import class_index, lab, port_report, vanilla_map
+    from . import class_index, lab, port_harness, port_publish, port_regen, port_report, vanilla_map
 except ImportError:
     import class_index
     import lab
+    import port_harness
+    import port_publish
+    import port_regen
     import port_report
     import vanilla_map
 
 MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 STORE = Path(os.environ.get("HORIZON_VERSIONS", Path.home() / "code" / "horizon-parity" / "versions"))
+PORTS = Path(os.environ.get("HORIZON_PORTS", STORE.parent / "ports"))
 STATES = ["handshake", "status", "login", "configuration", "play"]
 # How many changed JSON paths one changed file keeps in diff.json.
 PATH_LIMIT = 50
@@ -545,6 +557,39 @@ def diff(args):
     return 0
 
 
+# --- regen -------------------------------------------------------------------------------------------------
+
+def regen(args):
+    version = safe_version(args.new)
+    result = port_regen.regen(version, paths(version), version_dir(version), args.base,
+                              Path(args.worktree) if args.worktree else PORTS / version, args.only)
+    lab.write_json(diff_dir(result["old"], version) / "regen.json", result)
+    for name, entry in result["generators"].items():
+        stat = ", ".join(f"{p} +{a} -{r}" for p, (a, r) in entry.get("stat", {}).items())
+        print(f"{name}: {entry['status']}" + (f" ({stat})" if stat else ""))
+    print(f"\n{result['candidate']} at {result['commit'][:10]}; {diff_dir(result['old'], version) / 'regen.json'}")
+    return 1 if any(e["status"] == "failed" for e in result["generators"].values()) else 0
+
+
+# --- harnesses ---------------------------------------------------------------------------------------------
+
+def harnesses(args):
+    version, old = safe_version(args.new), args.old or pinned()
+    directory = diff_dir(old, version)
+    previous = json.loads((directory / "harnesses.json").read_text()) if args.no_run else None
+    result = port_harness.harnesses(version, version_dir(version),
+                                    Path(args.worktree) if args.worktree else PORTS / version,
+                                    args.baseline, args.names or None, args.timeout, previous)
+    lab.write_json(directory / "harnesses.json", result)
+    port_harness.keep_logs(result, directory / "harness-logs")
+    counts = result["summary"]
+    print(f"horizon-prepare: {result['prepare']['status']}")
+    print(f"harnesses: {counts['pass']} pass, {counts['oracle']} oracle no longer compiles, {counts['fail']} fail; "
+          f"{counts['new']} newly failing, {counts['known']} failing on the baseline too")
+    print(f"{directory / 'harnesses.json'}")
+    return 0
+
+
 # --- report ------------------------------------------------------------------------------------------------
 
 def harness_results(state_path):
@@ -563,7 +608,11 @@ def report(args):
     result = json.loads((directory / "diff.json").read_text())
     mapping = json.loads((directory / "vanilla_map.json").read_text())
     results = harness_results(args.results) if args.results else None
-    built = port_report.build(result, mapping, args.old, args.new, load(pinned(), "facts.json"), results)
+    regenerated, ran = directory / "regen.json", directory / "harnesses.json"
+    regenerated = json.loads(regenerated.read_text()) if regenerated.exists() else None
+    ran = json.loads(ran.read_text()) if ran.exists() and not args.results else None
+    built = port_report.build(result, mapping, args.old, args.new, load(pinned(), "facts.json"), results,
+                              regen=regenerated, harnesses=ran)
     lab.write_json(directory / "report.json", built)
     (directory / "report.md").write_text(port_report.markdown(built))
     print("\n".join(port_report.markdown(built).splitlines()[:args.lines]))
@@ -571,12 +620,43 @@ def report(args):
     return 0
 
 
+# --- publish -----------------------------------------------------------------------------------------------
+
+def publish(args):
+    directory = diff_dir(args.old, args.new)
+    if not (directory / "report.json").exists():
+        raise SystemExit(f"No report yet; run version_port.py report {args.old} {args.new}")
+    built = json.loads((directory / "report.json").read_text())
+    result = json.loads((directory / "diff.json").read_text())
+    issues = port_publish.open_version_port_issues() if args.yes or args.check_github else {}
+    actions = port_publish.plan(built, result, directory, issues)
+    creates = sum(1 for a in actions if a[0] == "create")
+    if not args.yes:
+        for action, name, text, number in actions:
+            print(f"would {action}{f' #{number}' if number else ''}: {name}")
+        for action, name, text, number in actions[:args.show]:
+            print(f"\n--- {name}\n{text}")
+        missing = port_publish.missing_labels(args.new) if args.check_github else [port_publish.LABEL,
+                                                                                    f"port-{args.new}"]
+        print(f"\nDry run: {creates} issues to create, {len(actions) - creates} to update"
+              f"{'' if args.check_github else ' (open issues not checked: --check-github)'}; labels to create: "
+              f"{', '.join(missing) or 'none'}; then one Kira card for the tracking issue. Rerun with --yes to do it.")
+        return 0
+    urls = port_publish.apply(actions, built, issues)
+    tracking = urls[actions[-1][1]]
+    card = port_publish.kira_card(args.new, tracking)
+    print(f"Tracking issue {tracking}" + (f"; Kira card {card}" if card else "; Kira card already there"))
+    return 0
+
+
 def port(args):
-    """prepare both, diff, report."""
+    """prepare both, diff, regen, report."""
     old = args.old or pinned()
     for version in (old, args.new):
         prepare(argparse.Namespace(version=version, download=False, jobs=args.jobs))
     diff(argparse.Namespace(old=old, new=args.new))
+    if not args.no_regen:
+        regen(argparse.Namespace(new=args.new, base=args.base, worktree=None, only=None))
     return report(argparse.Namespace(old=old, new=args.new, results=args.results, lines=args.lines))
 
 
@@ -623,24 +703,48 @@ def main():
     command = commands.add_parser("diff", help="diff two prepared versions")
     command.add_argument("old")
     command.add_argument("new")
+    command = commands.add_parser("regen", help="a candidate worktree pinned to NEW, every table regenerated")
+    command.add_argument("new")
+    command.add_argument("--base", default="origin/main", help="what port/NEW starts from (default origin/main)")
+    command.add_argument("--worktree", help="where (default: $HORIZON_PORTS/NEW)")
+    command.add_argument("--only", nargs="*", help="these generators only (names in tools/port_regen.py)")
+    command = commands.add_parser("harnesses", help="horizon-prepare and every harness in the candidate")
+    command.add_argument("new")
+    command.add_argument("names", nargs="*", help="these harnesses only (default: all)")
+    command.add_argument("--old", help="the version the port starts from (default: the pinned one)")
+    command.add_argument("--worktree", help="the candidate (default: $HORIZON_PORTS/NEW)")
+    command.add_argument("--baseline", help="tools/parity.py's state.json from a run on the pinned version: what "
+                                            "fails there too is not newly failing")
+    command.add_argument("--timeout", type=int, help="per harness, seconds (tools/parity.py --timeout)")
+    command.add_argument("--no-run", action="store_true", help="classify the last run again (another --baseline)")
     command = commands.add_parser("report", help="the ranked port report of a diff")
     command.add_argument("old")
     command.add_argument("new")
-    command.add_argument("--results", help="tools/parity.py's state.json from a run against NEW")
+    command.add_argument("--results", help="tools/parity.py's state.json from a run against NEW (default: "
+                                           "harnesses.json, when version_port.py harnesses ran)")
     command.add_argument("--lines", type=int, default=60, help="how much of report.md to print")
+    command = commands.add_parser("publish", help="the report's work items as GitHub issues (dry run by default)")
+    command.add_argument("old")
+    command.add_argument("new")
+    command.add_argument("--yes", action="store_true", help="create and update the issues, labels and Kira card")
+    command.add_argument("--check-github", action="store_true",
+                         help="dry run: read the open issues and labels to tell creates from updates")
+    command.add_argument("--show", type=int, default=1, help="dry run: print this many issue bodies")
     command = commands.add_parser("port", help="prepare, diff and report in one go")
     command.add_argument("new")
     command.add_argument("--old", help="default: the pinned version")
     command.add_argument("--results", help="tools/parity.py's state.json from a run against NEW")
     command.add_argument("--lines", type=int, default=60)
+    command.add_argument("--base", default="origin/main", help="what the candidate starts from")
+    command.add_argument("--no-regen", action="store_true", help="diff and report only (snapshots)")
     command.add_argument("-j", "--jobs", type=int, default=int(os.environ.get("FLEET_LOAD_JOBS", 0)) or None)
     command = commands.add_parser("gc", help="delete versions and scratch the store doesn't need")
     command.add_argument("--keep", nargs="*", default=[])
     command.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     STORE.mkdir(parents=True, exist_ok=True)
-    return {"detect": detect, "prepare": prepare, "diff": diff, "report": report, "port": port,
-            "gc": gc}[args.command](args)
+    return {"detect": detect, "prepare": prepare, "diff": diff, "regen": regen, "harnesses": harnesses,
+            "report": report, "publish": publish, "port": port, "gc": gc}[args.command](args)
 
 
 if __name__ == "__main__":

@@ -325,8 +325,10 @@ into `mods/<id>/carry/`, a folder content mod (API 0.2) the game loads with `--d
 keeps what a content mod may not hold (other namespaces, vanilla data) in `outside/`. Files of
 the mod's own content that the game's content loader would refuse whole also go to `outside/`,
 listed with the reason in the report's `unreadable`: paths vanilla does not read (upper case),
-JSON that does not parse, and shared tags with `"replace": true`. Vanilla skips them one by one.
-A byte-order mark is dropped. For ATM10's 42 mods that is 19 files in 7 mods, and the 42 load as
+and JSON that does not parse. Vanilla skips them one by one. A vanilla or convention tag
+with `"replace": true` is carried as it is: the game honours it as a data pack's, with a warning
+(docs/mods.md); Towns and Towers' seven `minecraft:has_structure/*` biome tags are such.
+A byte-order mark is dropped. For ATM10's 42 mods that is 6 files in 4 mods, and the 42 load as
 carried. No class file is copied. It upgrades from 1.21.1 to 26.3: vanilla-type recipes (ingredients), loot tables
 (`conditions` lists become one `condition`, `functions` become `modifier`, kinds move to `type`,
 tool matches on silk touch or shears become `minecraft:tool/can_silk_touch` and
@@ -346,7 +348,9 @@ same states (Macaw's garage doors, multi-part gates). Recipes get the convention
 (`c:dyes/red`), filled from the oracle with vanilla's and the mod's own members. Without the
 oracle, templates are guessed from the blockstate's properties: the template whose properties
 include them with the fewest left over (models often ignore `powered` or `waterlogged`), the
-block's name breaking ties (`_pane`, `_gate`, `_trapdoor`).
+block's name breaking ties (`_pane`, `_gate`, `_trapdoor`). Walls and vines have the same
+property names; sides tested as `true` / `false` make a vine (Chipped's 11 vines, which the game
+refused as walls: their blockstates did not load).
 
 ### 1. Import
 
@@ -507,8 +511,13 @@ Two cases the oracle fills in:
     Better Witch Huts' log and fence legs are `horizon:yung_pillar`. In the monument at chunk
     (2, 8) (seed 1234), 318,512 blocks of air become water and none is left between y 30 and
     60 (227,034 before); its 5,142 placeholder blocks are gone.
-    Still taken out: Formations' biome replacements, Repurposed's air fix
-    (`close_off_air_sources`), blocks aged or propped up.
+    Repurposed's opposite fix, which walls off the air and other liquids beside its ocean
+    mineshafts' water, is `horizon:close_off_air_sources` (its 4 lists). It runs in the mod's
+    order, so the walls it builds keep the later blocks of the template from the mod's "where
+    the world is air, keep it" rules: around the ocean mineshaft at chunk (-18, -54), seed
+    1234, 650 blocks of air and cave air become prismarine and 614 more template water blocks
+    stay water (1,303 blocks change in its 81 chunks).
+    Still taken out: Formations' biome replacements, blocks aged or propped up.
     In the 128×128-chunk square (seed 1234), every spawner of a mod structure now has its mob:
     in the Overworld 83 Better Dungeons spawners held the template's placeholder pig and 17 of
     Moog's were empty (763 spawners with a mob, up from 628); in the Nether the 52 empty ones
@@ -530,6 +539,12 @@ Two cases the oracle fills in:
     from the template's origin along one axis, and a world height range. The game runs them
     as `horizon:matter_phase`, `horizon:piece_origin_axis_aligned_linear_pos` and
     `horizon:y_value` with the mod's fields, and carry renames them (213 in 75 lists).
+  - **Waterlogging.** Repurposed's `waterlogging_when_replacing_water_processor` (the bottom
+    pillars of its villages and outposts, 16 lists) is `horizon:waterlog_in_world_water`: a
+    block that can be waterlogged is where the world holds water, dry where it does not, and
+    one placed in water gets a block tick. Its dropped processors go from 370 to 253 (with
+    the structure voids carried); around the ocean village at chunk (12, 10), seed 1234, 6
+    spruce fences of its pillars under the sea are now waterlogged.
   - **Namespaces besides the mod id.** Towns and Towers (mod id `t_and_t`) ships all 60 of its
     structures under `kaisyn` and `towns_and_towers`, which carry used to leave in `outside/`.
     Carry now claims a namespace for the mod when the mod's own files (its id's, its tag

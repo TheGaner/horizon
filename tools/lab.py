@@ -24,6 +24,28 @@ LOCAL = ROOT / ".local"
 LOCK = ROOT / "research-lock.json"
 
 
+def pinned_version():
+    """The Minecraft version research-lock.json pins: every tool reads it from there, never by hand."""
+    version = json.loads(LOCK.read_text(encoding="utf-8"))["minecraft"]["version"]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", version) or version in {".", ".."}:
+        raise ValueError("Unsafe version identifier in lock file")
+    return version
+
+
+VERSION = pinned_version()
+# The pinned version's imported jars, libraries and sources (tools/lab.py prepare), and the resources
+# horizon-prepare made from them.
+GAME = LOCAL / "minecraft" / VERSION
+RESOURCES = LOCAL / "horizon-client" / VERSION
+
+
+def version_info(client_jar=None):
+    """What the pinned client jar states about itself in its version.json (protocol_version, world_version,
+    pack_version, java_version...)."""
+    with zipfile.ZipFile(client_jar or GAME / "jars" / "client.jar") as archive:
+        return json.loads(archive.read("version.json"))
+
+
 def cargo_target():
     """Cargo's target directory, honouring CARGO_TARGET_DIR (tools/parity.py sets it)."""
     return ROOT / os.environ.get("CARGO_TARGET_DIR", "target")
@@ -237,14 +259,18 @@ def import_library(artifact, destination_root, minecraft=None):
 
 
 def launcher_assets(manifest, minecraft=None):
-    """The launcher's asset directory and the pinned version's verified asset index."""
+    """The launcher's asset directory and the pinned version's asset index."""
     assets = minecraft_dir(minecraft) / "assets"
     info = manifest["assetIndex"]
     index = assets / "indexes" / f"{info['id']}.json"
     if not index.is_file():
         raise FileNotFoundError(f"Missing {index}. {LAUNCHER_HINT.format(version=manifest['id'])}")
-    if digest(index, "sha1") != info["sha1"]:
-        raise ValueError(f"{index} is not the pinned asset index")
+    checksum = digest(index, "sha1")
+    known = json.loads(LOCK.read_text(encoding="utf-8"))["minecraft"].get("accepted_asset_index_sha1", [])
+    if checksum != info["sha1"] and checksum not in known:
+        # Mojang republishes an index under the same id (#1076); each object is still verified.
+        print(f"{index} is an asset index Horizon does not know yet (sha1 {checksum}); "
+              "using it, every file is still checked against its own SHA-1", file=sys.stderr)
     return assets, index
 
 
@@ -260,10 +286,7 @@ def launcher_object(assets, checksum):
 
 def config():
     lock = json.loads(LOCK.read_text(encoding="utf-8"))
-    version = lock["minecraft"]["version"]
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", version) or version in {".", ".."}:
-        raise ValueError("Unsafe version identifier in lock file")
-    return lock, LOCAL / "minecraft" / version
+    return lock, LOCAL / "minecraft" / pinned_version()
 
 
 def bundle_entries(archive, name):

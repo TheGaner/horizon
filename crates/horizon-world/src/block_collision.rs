@@ -6,6 +6,7 @@ use crate::{
     collision_context::CollisionContext,
     dynamic_support::{DynamicSupport, DynamicSupportError, DynamicSupportWorld},
     liquid_collision::{LiquidCollision, LiquidCollisionWorld},
+    piston_shape::PistonBlockBindings,
     powder_snow_collision::{PowderSnowWorld, powder_snow_collision_shape},
     registry::{BlockRegistry, BlockStateId},
 };
@@ -79,6 +80,9 @@ pub struct BlockCollisionRegistry<'r> {
     dynamic: HashMap<BlockStateId, DynamicSupport>,
     contextual: HashMap<BlockStateId, ContextualRule>,
     scan_flags: Vec<u8>,
+    /// Piston and piston-head states for moving-piston collision; None in
+    /// registries without pistons.
+    pistons: Option<PistonBlockBindings<'r>>,
 }
 enum ContextualRule {
     Scaffolding(ScaffoldingCollision),
@@ -111,7 +115,8 @@ impl<'r> BlockCollisionRegistry<'r> {
             scan_flags.push(
                 u8::from(large)
                     | (u8::from(state.name == "minecraft:moving_piston") << 1)
-                    | (u8::from(empty) << 2),
+                    | (u8::from(empty) << 2)
+                    | (u8::from(contextual.contains_key(&id)) << 3),
             );
             if cached.cached_shape(id)?.is_none() {
                 if let Some(rule) =
@@ -121,15 +126,21 @@ impl<'r> BlockCollisionRegistry<'r> {
                 }
             }
         }
+        let pistons = PistonBlockBindings::new(cached.registry()).ok();
         Ok(Self {
             cached,
             dynamic,
             contextual,
             scan_flags,
+            pistons,
         })
     }
     pub fn registry(&self) -> &'r BlockRegistry {
         self.cached.registry()
+    }
+    /// The piston states behind `PistonMovingBlockEntity.getCollisionShape`.
+    pub fn pistons(&self) -> Option<&PistonBlockBindings<'r>> {
+        self.pistons.as_ref()
     }
     pub fn cached_shapes(&self) -> &CachedCollisionRegistry<'r> {
         &self.cached
@@ -183,7 +194,12 @@ impl<'r> BlockCollisionRegistry<'r> {
             + LiquidCollisionWorld<Error = E>
             + PowderSnowWorld<Error = E>,
     {
-        match self.contextual.get(&state) {
+        // Most states have no contextual rule: their flag spares the lookup.
+        let contextual = self
+            .scan_flags
+            .get(state.0 as usize)
+            .is_none_or(|flags| flags & 8 != 0);
+        match contextual.then(|| self.contextual.get(&state)).flatten() {
             Some(ContextualRule::Scaffolding(rule)) => Ok(rule.shape(context, position)),
             Some(ContextualRule::Liquid(rule)) => rule
                 .shape(world, position, context)

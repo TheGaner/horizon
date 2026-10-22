@@ -247,6 +247,8 @@ pub struct Streaming {
     pub forced: HashSet<(i32, i32)>,
     /// No work is scheduled while paused (title screen).
     pub paused: bool,
+    /// The level loading screen is up: work goes ring by ring (`Ranges::rings`).
+    pub loading: bool,
     /// Dimension flags: sky light, Nether face shading.
     pub sky_light: bool,
     pub nether_shading: bool,
@@ -316,6 +318,7 @@ struct GenerationInputs<'a> {
     finishing: &'a FxHashSet<(i32, i32)>,
     decorates: bool,
     remote: bool,
+    loading: bool,
 }
 impl GenerationScan {
     /// None means the scan was skipped; Some preserves the original candidate
@@ -362,7 +365,7 @@ impl GenerationScan {
                     {
                         continue;
                     }
-                    wanted.push((input.ranges.distance(x, z), x, z));
+                    wanted.push((input.ranges.priority(x, z, input.loading), x, z));
                 }
             }
             // A level-31 forced ticket block-ticks its neighbouring chunks
@@ -381,7 +384,7 @@ impl GenerationScan {
                         {
                             continue;
                         }
-                        wanted.push((input.ranges.distance(x, z), x, z));
+                        wanted.push((input.ranges.priority(x, z, input.loading), x, z));
                     }
                 }
             }
@@ -436,6 +439,8 @@ impl Streaming {
                 thread::Builder::new()
                     .name(format!("horizon-worker-{i}"))
                     .spawn(move || {
+                        // A dedicated server's tick comes first (horizon_threads).
+                        horizon_threads::behind_server();
                         let mut worker = generator.worker();
                         // The face visibility table and its occlusion cache stay with
                         // the worker across mesh jobs, like vanilla's per-thread cache:
@@ -544,6 +549,7 @@ impl Streaming {
             radius: 8,
             forced: HashSet::new(),
             paused: false,
+            loading: false,
             sky_light: true,
             nether_shading: false,
             biome_zoom: BiomeZoom::new(0),
@@ -719,8 +725,9 @@ impl Streaming {
             }
         }
     }
+    /// The order jobs around the player run in, lowest first.
     fn distance(&self, x: i32, z: i32) -> i64 {
-        self.ranges().distance(x, z)
+        self.ranges().priority(x, z, self.loading)
     }
     fn region(world: &World, x: i32, z: i32) -> Option<Box<Region>> {
         let mut region: Region = Default::default();
@@ -1188,6 +1195,7 @@ impl Streaming {
             finishing: &self.finishing,
             decorates: self.decorates,
             remote: self.remote,
+            loading: self.loading,
         };
         if let Some(wanted) = self.generation_scan.candidates(input, workers * 3) {
             for (d, x, z) in wanted {
@@ -1317,6 +1325,30 @@ impl Streaming {
         }
         self.written.clear();
     }
+    /// Finish generation for a closing world without waiting on the event
+    /// loop. No new generation is scheduled while the save screen is shown.
+    /// Proto snapshots are checked out to workers before chunk writes, just as
+    /// in `save(true)`, so older generation cannot overwrite the final chunks.
+    pub fn poll_save(&mut self, world: &mut World) -> bool {
+        let started = std::time::Instant::now();
+        while let Ok(done) = self.results.try_recv() {
+            match done {
+                Done::Decorated(x, z, region) => self.receive_decorated(x, z, region),
+                Done::Generated(chunk) => self.receive_generated(chunk, world),
+                Done::Saved(protos) => self.receive_saved(protos),
+                other => self.deferred.push(other),
+            }
+            if started.elapsed() >= std::time::Duration::from_millis(2) {
+                return false;
+            }
+        }
+        if self.decorating > 0 || !self.finishing.is_empty() || self.saving > 0 {
+            return false;
+        }
+        let written: Vec<_> = self.written.drain().collect();
+        self.save_checked_out(written);
+        self.saving == 0
+    }
     fn in_range(&self, x: i32, z: i32, margin: i32) -> bool {
         self.ranges().in_range(x, z, margin)
     }
@@ -1338,6 +1370,29 @@ struct Ranges<'a> {
     forced: &'a HashSet<(i32, i32)>,
 }
 impl Ranges<'_> {
+    /// `distance`, or `rings` while the level loading screen is up.
+    fn priority(&self, x: i32, z: i32, loading: bool) -> i64 {
+        if loading {
+            self.rings(x, z)
+        } else {
+            self.distance(x, z)
+        }
+    }
+    /// Ring by ring: the Chebyshev distance to the nearest centre first, then
+    /// the squared distance. Vanilla's chunk tasks run by ticket level, which
+    /// spreads one level per ring of chunks (`ChunkTaskPriorityQueue`), so
+    /// `LevelLoadingScreen`'s chunk map fills squares around the spawn.
+    fn rings(&self, x: i32, z: i32) -> i64 {
+        let d = |c: (i32, i32)| {
+            let (dx, dz) = (i64::from(x - c.0), i64::from(z - c.1));
+            let ring = dx.abs().max(dz.abs());
+            (ring * ring) << 20 | (dx * dx + dz * dz)
+        };
+        self.extra
+            .iter()
+            .map(|(c, _)| d(*c))
+            .fold(d(self.center), i64::min)
+    }
     fn distance(&self, x: i32, z: i32) -> i64 {
         let d = |c: (i32, i32)| {
             let (dx, dz) = (i64::from(x - c.0), i64::from(z - c.1));
@@ -1536,6 +1591,7 @@ mod tests {
                 finishing: &self.finishing,
                 decorates: self.decorates,
                 remote: self.remote,
+                loading: false,
             }
         }
         fn fill(&mut self) {
@@ -1887,6 +1943,31 @@ mod tests {
     /// from the save) and is not unloaded right after: either way it would be
     /// asked for and loaded again on the next frame, forever (8 such columns
     /// after a teleport at render distance 16 held 8 of the in-flight slots).
+    /// #770: while the loading screen is up, chunks go ring by ring (a
+    /// square front, as vanilla's ticket levels), nearest first in a ring.
+    #[test]
+    fn loading_goes_ring_by_ring() {
+        let forced = HashSet::new();
+        let r = Ranges {
+            center: (2, -1),
+            radius: 12,
+            extra: &[],
+            forced: &forced,
+        };
+        let at = |dx: i32, dz: i32| (2 + dx, -1 + dz);
+        let key = |(x, z): (i32, i32), loading| r.priority(x, z, loading);
+        // The corner of ring 3 comes before the edge of ring 4 only while loading.
+        assert!(key(at(3, 3), true) < key(at(0, 4), true));
+        assert!(key(at(3, 3), false) > key(at(0, 4), false));
+        // Inside a ring, nearest first; rings never interleave.
+        assert!(key(at(0, 3), true) < key(at(2, -3), true));
+        assert!(key(at(-3, -3), true) < key(at(4, 0), true));
+        for dx in -20..=20 {
+            for dz in -20..=20 {
+                assert_eq!(key(at(dx, dz), false), r.distance(2 + dx, -1 + dz));
+            }
+        }
+    }
     #[test]
     fn requested_columns_stay_loaded() {
         let forced = HashSet::new();

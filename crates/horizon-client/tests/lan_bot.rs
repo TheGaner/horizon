@@ -34,7 +34,9 @@ use std::{
 };
 
 fn resources() -> Option<std::path::PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.local/horizon-client")
+        .join(horizon_core::VANILLA_VERSION);
     root.join("items.json").exists().then_some(root)
 }
 
@@ -182,6 +184,7 @@ impl Server {
             equipment: Default::default(),
             health: 20.0,
             attributes: Vec::new(),
+            bed: None,
             living_flags: 0,
         };
         let mut ctx = TickCtx {
@@ -195,6 +198,7 @@ impl Server {
             clock_rate: 1.0,
             tick_rate: 20.0,
             tick_frozen: false,
+            tick_steps: (0, 0),
             collision: None,
         };
         let events = self.hub.tick(&mut ctx);
@@ -305,7 +309,10 @@ fn status_and_join() {
         Ok(r.json)
     });
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-    assert_eq!(v["version"]["protocol"], 777);
+    assert_eq!(
+        v["version"]["protocol"],
+        horizon_core::version::PROTOCOL_VERSION
+    );
     // ServerStatus.CODEC writes a plain literal MOTD as a bare string.
     assert_eq!(v["description"], "Test - World");
 

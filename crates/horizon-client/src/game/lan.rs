@@ -44,6 +44,8 @@ pub(super) struct LanHost {
     pub host_entity: i32,
     /// The host's swings the guests were told of (`Game::swings_started`).
     pub host_swings: u32,
+    /// The host's crack the guests were told of: the block and its stage.
+    pub host_crack: Option<([i32; 3], i32)>,
     pub host_uuid: u128,
     /// The host's profile name (the account's, or the offline name).
     pub host_name: String,
@@ -59,9 +61,10 @@ pub(super) struct LanHost {
     pub mob_players: HashMap<u32, u32>,
     /// An integrated server's owner (game/integrated.rs).
     pub owner: Option<Owner>,
-    /// The players' locator bars (game/lan_waypoints.rs), and the guests who
-    /// are dead, whose respawn replaces their waypoint.
-    pub waypoints: lan::waypoints::Waypoints,
+    /// The players' locator bars, one waypoint manager per level by
+    /// dimension id (game/lan_waypoints.rs), and the guests who are dead,
+    /// whose respawn replaces their waypoint.
+    pub waypoints: std::collections::HashMap<String, lan::waypoints::Waypoints>,
     pub waypoint_dead: std::collections::HashSet<u128>,
     /// Guests' commands waiting for the hub to be back in `self.lan`, where
     /// a command can reach every player (game/lan_actions.rs).
@@ -395,6 +398,8 @@ impl Game<'_> {
                     ],
                     "chunks": g.sent_chunks.len(),
                     "tracked": g.tracker.len(),
+                    // Whether the host draws this guest lying in a bed.
+                    "model_lying": h.models.get(&g.conn).map(|m| m.extra.ints[1] != 0),
                     // The armour the host draws on this guest, head to feet.
                     "model_armor": h.models.get(&g.conn).map(|m| {
                         [&m.extra.head, &m.extra.chest, &m.extra.legs, &m.extra.feet]
@@ -519,6 +524,7 @@ impl Game<'_> {
             settings: LanSettings { port, ..settings },
             host_entity,
             host_swings: self.swings_started,
+            host_crack: None,
             host_uuid,
             host_name: self.options.player_name(),
             models: HashMap::new(),
@@ -735,6 +741,7 @@ impl Game<'_> {
             health: p.health.health(),
             attributes: horizon_client::lan::attributes::syncable(&p.attributes),
             living_flags: living_flags(self.using),
+            bed: self.sleeping,
         })
     }
 
@@ -853,6 +860,7 @@ impl Game<'_> {
                     clock_rate,
                     tick_rate: self.clock.rate(),
                     tick_frozen: self.clock.frozen(),
+                    tick_steps: self.clock.step_state(),
                     collision: Some(self.collision),
                 };
                 host.hub.movement_checks = (
@@ -1049,6 +1057,7 @@ impl Game<'_> {
             clock_rate,
             tick_rate: self.clock.rate(),
             tick_frozen: self.clock.frozen(),
+            tick_steps: self.clock.step_state(),
             collision: Some(self.collision),
         };
         host.hub.place_new_player(conn, &mut ctx);
@@ -1227,6 +1236,8 @@ impl Game<'_> {
                 .each_ref()
                 .map(|s| s.as_ref().map(|s| s.item.clone()));
             m.extra.crouching = g.sneaking;
+            // Lying in its bed (LivingEntity.getBedOrientation).
+            m.extra.ints[1] = g.bed.map_or(0, |b| self.bed_facing(b));
             // LivingEntity.updateSwingTime: the arm swing lan_swings started.
             m.anim.attack_anim_o = m.anim.attack_anim;
             horizon_client::mobs::ai::tick_swing(m);
@@ -1236,6 +1247,20 @@ impl Game<'_> {
             m.extra.using_item = using.map_or(0, |(_, ticks)| ticks as i32 + 1);
             m.extra.using_off_hand = using.is_some_and(|(slot, _)| slot == OFFHAND_SLOT);
         }
+    }
+
+    /// The bed at `head` as a sleeping model lies in it (`ints[1]`,
+    /// `villager::sleep_pose`): its `facing`.
+    pub(super) fn bed_facing(&self, head: [i32; 3]) -> i32 {
+        let state = self.world.block(head[0], head[1], head[2]);
+        let facing = self
+            .pack
+            .assets
+            .registry
+            .state(state)
+            .and_then(|s| s.properties.get("facing"))
+            .map(String::as_str);
+        horizon_client::mobs::villager::bed_facing_code(facing)
     }
 
     /// The guests' models for the entity pass.

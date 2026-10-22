@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
 """Compare a player's right click on a block with vanilla's, for items that are
 both food and blocks (sweet and glow berries, carrots, potatoes), for sweet
-berry bushes, for spawn eggs used on a monster spawner, for respawn anchors and
-for beds in the Nether and the End.
+berry bushes, for spawn eggs used on a monster spawner, for shears carving
+pumpkins, for blocks placed where mobs and armor stands stand, for respawn
+anchors and for beds in the Nether and the End.
 
 Every case has a block at the origin, something above it, and a player three
 blocks south, survival or creative, hungry or full, sneaking or not, who
-right-clicks the top face of the origin holding an item, sometimes with
-another (or nothing) in the main hand and the item in the off hand, the
-main hand trying first. Vanilla runs the real
-`ServerPlayerGameMode.useItemOn` over the headless level of the dispenser
-harness (`VanillaDispenserOracle.useItem`): the block's `useItemOn` and
-`useWithoutItem` (picking a bush's berries, `SweetBerryBushBlock.useItemOn`
-passing bone meal on), then `ItemStack.useOn` (`BlockItem.place` with its
-`mayPlaceOn` rules, `BoneMealItem.useOn`, eating a consumable that could
-not be placed, and `SpawnEggItem.useOn` setting a spawner's mob). Respawn
+right-clicks the top face of the origin (for pumpkins, any face, turned any
+way) holding an item, sometimes with another (or nothing) in the main hand
+and the item in the off hand, the main hand trying first. Vanilla runs the
+real `ServerPlayerGameMode.useItemOn` over the headless level of the
+dispenser harness (`VanillaDispenserOracle.useItem`): the block's `useItemOn`
+and `useWithoutItem` (picking a bush's berries, `SweetBerryBushBlock.useItemOn`
+passing bone meal on, `PumpkinBlock.useItemOn` carving with shears and
+dropping the seeds from the carved side), then `ItemStack.useOn`
+(`BlockItem.place` with its `mayPlaceOn` rules, `BoneMealItem.useOn`, eating
+a consumable that could not be placed, and `SpawnEggItem.useOn` setting a
+spawner's mob). Respawn
 anchors are charged with glowstone, set the respawn point in the Nether and
 explode elsewhere (`RespawnAnchorBlock`, through the stand-in level's real
 `ServerExplosion`, with water at the anchor). Respawn cases call
@@ -156,6 +159,52 @@ def anchor_case(rng, states, case):
     case['cells'] = cells
 
 
+def pumpkin_case(rng, states, case):
+    """Shears (or something else) used on a pumpkin (`PumpkinBlock.useItemOn`):
+    any face, the player turned any way, worn shears (the stand-in player
+    has no entity id for the break event, so they keep one use)."""
+    cells = [[0, 0, 0, states.get(rng.choice(['pumpkin'] * 6 + ['carved_pumpkin', 'melon']))]]
+    if rng.random() < 0.3:
+        cells.append([0, 1, 0, states.get(rng.choice(['stone', 'snow', 'short_grass']))])
+    damage = rng.choice([0, 0, 0, 100, 236])
+    shears = d_plain('shears', 1) if damage == 0 else \
+        '{id:"minecraft:shears",count:1,components:{"minecraft:damage":%d}}' % damage
+    item = rng.choice([shears] * 6 + [d_plain('stick', 1), d_plain('pumpkin', 3), '-'])
+    use = {'item': item, 'creative': rng.random() < 0.2, 'sneaking': rng.random() < 0.15, 'food': 20,
+           'yaw': rng.choice([0, 30, 90, 135, 180, 200, 270, 315, -45, -100]),
+           'face': rng.choice(['up', 'up', 'down', 'north', 'south', 'west', 'east'])}
+    if rng.random() < 0.3:
+        # Shears in the off hand, something else or nothing in the main hand.
+        use.update(offhand=item, item=rng.choice(['-', '-', d_plain('stick', 1), d_plain('stone', 16)]))
+    case['use_item'] = use
+    case['cells'] = cells
+
+
+# Entities a block may be placed into (`Entity.blocksBuilding`), and blocks to place.
+BLOCKERS = ['skeleton', 'zombie', 'pig', 'chicken', 'cow', 'armor_stand', 'slime', 'bat']
+PLACED = ['obsidian', 'stone', 'oak_slab', 'oak_fence', 'white_carpet', 'torch', 'glass', 'oak_trapdoor', 'snow']
+
+
+def blocked_case(rng, states, case):
+    """A block placed on top of the origin where a mob or an armor stand stands, in its box or beside it
+    (`BlockItem.canPlace`'s `Level.isUnobstructed`)."""
+    case['cells'] = [[0, 0, 0, states.get(rng.choice(['stone', 'grass_block', 'dirt']))]]
+    entities = []
+    for _ in range(rng.choice([1, 1, 2])):
+        kind = rng.choice(BLOCKERS)
+        offset = [rng.choice([0, 0, 0.3, -0.45, 0.7, -1.2]), rng.choice([0, 0, 0.5, 0.95, 1.02, -0.5]),
+                  rng.choice([0, 0, 0.3, -0.6, 0.9])]
+        e = {'type': f'minecraft:{kind}', 'pos': [0.5 + offset[0], 1 + offset[1], 0.5 + offset[2]]}
+        if kind == 'armor_stand' and rng.random() < 0.3:
+            e['marker'] = True
+        if kind in ('pig', 'cow', 'chicken') and rng.random() < 0.3:
+            e['baby'] = True
+        entities.append(e)
+    case['entities'] = entities
+    case['use_item'] = {'item': d_plain(rng.choice(PLACED), rng.choice([1, 16])), 'creative': rng.random() < 0.3,
+                        'sneaking': False, 'food': 20}
+
+
 def cases(facts, count, seed):
     rng = random.Random(seed)
     states = d.States(facts)
@@ -177,6 +226,18 @@ def cases(facts, count, seed):
             continue
         if rng.random() < 0.15:
             anchor_case(rng, states, case)
+            case['items'] = []
+            case['mode'] = 'dispense'
+            yield case
+            continue
+        if rng.random() < 0.1:
+            blocked_case(rng, states, case)
+            case['items'] = []
+            case['mode'] = 'dispense'
+            yield case
+            continue
+        if rng.random() < 0.12:
+            pumpkin_case(rng, states, case)
             case['items'] = []
             case['mode'] = 'dispense'
             yield case
@@ -232,6 +293,8 @@ def kind(case, facts):
         return f'respawn at {first}'
     item = case['use_item']['item']
     item = item.split('"')[1].split(':')[1] if item != '-' else 'empty hand'
+    if 'entities' in case:
+        return f'{item} placed by ' + ', '.join(e['type'].split(':')[1] for e in case['entities'])
     return f'{item} on {first}'
 
 

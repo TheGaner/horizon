@@ -1,8 +1,9 @@
 //! Updates and rollbacks (docs/server.md, section 7) for a `horizon-server` installed by install.sh or
 //! install.ps1: each release in `<dir>/releases/<tag>`, `<dir>/current` pointing at the one in use, and
-//! `<dir>/previous` naming the one before it. An update downloads the newest release from GitHub, checks it
-//! against the SHA-256 GitHub publishes for it, unpacks it beside the others and switches `current`; the
-//! supervisor then restarts the game on it and switches back by itself if the new game doesn't come up.
+//! `<dir>/previous` naming the one before it. An update downloads the newest stable release from GitHub, checks it
+//! against the SHA-256 in the release's signed SHA256SUMS (docs/security.md), unpacks it beside the others and
+//! switches `current`; the supervisor then restarts the game on it and switches back by itself if the new game
+//! doesn't come up.
 
 use crate::{api::Client, backup, config::Config, engine, supervisor};
 use serde_json::{Value, json};
@@ -231,27 +232,48 @@ pub struct Release {
     pub sha256: String,
 }
 
-/// The newest release (or `tag`), from GitHub's API.
+/// GitHub's API, or a release asset: the body of `url`.
+fn fetch(url: &str) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    ureq::get(url)
+        .set("Accept", "application/vnd.github+json")
+        .set("User-Agent", "horizon-server")
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(404, _) => "404".to_string(),
+            e => format!("GitHub didn't answer: {e}"),
+        })?
+        .into_reader()
+        .take(64 << 20)
+        .read_to_end(&mut body)
+        .map_err(|e| format!("GitHub's answer: {e}"))?;
+    Ok(body)
+}
+
+/// The newest stable release (or `tag`), from GitHub's API, with the SHA-256 its signed checksums
+/// give for this computer's archive.
 pub fn release(tag: Option<&str>) -> Result<Release, String> {
     let url = match tag {
         Some(tag) => format!("https://api.github.com/repos/{REPO}/releases/tags/{tag}"),
         None => format!("https://api.github.com/repos/{REPO}/releases/latest"),
     };
-    let text = ureq::get(&url)
-        .set("Accept", "application/vnd.github+json")
-        .set("User-Agent", "horizon-server")
-        .call()
-        .map_err(|e| match e {
-            ureq::Error::Status(404, _) => format!("no release {} on GitHub", tag.unwrap_or("")),
-            e => format!("GitHub didn't answer: {e}"),
-        })?
-        .into_string()
-        .map_err(|e| format!("GitHub's answer: {e}"))?;
-    pick(&serde_json::from_str(&text).map_err(|e| format!("GitHub's answer: {e}"))?)
+    let text = fetch(&url).map_err(|e| match e.as_str() {
+        "404" => format!("no release {} on GitHub", tag.unwrap_or("")),
+        _ => e,
+    })?;
+    let json = serde_json::from_slice(&text).map_err(|e| format!("GitHub's answer: {e}"))?;
+    pick(&json, fetch, &horizon_release_sign::trusted_keys())
 }
 
-/// The archive for this computer in a release's JSON, with the SHA-256 GitHub publishes for it.
-fn pick(release: &Value) -> Result<Release, String> {
+/// The archive for this computer in a release's JSON, with the SHA-256 the release's SHA256SUMS
+/// gives for it, once its signature checks with one of `keys` (docs/security.md). A release from
+/// before signing gets the SHA-256 pinned for it (legacy-releases.txt); any other release that
+/// isn't signed, or not by Horizon's key, is refused.
+fn pick(
+    release: &Value,
+    fetch: impl Fn(&str) -> Result<Vec<u8>, String>,
+    keys: &[horizon_release_sign::PublicKey],
+) -> Result<Release, String> {
     let tag = release["tag_name"]
         .as_str()
         .ok_or("GitHub's answer has no tag")?;
@@ -266,10 +288,36 @@ fn pick(release: &Value) -> Result<Release, String> {
             )
         })?;
     let name = asset["name"].as_str().unwrap_or_default();
-    let sha256 = asset["digest"]
-        .as_str()
-        .and_then(|d| d.strip_prefix("sha256:"))
-        .ok_or_else(|| format!("release {tag} publishes no SHA-256 for {name}"))?;
+    // A release from before signing: only the files pinned for it at the time (a rollback).
+    if let Some(hex) = horizon_release_sign::legacy_digest(tag, name) {
+        return Ok(Release {
+            tag: tag.to_owned(),
+            asset: name.to_owned(),
+            url: asset["browser_download_url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            sha256: hex.to_owned(),
+        });
+    }
+    let attached = |file: &str| -> Result<Option<Vec<u8>>, String> {
+        match assets.iter().find(|a| a["name"] == file) {
+            Some(a) => fetch(a["browser_download_url"].as_str().unwrap_or_default())
+                .map(Some)
+                .map_err(|e| format!("{file} of {tag}: {e}")),
+            None => Ok(None),
+        }
+    };
+    let sums = attached(horizon_release_sign::SUMS)?;
+    let signature = attached(horizon_release_sign::SIGNATURE)?
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned());
+    let sha256 = horizon_release_sign::signed_digest(
+        tag,
+        name,
+        sums.as_deref(),
+        signature.as_deref(),
+        keys,
+    )?;
     Ok(Release {
         tag: tag.to_owned(),
         asset: name.to_owned(),
@@ -277,20 +325,75 @@ fn pick(release: &Value) -> Result<Release, String> {
             .as_str()
             .unwrap_or_default()
             .to_owned(),
-        sha256: sha256.to_ascii_lowercase(),
+        sha256,
     })
 }
 
-/// Whether the release `tag` is newer than `than`: releases are tagged `vYYYY.MM.DD[.N]`, compared
-/// number by number. A tag that isn't one (an archive installed by hand) is never older than a release.
-pub fn newer(tag: &str, than: &str) -> bool {
-    let numbers = |t: &str| -> Option<Vec<u64>> {
-        t.strip_prefix('v')?
-            .split('.')
-            .map(|n| n.parse().ok())
-            .collect()
+/// Where a release tag stands among Horizon's releases (docs/versioning.md). Releases before 0.2 were
+/// tagged `vYYYY.MM.DD[.N]` (any `v` and numbers: `Dated`), compared number by number; from 0.2 they are
+/// `vMAJOR.MINOR.PATCH[-PRE]` (`Semver`), and every one of those is newer than every dated one, so
+/// v0.2.0 follows v2026.10.19.15. A pre-release (`v0.3.0-rc.1`) comes before its release, as in semver.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum TagOrder {
+    Dated(Vec<u64>),
+    Semver([u64; 3], Prerelease),
+}
+
+/// A pre-release's place: (is a release, its identifiers). A release has none and follows every
+/// pre-release of its version; identifiers compare one by one, numbers before words, and a shorter
+/// list first when one starts the other.
+type Prerelease = (bool, Vec<Identifier>);
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Identifier {
+    Number(u64),
+    Word(String),
+}
+
+/// Semver's majors stay below this; a date tag's first number is a year.
+const FIRST_YEAR: u64 = 1000;
+
+fn tag_order(tag: &str) -> Option<TagOrder> {
+    let rest = tag.strip_prefix('v')?;
+    let (core, pre) = match rest.split_once('-') {
+        Some((core, pre)) => (core, Some(pre)),
+        None => (rest, None),
     };
-    match (numbers(tag), numbers(than)) {
+    let numbers: Vec<u64> = core
+        .split('.')
+        .map(|n| n.parse().ok())
+        .collect::<Option<_>>()?;
+    match (numbers.as_slice(), pre) {
+        (&[major, minor, patch], pre) if major < FIRST_YEAR => {
+            let pre = match pre {
+                None => (true, Vec::new()),
+                Some(pre) => (
+                    false,
+                    pre.split('.')
+                        .map(|id| {
+                            if id.is_empty() {
+                                None
+                            } else {
+                                Some(id.parse().map_or_else(
+                                    |_| Identifier::Word(id.to_owned()),
+                                    Identifier::Number,
+                                ))
+                            }
+                        })
+                        .collect::<Option<_>>()?,
+                ),
+            };
+            Some(TagOrder::Semver([major, minor, patch], pre))
+        }
+        (_, None) => Some(TagOrder::Dated(numbers)),
+        (_, Some(_)) => None,
+    }
+}
+
+/// Whether the release `tag` is newer than `than` ([`TagOrder`]). A tag that isn't a release (an
+/// archive installed by hand) is never newer than one, and every release is newer than it.
+pub fn newer(tag: &str, than: &str) -> bool {
+    match (tag_order(tag), tag_order(than)) {
         (Some(a), Some(b)) => a > b,
         (Some(_), None) => true,
         _ => false,
@@ -717,31 +820,133 @@ mod tests {
     }
 
     #[test]
-    fn the_archive_for_this_computer_is_picked_with_its_digest() {
-        let asset = |name: &str| {
-            json!({
-                "name": name,
-                "browser_download_url": format!("https://example.invalid/{name}"),
-                "digest": "sha256:ABCDEF",
-            })
+    fn semver_tags_follow_every_date_tag() {
+        // 0.2 follows the last date tags, whatever their numbers.
+        assert!(newer("v0.2.0", "v2026.10.19.15"));
+        assert!(newer("v0.2.0", "v2026.10.21"));
+        assert!(!newer("v2026.10.19.15", "v0.2.0"));
+        assert!(!newer("v2099.12.31.99", "v0.2.0"));
+        // Within 0.2: patch, minor, and numbers compared as numbers.
+        assert!(newer("v0.2.1", "v0.2.0"));
+        assert!(!newer("v0.2.0", "v0.2.1"));
+        assert!(newer("v0.2.10", "v0.2.9"));
+        assert!(newer("v0.3.0", "v0.2.57"));
+        assert!(newer("v1.0.0", "v0.99.0"));
+        assert!(!newer("v0.2.0", "v0.2.0"));
+        // A semver tag is a release: an archive installed by hand is older.
+        assert!(newer("v0.2.0", "local"));
+        assert!(!newer("local", "v0.2.0"));
+    }
+
+    #[test]
+    fn prereleases_come_before_their_release() {
+        assert!(newer("v0.3.0", "v0.3.0-rc.1"));
+        assert!(newer("v0.3.0-rc.1", "v0.2.9"));
+        assert!(newer("v0.3.0-beta.2", "v0.3.0-beta.1"));
+        assert!(newer("v0.3.0-beta.11", "v0.3.0-beta.2"));
+        assert!(newer("v0.3.0-rc.1", "v0.3.0-beta.9"));
+        assert!(newer("v0.3.0-beta.1", "v0.3.0-beta"));
+        // Numbers come before words; any pre-release still follows every date tag.
+        assert!(newer("v0.3.0-alpha", "v0.3.0-1"));
+        assert!(newer("v0.2.1-beta.1", "v2026.10.21"));
+        assert!(!newer("v0.2.1-beta.1", "v0.2.1"));
+        // Not tags: a date tag with a suffix, an empty identifier.
+        assert!(newer("v0.2.0", "v2026.10.21-x"));
+        assert!(newer("v0.2.0", "v0.3.0-"));
+        assert!(newer("v0.2.0", "v0.3.0-rc..1"));
+    }
+
+    #[test]
+    fn pruning_orders_dated_and_semver_releases() {
+        // `prune` sorts with `newer`: semver releases first, then the dated ones.
+        let mut tags = vec!["v2026.10.19.15", "v0.2.1", "v2026.10.21", "v0.2.0", "local"];
+        tags.sort_by(|a, b| {
+            if newer(a, b) {
+                std::cmp::Ordering::Less
+            } else if newer(b, a) {
+                std::cmp::Ordering::Greater
+            } else {
+                b.cmp(a)
+            }
+        });
+        assert_eq!(
+            tags,
+            ["v0.2.1", "v0.2.0", "v2026.10.21", "v2026.10.19.15", "local"]
+        );
+    }
+
+    #[test]
+    fn horizon_server_ships_with_a_release_key() {
+        // With no key in release-keys.txt every update after the pinned releases would be refused:
+        // this fails until the release environment's public key is listed (docs/security.md).
+        assert!(
+            !horizon_release_sign::trusted_keys().is_empty(),
+            "crates/horizon-release-sign/release-keys.txt lists no key"
+        );
+    }
+
+    #[test]
+    fn a_release_from_before_signing_is_picked_with_its_pinned_digest() {
+        if let Some(first) = ASSETS.first() {
+            let pinned = horizon_release_sign::legacy_digest("v2026.10.19", first)
+                .expect("v2026.10.19 is from before signing and has every platform's archive");
+            let old = json!({ "tag_name": "v2026.10.19", "assets": [{ "name": first, "browser_download_url": "u" }] });
+            let nothing = |_: &str| -> Result<Vec<u8>, String> { Err("404".into()) };
+            assert_eq!(pick(&old, nothing, &[]).unwrap().sha256, pinned);
+        }
+    }
+
+    #[test]
+    fn the_archive_for_this_computer_is_picked_with_its_signed_digest() {
+        use horizon_release_sign::{SigningKey, sha256_hex, sums_file};
+        let asset = |name: &str| json!({ "name": name, "browser_download_url": format!("https://example.invalid/{name}") });
+        let (key, _) = SigningKey::generate().unwrap();
+        let listed: Vec<(String, String)> = ASSETS
+            .iter()
+            .map(|n| (n.to_string(), sha256_hex(n.as_bytes())))
+            .collect();
+        let sums = sums_file(&listed);
+        let signature = key.sign("v2099.01.01", sums.as_bytes());
+        let files = |url: &str| -> Result<Vec<u8>, String> {
+            match url.rsplit('/').next() {
+                Some("SHA256SUMS") => Ok(sums.clone().into_bytes()),
+                Some("SHA256SUMS.sig") => Ok(signature.clone().into_bytes()),
+                _ => Err("404".into()),
+            }
         };
-        let release = json!({
-            "tag_name": "v2026.10.19",
-            "assets": ASSETS.iter().rev().map(|n| asset(n)).chain([asset("other.zip")]).collect::<Vec<_>>(),
+        let names = ASSETS.iter().rev().copied().chain(["other.zip"]);
+        let signed = json!({
+            "tag_name": "v2099.01.01",
+            "assets": names.chain(["SHA256SUMS", "SHA256SUMS.sig"]).map(asset).collect::<Vec<_>>(),
         });
         if let Some(first) = ASSETS.first() {
-            let picked = pick(&release).unwrap();
-            assert_eq!(picked.tag, "v2026.10.19");
+            let picked = pick(&signed, files, &[key.public()]).unwrap();
+            assert_eq!(picked.tag, "v2099.01.01");
             // The most specific archive (Linux: the server build), even when listed last.
             assert_eq!(picked.asset, *first);
-            assert_eq!(picked.sha256, "abcdef");
-            let undigested = json!({ "tag_name": "v1", "assets": [{ "name": first, "browser_download_url": "x" }] });
-            assert!(pick(&undigested).unwrap_err().contains("no SHA-256"));
+            assert_eq!(picked.sha256, sha256_hex(first.as_bytes()));
+            // Signed by another key, or not signed at all: refused.
+            let (other, _) = SigningKey::generate().unwrap();
+            assert!(pick(&signed, files, &[other.public()]).is_err());
+            let unsigned = json!({ "tag_name": "v1", "assets": [asset(first)] });
+            assert!(
+                pick(&unsigned, files, &[key.public()])
+                    .unwrap_err()
+                    .contains("not signed")
+            );
+            // The same signed list under another tag: refused.
+            let mut replayed = signed.clone();
+            replayed["tag_name"] = json!("v2099.01.02");
+            assert!(pick(&replayed, files, &[key.public()]).is_err());
         }
         assert!(
-            pick(&json!({ "tag_name": "v1", "assets": [asset("other.zip")] }))
-                .unwrap_err()
-                .contains("no archive for this computer")
+            pick(
+                &json!({ "tag_name": "v1", "assets": [asset("other.zip")] }),
+                files,
+                &[]
+            )
+            .unwrap_err()
+            .contains("no archive for this computer")
         );
     }
 

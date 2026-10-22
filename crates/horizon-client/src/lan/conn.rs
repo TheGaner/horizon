@@ -326,7 +326,10 @@ fn serve_legacy(mut stream: TcpStream, shared: &Shared) -> Result<(), String> {
                 return Ok(());
             }
         }
-        format!("\u{a7}1\0127\026.3\0{motd}\0{online}\0{max}")
+        format!(
+            "\u{a7}1\0127\0{}\0{motd}\0{online}\0{max}",
+            horizon_core::VANILLA_VERSION
+        )
     };
     let units: Vec<u16> = body.encode_utf16().collect();
     let mut out = vec![0xFF];
@@ -774,7 +777,11 @@ fn play(c: Connection, shared: &Arc<Shared>, parts: Parts, address: std::net::So
         let (alive, latency, pending) = (alive.clone(), latency.clone(), pending.clone());
         std::thread::Builder::new()
             .name(format!("horizon-lan-out-{conn_id}"))
-            .spawn(move || write_loop(writer, rx, alive, latency, pending))
+            .spawn(move || {
+                // A dedicated server's tick comes first (horizon_threads).
+                horizon_threads::behind_server();
+                write_loop(writer, rx, alive, latency, pending)
+            })
             .ok()
     };
     let joined = Joined {

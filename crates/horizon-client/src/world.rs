@@ -93,6 +93,9 @@ pub struct World {
     pub light_log: Option<crate::fast_hash::FxHashMap<(i32, i32), u32>>,
     /// The villager POIs of each section (`PoiManager`'s sections).
     pub pois: crate::poi_sections::PoiSections<crate::mobs::villager_brain::Poi>,
+    /// The moving-piston block entities of the level, by position, copied
+    /// from the block ticks after each tick: collision and rendering read them.
+    pub moving_pistons: Vec<([i32; 3], horizon_world::piston_shape::MovingPistonState)>,
 }
 /// ServerLevel weather state (advanceWeatherCycle).
 #[derive(Clone, Copy, Debug, Default)]
@@ -178,6 +181,7 @@ impl World {
             weather: Weather::default(),
             block_log: None,
             light_log: None,
+            moving_pistons: Vec::new(),
             pois: Default::default(),
         }
     }
@@ -292,6 +296,14 @@ impl World {
     pub fn world_surface(&self, x: i32, z: i32, air: impl Fn(BlockStateId) -> bool) -> i32 {
         self.chunks.get(&(x >> 4, z >> 4)).map_or(MIN_Y, |chunk| {
             chunk.world_surface(x, z, |v| air(BlockStateId(v)))
+        })
+    }
+    /// `getHeight(Heightmap.Types.MOTION_BLOCKING, x, z)`: one above the
+    /// highest block where `blocks` (motion blocking or holding a fluid),
+    /// or `MIN_Y` (also where the chunk isn't loaded).
+    pub fn motion_blocking(&self, x: i32, z: i32, blocks: impl Fn(BlockStateId) -> bool) -> i32 {
+        self.chunks.get(&(x >> 4, z >> 4)).map_or(MIN_Y, |chunk| {
+            chunk.motion_blocking(x & 15, z & 15, |v| blocks(BlockStateId(v)))
         })
     }
     pub fn block(&self, x: i32, y: i32, z: i32) -> BlockStateId {

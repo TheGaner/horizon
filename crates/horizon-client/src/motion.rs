@@ -242,6 +242,9 @@ pub struct PlayerMotion {
     /// Gliding (shared flag 7) and LivingEntity.fallFlyTicks.
     pub fall_flying: bool,
     pub fall_fly_ticks: i32,
+    /// The server saw the glide end last tick (`updateFallFlying`'s `canGlide`
+    /// failed): the cleared flag reaches the client at its next tick.
+    pub glide_ending: bool,
     /// Glider durability to take this tick (updateFallFlying).
     pub glider_wear: u32,
     pub sprinting: bool,
@@ -287,6 +290,11 @@ pub struct PlayerMotion {
     /// The powder snow blocks this tick's movement went into: the game
     /// destroys them if the player is burning, then puts the fire out.
     pub powder_snow_entered: Vec<BlockPos>,
+    /// The last hurts taken (`hurt_blocking`), newest last, for tests and
+    /// the control socket's `hurtlog`.
+    pub hurt_log: Vec<crate::health::HurtRecord>,
+    /// The last melee attacks made on mobs, newest last.
+    pub attack_log: Vec<crate::health::AttackRecord>,
 }
 fn attribute_error(error: impl std::fmt::Debug) -> io::Error {
     io::Error::other(format!("movement attribute: {error:?}"))
@@ -399,6 +407,7 @@ impl PlayerMotion {
             pitch: 0.0,
             fall_flying: false,
             fall_fly_ticks: 0,
+            glide_ending: false,
             glider_wear: 0,
             sprinting: false,
             sprint_input: crate::sprint::SprintState::default(),
@@ -430,6 +439,8 @@ impl PlayerMotion {
             old_position: position,
             block_effects: true,
             powder_snow_entered: Vec::new(),
+            hurt_log: Vec::new(),
+            attack_log: Vec::new(),
         })
     }
     /// `Entity.getTicksRequiredToFreeze`.
@@ -756,6 +767,13 @@ impl MotionWorld<'_, '_, '_> {
             }
         }
         let toggled = flying_before != self.player.flying;
+        // The server clears the glide flag from the position the client sent
+        // last tick, and the client applies it a tick later, before aiStep: a
+        // landing glide lasts one more tick on the ground, with no ground
+        // friction, so a jump then keeps the speed (the elytra hop).
+        if std::mem::take(&mut self.player.glide_ending) {
+            self.player.fall_flying = false;
+        }
         // Player.tryToStartFallFlying (canGlide: airborne, not flying, a glider;
         // never from inside a liquid).
         let can_glide = self.player.glider
@@ -768,11 +786,17 @@ impl MotionWorld<'_, '_, '_> {
         }
         // LivingEntity.tick fallFlyTicks, then updateFallFlying.
         if self.player.fall_flying {
+            // Entity.checkFallDistanceAccumulation: a glide that isn't diving
+            // (falling slower than 0.5 a tick) keeps the fall distance at 1, so
+            // landing from it hurts no more than a one-block drop.
+            if self.player.velocity.y > -0.5 && self.player.fall_distance > 1.0 {
+                self.player.fall_distance = 1.0;
+            }
             self.player.fall_fly_ticks += 1;
             // canGlide alone: water and lava don't end a glide.
             let still = self.player.glider && !self.player.ground.on_ground && !self.player.flying;
             if !still {
-                self.player.fall_flying = false;
+                self.player.glide_ending = true;
             } else if (self.player.fall_fly_ticks + 1) % 10 == 0
                 && ((self.player.fall_fly_ticks + 1) / 10) % 2 == 0
             {
@@ -1269,9 +1293,7 @@ impl MotionWorld<'_, '_, '_> {
                 amount: 1,
             }));
         self.player
-            .health
-            .food
-            .add_exhaustion(if self.player.sprinting { 0.2 } else { 0.05 });
+            .cause_food_exhaustion(if self.player.sprinting { 0.2 } else { 0.05 });
         Ok(())
     }
     /// LivingEntity.travelFallFlying with updateFallFlyingMovement.
@@ -1423,7 +1445,7 @@ impl MovementStatisticsWorld for MotionWorld<'_, '_, '_> {
         Ok(())
     }
     fn exhaust(&mut self, amount: f32) -> Result<()> {
-        self.player.health.food.add_exhaustion(amount);
+        self.player.cause_food_exhaustion(amount);
         Ok(())
     }
 }
@@ -2022,7 +2044,9 @@ mod tests {
         let root = std::env::var_os("HORIZON_TEST_RESOURCES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3")
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client")
+                    .join(horizon_core::VANILLA_VERSION)
             });
         if !root.join("movement-properties.nbt").exists() {
             eprintln!("skipped sword sweep regression: prepared resources unavailable");
@@ -2056,7 +2080,9 @@ mod tests {
         let root = std::env::var_os("HORIZON_TEST_RESOURCES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3")
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client")
+                    .join(horizon_core::VANILLA_VERSION)
             });
         if !root.join("movement-properties.nbt").exists() {
             return;
@@ -2126,9 +2152,73 @@ mod tests {
         assert!(player.position.y < 84.0);
     }
 
+    /// `MovingPistonBlock.getCollisionShape`: a block halfway through a push
+    /// up is solid at its moving position, so a player lands on it.
+    #[test]
+    fn a_player_lands_on_a_block_a_piston_is_moving() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
+        if !root.join("movement-properties.nbt").exists() {
+            return;
+        }
+        let assets = Assets::load(&root).unwrap();
+        let render = assets.reload(&root).unwrap();
+        let binding = crate::collisions::load(&root, assets.registry).unwrap();
+        let resources = MotionResources::load(&root, &assets).unwrap();
+        let mut scene = World::test_scene(&assets, &render, 1).unwrap();
+        let registry = assets.registry;
+        let moving = registry.default_state("minecraft:moving_piston").unwrap();
+        let stone = registry.default_state("minecraft:stone").unwrap();
+        scene.set(20, 4, 20, moving).unwrap();
+        scene.moving_pistons.push((
+            [20, 4, 20],
+            horizon_world::piston_shape::MovingPistonState {
+                moved_state: stone,
+                direction: horizon_core::geometry::Direction::Up,
+                extending: true,
+                source: false,
+                progress: 0.5,
+                previous_progress: 0.0,
+            },
+        ));
+        let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 6.0, 20.5)).unwrap();
+        for _ in 0..30 {
+            MotionWorld {
+                entities: &[],
+                player: &mut player,
+                scene: &mut scene,
+                assets: &assets,
+                collision_binding: &binding,
+                resources: &resources,
+            }
+            .controlled_simulation_tick(Default::default())
+            .unwrap();
+        }
+        assert!(player.ground.on_ground);
+        assert_eq!(player.position.y, 4.5);
+        // Once the block entity is gone, the moving_piston block has no shape.
+        scene.moving_pistons.clear();
+        for _ in 0..10 {
+            MotionWorld {
+                entities: &[],
+                player: &mut player,
+                scene: &mut scene,
+                assets: &assets,
+                collision_binding: &binding,
+                resources: &resources,
+            }
+            .controlled_simulation_tick(Default::default())
+            .unwrap();
+        }
+        assert_eq!(player.position.y, 4.0);
+    }
+
     #[test]
     fn spectator_scroll_speed_controls_horizontal_and_vertical_flight() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
         if !root.join("movement-properties.nbt").exists() {
             return;
         }
@@ -2169,7 +2259,9 @@ mod tests {
 
     #[test]
     fn resident_spectator_flight_ignores_solid_and_climbable_blocks() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
         if !root.join("movement-properties.nbt").exists() {
             return;
         }
@@ -2228,11 +2320,82 @@ mod tests {
     }
 
     #[test]
+    fn creative_and_spectator_preserve_hunger_when_switching_from_survival() {
+        let root = std::env::var_os("HORIZON_TEST_RESOURCES")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client")
+                    .join(horizon_core::VANILLA_VERSION)
+            });
+        if !root.join("movement-properties.nbt").exists() {
+            eprintln!("skipped hunger regression: prepared resources unavailable");
+            return;
+        }
+        let assets = Assets::load(&root).unwrap();
+        let resources = MotionResources::load(&root, &assets).unwrap();
+        // Both abilities are set by creative/spectator mode changes for the
+        // resident player and for LAN/dedicated guests.
+        for spectator in [false, true] {
+            for food in [0, 1, 20] {
+                let mut player = PlayerMotion::new(&resources, Vec3::ZERO).unwrap();
+                player.health.food.food = food;
+                player.health.food.saturation = 0.0;
+                player.health.food.exhaustion = 0.0;
+                player.health.food.timer = 79;
+                player.invulnerable = true;
+                player.spectator = spectator;
+                for _ in 0..160 {
+                    player.cause_food_exhaustion(0.2);
+                    player
+                        .food_tick(&resources.health, Default::default())
+                        .unwrap();
+                }
+                assert_eq!(player.health.food.food, food);
+                assert_eq!(player.health.food.saturation, 0.0);
+                assert_eq!(player.health.food.exhaustion, 0.0);
+                assert_eq!(player.health.health(), 20.0);
+                assert!(!player.health.dead_or_dying());
+                assert!(player.events.is_empty());
+
+                // Pending exhaustion from survival is still processed, but an
+                // empty food bar cannot hurt the now-invulnerable player.
+                player.health.food.exhaustion = 5.0;
+                player.health.food.timer = 79;
+                player
+                    .food_tick(&resources.health, Default::default())
+                    .unwrap();
+                assert_eq!(player.health.food.food, (food - 1).max(0));
+                assert_eq!(player.health.food.exhaustion, 1.0);
+                assert_eq!(player.health.health(), 20.0);
+                assert!(player.events.is_empty());
+
+                // Returning to survival resumes exhaustion and starvation.
+                player.health.food.food = food;
+                player.health.food.exhaustion = 0.0;
+                player.invulnerable = false;
+                player.spectator = false;
+                player.cause_food_exhaustion(0.2);
+                assert_eq!(player.health.food.exhaustion, 0.2);
+                player.health.food.exhaustion = 5.0;
+                player.health.food.timer = 79;
+                player
+                    .food_tick(&resources.health, Default::default())
+                    .unwrap();
+                assert_eq!(player.health.food.food, (food - 1).max(0));
+                assert_eq!(player.health.health(), if food <= 1 { 19.0 } else { 20.0 });
+            }
+        }
+    }
+
+    #[test]
     fn player_fire_damage_queues_hurt_sound_only_for_fresh_hits() {
         let root = std::env::var_os("HORIZON_TEST_RESOURCES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3")
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client")
+                    .join(horizon_core::VANILLA_VERSION)
             });
         if !root.join("movement-properties.nbt").exists() {
             eprintln!("skipped damage regression: prepared resources unavailable");
@@ -2404,12 +2567,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_glide_that_is_not_diving_keeps_the_fall_distance_at_one() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
+        if !root.join("movement-properties.nbt").exists() {
+            return;
+        }
+        let assets = Assets::load(&root).unwrap();
+        let render = assets.reload(&root).unwrap();
+        let binding = crate::collisions::load(&root, assets.registry).unwrap();
+        let resources = MotionResources::load(&root, &assets).unwrap();
+        // Entity.checkFallDistanceAccumulation: capped above -0.5 a tick, not below.
+        for (dy, capped) in [(-0.3, true), (-0.49, true), (-0.8, false)] {
+            let mut scene = World::test_scene(&assets, &render, 2).unwrap();
+            let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 20.0, 20.5)).unwrap();
+            player.glider = true;
+            player.fall_flying = true;
+            player.velocity = Vec3::new(0.0, dy, 0.6);
+            player.fall_distance = 30.0;
+            let mut w = MotionWorld {
+                entities: &[],
+                player: &mut player,
+                scene: &mut scene,
+                assets: &assets,
+                collision_binding: &binding,
+                resources: &resources,
+            };
+            w.player_movement_tick([0.0, 0.0], false).unwrap();
+            assert!(w.player.fall_flying);
+            if capped {
+                assert!(
+                    w.player.fall_distance < 2.0,
+                    "{dy}: {}",
+                    w.player.fall_distance
+                );
+            } else {
+                assert!(
+                    w.player.fall_distance > 30.0,
+                    "{dy}: {}",
+                    w.player.fall_distance
+                );
+            }
+        }
+    }
     /// Footsteps on the prepared vanilla resources, when they are present:
     /// none while standing (gravity still moves the player every tick), one
     /// per `nextStep` metre while walking.
     #[test]
     fn resident_water_landing_cancels_a_preset_fall() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
         if !root.join("movement-properties.nbt").exists() {
             return;
         }
@@ -2448,13 +2658,56 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn a_landing_glide_lasts_a_tick_so_a_jump_keeps_its_speed() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
+        if !root.join("movement-properties.nbt").exists() {
+            return;
+        }
+        let assets = Assets::load(&root).unwrap();
+        let render = assets.reload(&root).unwrap();
+        let binding = crate::collisions::load(&root, assets.registry).unwrap();
+        let resources = MotionResources::load(&root, &assets).unwrap();
+        let mut scene = World::test_scene(&assets, &render, 2).unwrap();
+        let mut player = PlayerMotion::new(&resources, Vec3::new(20.5, 4.2, 20.5)).unwrap();
+        let mut w = MotionWorld {
+            entities: &[],
+            player: &mut player,
+            scene: &mut scene,
+            assets: &assets,
+            collision_binding: &binding,
+            resources: &resources,
+        };
+        w.move_self(Vec3::new(0.0, -1.0, 0.0)).unwrap();
+        assert!(w.player.ground.on_ground);
+        w.player.set_sprinting(true).unwrap();
+        w.player.glider = true;
+        w.player.fall_flying = true;
+        w.player.velocity = Vec3::new(0.0, 0.0, 1.5);
+        // The landed glide's extra tick: the jump's sprint boost, no ground friction.
+        w.player_movement_tick([0.0, 1.0], true).unwrap();
+        assert!(w.player.fall_flying);
+        assert!(w.player.velocity.y > 0.3, "jumped: {:?}", w.player.velocity);
+        assert!(
+            w.player.velocity.z > 1.5,
+            "kept its speed: {:?}",
+            w.player.velocity
+        );
+        // Then the server's cleared flag arrives.
+        w.player_movement_tick([0.0, 1.0], true).unwrap();
+        assert!(!w.player.fall_flying);
+    }
 
     #[test]
     fn resident_water_and_lava_are_not_treated_as_air() {
         let root = std::env::var_os("HORIZON_TEST_RESOURCES")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| {
-                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3")
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../.local/horizon-client")
+                    .join(horizon_core::VANILLA_VERSION)
             });
         if !root.join("movement-properties.nbt").exists() {
             eprintln!("skipping resident water/lava test: prepared resources unavailable");
@@ -2711,7 +2964,9 @@ mod tests {
 
     #[test]
     fn resident_swimming_uses_previous_eyes_and_requires_water_at_the_feet() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
         if !root.join("movement-properties.nbt").exists() {
             return;
         }
@@ -2784,7 +3039,9 @@ mod tests {
 
     #[test]
     fn resident_fire_precedes_first_tick_lava_and_water_extinguishing() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
         if !root.join("movement-properties.nbt").exists() {
             return;
         }
@@ -2836,7 +3093,9 @@ mod tests {
 
     #[test]
     fn resident_bubble_columns_and_nautilus_preserve_their_air_rules() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
         if !root.join("movement-properties.nbt").exists() {
             return;
         }
@@ -2906,7 +3165,9 @@ mod tests {
 
     #[test]
     fn resident_mixed_fluids_use_lava_height_for_ground_jumps() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
         if !root.join("movement-properties.nbt").exists() {
             return;
         }
@@ -2955,7 +3216,9 @@ mod tests {
 
     #[test]
     fn footsteps_follow_the_walked_distance_not_the_tick() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.local/horizon-client/26.3");
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
         if !root.join("movement-properties.nbt").exists() {
             return;
         }

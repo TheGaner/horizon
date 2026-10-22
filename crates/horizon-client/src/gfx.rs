@@ -34,6 +34,7 @@ fn entity_shader() -> String {
 
 mod entity_batch;
 use entity_batch::EntityBatch;
+pub use entity_batch::WATER_MASK_OVERLAY;
 
 /// Window.getAppropriateLineWidth, in framebuffer pixels.
 pub fn outline_width(width: u32) -> f32 {
@@ -69,6 +70,7 @@ mod occlusion;
 mod pack_stages;
 pub mod panorama;
 mod resident;
+mod stars;
 #[cfg(test)]
 mod test_device;
 mod timing;
@@ -111,7 +113,8 @@ struct Globals {
     end_portal_sprites: [[f32; 4]; 2],
     /// x: vanilla's `GameTime` uniform; y: nether cardinal lighting, zw unused.
     time: [f32; 4],
-    /// Atlas rect of the current destroy stage (entity.wgsl).
+    /// Atlas rect of a destroy stage (entity.wgsl takes only its size: every stage's is the same,
+    /// and each crack carries its own stage's origin).
     crumbling_sprite: [f32; 4],
     /// Framebuffer size, selection stroke width, perspective layering scale.
     outline_params: [f32; 4],
@@ -193,8 +196,13 @@ pub struct Frame<'a> {
     pub additive: &'a [Vertex],
     /// Name tags over everything, without depth (`TEXT_SEE_THROUGH`).
     pub see_through: &'a [Vertex],
-    /// Camera-relative sun, moon and stars (drawn behind everything, additive).
+    /// Camera-relative sun and moon, or the End sky box (drawn behind
+    /// everything, additive).
     pub celestial: &'a [Vertex],
+    /// The stars, drawn from their static buffer after the sun and moon:
+    /// the sky's rotation (camera-relative world from star space) and the
+    /// star brightness.
+    pub stars: Option<(Mat4, f32)>,
     /// First-person hand and held item, drawn after clearing depth.
     pub hand: &'a [Vertex],
     /// `CameraRenderState.hudFov`: the hand's own field of view
@@ -210,7 +218,8 @@ pub struct Frame<'a> {
     /// Atlas rects (u0, v0, width, height) of end_sky.png and end_portal.png
     /// (`rendertype_end_portal`'s Sampler0 and Sampler1).
     pub end_portal_sprites: [[f32; 4]; 2],
-    /// Current destroy-stage sprite: projected UVs repeat inside this atlas rect.
+    /// A destroy-stage sprite: projected UVs repeat inside a rect of this size, from the
+    /// origin each crack vertex carries (`breaking::stage_light`).
     pub crumbling_sprite: [f32; 4],
     pub ticks: u64,
     /// The darkness effect on the lightmap: the brightness it takes off the
@@ -315,6 +324,8 @@ pub struct Renderer {
     crosshair_globals: wgpu::Buffer,
     entity_pipeline: wgpu::RenderPipeline,
     crumbling_pipeline: wgpu::RenderPipeline,
+    /// `RenderPipelines.WATER_MASK`: depth writes only, no colour.
+    water_mask_pipeline: wgpu::RenderPipeline,
     cloud_pipeline: wgpu::RenderPipeline,
     cloud_mesh: crate::clouds::Mesh,
     cloud_buffer: wgpu::Buffer,
@@ -325,6 +336,7 @@ pub struct Renderer {
     see_through_pipeline: wgpu::RenderPipeline,
     celestial_pipeline: wgpu::RenderPipeline,
     celestial_buffer: wgpu::Buffer,
+    stars: stars::Stars,
     panorama: panorama::Panorama,
     /// `RenderPipelines.WORLD_BORDER` and its buffers.
     border_pipeline: wgpu::RenderPipeline,
@@ -531,6 +543,46 @@ fn terrain_group(
         ],
     })
 }
+/// CPU texture uploads prepared by the resource worker. Consumed by renderer
+/// construction so the temporary mip chains are released after GPU upload.
+pub struct PreparedTextures {
+    sprites: Vec<(Vec<u8>, u32)>,
+    forcefield: (Vec<u8>, u32),
+}
+impl PreparedTextures {
+    pub fn new(
+        pixels: &[u8],
+        size: u32,
+        layers: u32,
+        settings: &[crate::mipmap::Settings],
+        forcefield: (&[u8], u32),
+    ) -> Self {
+        Self::with_split(pixels, size, layers, settings, forcefield, sprite_split())
+    }
+
+    fn with_split(
+        pixels: &[u8],
+        size: u32,
+        layers: u32,
+        settings: &[crate::mipmap::Settings],
+        forcefield: (&[u8], u32),
+        split: u32,
+    ) -> Self {
+        let layer_bytes = (size * size * 4) as usize;
+        Self {
+            sprites: (0..layers.div_ceil(split).max(1))
+                .map(|array| {
+                    let first = array * split;
+                    let count = layers.saturating_sub(first).clamp(1, split);
+                    let start = (first as usize * layer_bytes).min(pixels.len());
+                    mip_chain(&pixels[start..], size, settings, first, count)
+                })
+                .collect(),
+            forcefield: mip_chain(forcefield.0, forcefield.1, &[], 0, 1),
+        }
+    }
+}
+
 fn mip_chain(
     pixels: &[u8],
     size: u32,
@@ -662,6 +714,23 @@ fn check_layers(limits: &wgpu::Limits, layers: u32) -> Result<()> {
         .into());
     }
     Ok(())
+}
+/// The swapchain format: a non-sRGB target, because vanilla blends and tints in gamma
+/// space, and 8-bit, because wgpu gives `Rgba16Float` the linear `ExtendedSrgb` color
+/// space: the compositor would read these gamma-encoded values as linear light and wash
+/// every colour out.
+fn surface_format(
+    formats: &[wgpu::TextureFormat],
+    default: wgpu::TextureFormat,
+) -> wgpu::TextureFormat {
+    [
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Rgba8Unorm,
+    ]
+    .into_iter()
+    .find(|f| formats.contains(f))
+    .or_else(|| formats.iter().copied().find(|f| !f.is_srgb()))
+    .unwrap_or(default)
 }
 /// Opens a device on the first of `backend_order`'s backends that gives one.
 /// Offscreen rendering needs no surface, so it can use a GPU the window's
@@ -814,6 +883,7 @@ impl Renderer {
         hud_atlas: (&[u8], u32, u32),
         forcefield: (&[u8], u32),
         panorama_faces: &panorama::Faces,
+        prepared: Option<PreparedTextures>,
         previous: Option<&Self>,
         api: GraphicsApi,
     ) -> Result<Self> {
@@ -859,13 +929,7 @@ impl Renderer {
                 .get_default_config(&adapter, size.width.max(1), size.height.max(1))
                 .ok_or("surface has no supported configuration")?;
             let caps = surface.get_capabilities(&adapter);
-            // Vanilla blends and tints in gamma space: use a non-sRGB target.
-            config.format = caps
-                .formats
-                .iter()
-                .copied()
-                .find(|f| !f.is_srgb())
-                .unwrap_or(config.format);
+            config.format = surface_format(&caps.formats, config.format);
             config.view_formats = vec![config.format.remove_srgb_suffix()];
             // Screenshots copy the presented frame back from the swapchain.
             if caps.usages.contains(wgpu::TextureUsages::COPY_SRC) {
@@ -1187,20 +1251,17 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let layer_bytes = (sprite_size * sprite_size * 4) as usize;
+        let prepared = prepared.unwrap_or_else(|| {
+            PreparedTextures::new(sprite_pixels, sprite_size, layers, sprite_mips, forcefield)
+        });
         let mut mip_levels = 1;
-        let sprite_textures: Vec<wgpu::Texture> = (0..sprite_arrays)
-            .map(|array| {
-                let first = array * split;
+        let sprite_textures: Vec<wgpu::Texture> = prepared
+            .sprites
+            .into_iter()
+            .enumerate()
+            .map(|(array, (mips, levels))| {
+                let first = array as u32 * split;
                 let count = layers.saturating_sub(first).clamp(1, split);
-                let start = (first as usize * layer_bytes).min(sprite_pixels.len());
-                let (mips, levels) = mip_chain(
-                    &sprite_pixels[start..],
-                    sprite_size,
-                    sprite_mips,
-                    first,
-                    count,
-                );
                 mip_levels = levels;
                 device.create_texture_with_data(
                     &queue,
@@ -1490,7 +1551,16 @@ impl Renderer {
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &entity_attributes,
         })];
-        let entity_pipeline = |label, cull_mode, depth_write, compare, bias, blend, clouds| {
+        #[allow(clippy::too_many_arguments)]
+        let entity_pipeline_with = |label,
+                                    cull_mode,
+                                    depth_write,
+                                    compare,
+                                    bias,
+                                    blend,
+                                    clouds,
+                                    fragment: &str,
+                                    write_mask| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(if clouds {
@@ -1518,18 +1588,43 @@ impl Renderer {
                 multisample: Default::default(),
                 fragment: Some(wgpu::FragmentState {
                     module: &entity_shader,
-                    entry_point: Some("fs_entity"),
+                    entry_point: Some(fragment),
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: config.format.remove_srgb_suffix(),
                         blend: Some(blend),
-                        write_mask: wgpu::ColorWrites::ALL,
+                        write_mask,
                     })],
                 }),
                 multiview_mask: None,
                 cache: None,
             })
         };
+        let entity_pipeline = |label, cull_mode, depth_write, compare, bias, blend, clouds| {
+            entity_pipeline_with(
+                label,
+                cull_mode,
+                depth_write,
+                compare,
+                bias,
+                blend,
+                clouds,
+                "fs_entity",
+                wgpu::ColorWrites::ALL,
+            )
+        };
+        // RenderPipelines.WATER_MASK: the boat's water patch writes depth only.
+        let water_mask_pipeline = entity_pipeline_with(
+            "Water mask",
+            None,
+            true,
+            wgpu::CompareFunction::GreaterEqual,
+            Default::default(),
+            alpha_blend,
+            false,
+            "fs_water_mask",
+            wgpu::ColorWrites::empty(),
+        );
         let crumbling_pipeline = entity_pipeline(
             "Breaking cracks",
             Some(wgpu::Face::Back),
@@ -1661,9 +1756,8 @@ impl Renderer {
         });
         // WorldBorderRenderer: misc/forcefield.png as a MipmappedTexture
         // (repeat, linear minification with mipmaps, nearest magnification).
-        let (forcefield_pixels, forcefield_size) = forcefield;
-        let (forcefield_mips, forcefield_levels) =
-            mip_chain(forcefield_pixels, forcefield_size, &[], 0, 1);
+        let forcefield_size = forcefield.1;
+        let (forcefield_mips, forcefield_levels) = prepared.forcefield;
         let forcefield_texture = device.create_texture_with_data(
             &queue,
             &wgpu::TextureDescriptor {
@@ -1958,6 +2052,7 @@ impl Renderer {
         let world_post = world_post::Post::new(&device, config.format.remove_srgb_suffix());
         let uploads = upload::Uploads::new(&device);
         let section_uploads = upload::Uploads::with_chunk(&device, SECTION_UPLOAD_CHUNK);
+        let stars = stars::Stars::new(&device, config.format.remove_srgb_suffix());
         let panorama = panorama::Panorama::new(
             &device,
             &queue,
@@ -2009,6 +2104,7 @@ impl Renderer {
             crosshair_globals,
             entity_pipeline,
             crumbling_pipeline,
+            water_mask_pipeline,
             cloud_pipeline,
             cloud_mesh: Default::default(),
             cloud_buffer,
@@ -2019,6 +2115,7 @@ impl Renderer {
             see_through_pipeline,
             celestial_pipeline,
             celestial_buffer,
+            stars,
             panorama,
             border_pipeline,
             border_group,
@@ -2083,7 +2180,7 @@ impl Renderer {
             phase2_pages: Vec::new(),
             block_entities: HashMap::new(),
             block_entity_revision: next_block_entity_revision(),
-            occlusion: occlusion::Occlusion::new(crate::chunk::HEIGHT / 16),
+            occlusion: occlusion::Occlusion::new(crate::chunk::MIN_Y, crate::chunk::HEIGHT / 16),
             world_post,
             pack: None,
             hud,
@@ -2274,8 +2371,7 @@ impl Renderer {
     /// a search this starts runs on its worker while the frame is prepared,
     /// and `render` takes it if it has finished.
     pub fn start_occlusion(&mut self, camera: DVec3, distance: f32) {
-        self.occlusion
-            .update(camera_section(camera), (distance / 16.0) as i32 + 2);
+        self.occlusion.update(camera, (distance / 16.0) as i32 + 2);
     }
     pub fn upload(&mut self, key: SectionKey, mesh: &SectionMesh) {
         self.occlusion.set(key, mesh.visibility);
@@ -3162,14 +3258,19 @@ impl Renderer {
             self.uploads
                 .buffer(&mut encoder, &self.outline, 0, bytemuck::cast_slice(&lines));
         }
-        let [entity_quads, crumbling_quads, translucent_crumbling_quads] =
-            self.entity_batch.update(
-                frame.entities,
-                frame.additive,
-                frame.hand,
-                frame.see_through,
-            );
-        let world_quads = entity_quads + crumbling_quads + translucent_crumbling_quads;
+        let [
+            entity_quads,
+            crumbling_quads,
+            translucent_crumbling_quads,
+            water_mask_quads,
+        ] = self.entity_batch.update(
+            frame.entities,
+            frame.additive,
+            frame.hand,
+            frame.see_through,
+        );
+        let world_quads =
+            entity_quads + crumbling_quads + translucent_crumbling_quads + water_mask_quads;
         let cloud_quads = if let Some(input) = &frame.clouds {
             let (rebuilt, uniform) =
                 crate::spans::time("clouds", || self.cloud_mesh.prepare(input));
@@ -3221,6 +3322,14 @@ impl Renderer {
                 &self.entity_buffer,
                 0,
                 bytemuck::cast_slice(all_entities),
+            );
+        }
+        if let Some((rotation, brightness)) = frame.stars {
+            self.stars.prepare(
+                &mut self.uploads,
+                &mut encoder,
+                view_proj * rotation,
+                brightness,
             );
         }
         let celestial_vertices = frame.celestial.len().min(2048 * 4);
@@ -3434,6 +3543,10 @@ impl Renderer {
                     pass.draw_indexed(0..(celestial_vertices as u32 / 4) * 6, 0, 0..1);
                     pass.set_bind_group(0, &self.group, &[]);
                 }
+                if !frame.title && frame.stars.is_some() {
+                    self.stars.draw(&mut pass);
+                    pass.set_bind_group(0, &self.group, &[]);
+                }
                 if !frame.title && frame.dark_disc {
                     pass.set_pipeline(&self.dark_disc);
                     pass.draw(0..3, 0..1);
@@ -3519,6 +3632,19 @@ impl Renderer {
                 pass.set_bind_group(0, &self.entity_group, &[]);
                 pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
                 pass.draw_indexed(0..crumbling_quads * 6, (entity_quads * 4) as i32, 0..1);
+                pass.set_bind_group(0, &self.group, &[]);
+            }
+            // BoatRenderer's water patch (RenderTypes.waterMask): depth only,
+            // before translucent terrain, so no water shows inside the boat.
+            if water_mask_quads > 0 {
+                pass.set_pipeline(&self.water_mask_pipeline);
+                pass.set_bind_group(0, &self.entity_group, &[]);
+                pass.set_vertex_buffer(0, self.entity_buffer.slice(..));
+                pass.draw_indexed(
+                    0..water_mask_quads * 6,
+                    ((entity_quads + crumbling_quads + translucent_crumbling_quads) * 4) as i32,
+                    0..1,
+                );
                 pass.set_bind_group(0, &self.group, &[]);
             }
             if additive_quads > 0 {
@@ -3787,10 +3913,19 @@ impl Renderer {
         if let Some(timer) = &mut self.gpu_timer {
             timer.end(&mut encoder);
         }
-        let readback = self
-            .screenshot
-            .take()
-            .map(|path| (path, self.copy_frame(&mut encoder, &target_texture)));
+        let readback = self.screenshot.take().and_then(|path| {
+            // The copy and PNG writer both assume 8-bit pixels; a float surface would make
+            // the row stride too small for the copy and abort in validation.
+            if self.config.format.block_copy_size(None) == Some(4) {
+                Some((path, self.copy_frame(&mut encoder, &target_texture)))
+            } else {
+                self.screenshot_result = Some(Err(format!(
+                    "screenshots need a 32-bit surface format, not {:?}",
+                    self.config.format
+                )));
+                None
+            }
+        });
         self.uploads.finish(&encoder);
         if has_section_copies {
             self.section_copy_bytes = 0;
@@ -4096,6 +4231,22 @@ fn frustum(m: Mat4) -> [Vec4; 6] {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn surface_is_8_bit_and_not_srgb() {
+        use super::surface_format;
+        use wgpu::TextureFormat::{Bgra8Unorm, Bgra8UnormSrgb, Rgba8Unorm, Rgba16Float};
+        // RADV's Wayland surfaces list the linear fp16 format first; choosing it makes the
+        // compositor read gamma-encoded values as linear light.
+        assert_eq!(
+            surface_format(&[Rgba16Float, Bgra8UnormSrgb, Bgra8Unorm], Bgra8UnormSrgb),
+            Bgra8Unorm
+        );
+        assert_eq!(
+            surface_format(&[Bgra8UnormSrgb, Rgba8Unorm], Bgra8UnormSrgb),
+            Rgba8Unorm
+        );
+        assert_eq!(surface_format(&[Rgba16Float], Bgra8UnormSrgb), Rgba16Float);
+    }
+    #[test]
     fn special_material_batches_preserve_quad_order_and_offsets() {
         let quad = |layer, id| {
             [super::Vertex {
@@ -4114,7 +4265,7 @@ mod tests {
         let mut batch = super::EntityBatch::default();
         let counts = batch.update(&entities, &quad(3, 5), &quad(0, 6), &quad(0, 8));
         let vertices = &batch.combined;
-        assert_eq!(counts, [4, 1, 1]);
+        assert_eq!(counts, [4, 1, 1, 0]);
         assert_eq!(
             vertices
                 .as_chunks::<4>()
@@ -4494,7 +4645,8 @@ mod sprite_upload_tests {
     #[test]
     fn real_rail_mips_do_not_change_with_larger_array_layers() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.local/horizon-client/26.3");
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
         if !root
             .join("assets/minecraft/textures/block/rail.png")
             .exists()
@@ -4628,6 +4780,50 @@ mod sprite_upload_tests {
             assert_eq!(state.cache_bytes, bytes);
             assert_eq!(state.cache.len(), 1);
             assert!(state.cache.contains_key(&(0, 0)));
+        }
+    }
+
+    #[test]
+    fn prepared_texture_uploads_preserve_layer_order_and_settings() {
+        let size = 4;
+        let layers = 5;
+        let pixels: Vec<u8> = (0..size * size * layers)
+            .flat_map(|i| [i as u8, (i * 3) as u8, 99, if i % 3 == 0 { 0 } else { 255 }])
+            .collect();
+        let settings: Vec<_> = (0..layers)
+            .map(|i| crate::mipmap::Settings {
+                strategy: if i % 2 == 0 {
+                    crate::mipmap::Strategy::Mean
+                } else {
+                    crate::mipmap::Strategy::StrictCutout
+                },
+                ..Default::default()
+            })
+            .collect();
+        let border = [20, 30, 40, 128].repeat(16);
+        let expected = mip_chain(&pixels, size, &settings, 0, layers);
+        // A partial final array and an exact boundary exercise the global
+        // layer offset used to select each sprite's mipmap settings.
+        for split in [1, 2, 5, 8] {
+            let prepared = PreparedTextures::with_split(
+                &pixels,
+                size,
+                layers,
+                &settings,
+                (&border, size),
+                split,
+            );
+            assert_eq!(prepared.sprites.len(), layers.div_ceil(split) as usize);
+            let actual: Vec<_> = prepared
+                .sprites
+                .iter()
+                .flat_map(|(bytes, levels)| {
+                    assert_eq!(*levels, expected.1);
+                    bytes.iter().copied()
+                })
+                .collect();
+            assert_eq!(actual, expected.0);
+            assert_eq!(prepared.forcefield, mip_chain(&border, size, &[], 0, 1));
         }
     }
 
