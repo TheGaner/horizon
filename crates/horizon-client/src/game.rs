@@ -7487,9 +7487,8 @@ impl Game<'_> {
             seed,
         )?;
         self.end.set_locator(locator);
-        // Keep the previously source-hashed forced chunk ticket reload.
-        let mut streaming = streaming;
-        streaming.forced = horizon_client::save::read_forced_chunks(&save.root)?;
+        // The shared constructor restores force-loaded tickets for both
+        // first entry and subsequent dimension/portal level openings.
         Ok((streaming, save))
     }
     /// Change dimension through a portal (Entity.changeDimension with
