@@ -23,6 +23,8 @@ pub struct ItemEntity {
     pub previous: Vec3,
     pub velocity: Vec3,
     pub on_ground: bool,
+    /// Signed Java ItemEntity age held as two's-complement u32 for existing
+    /// callers. -32768 never ages; -6000 is extended life.
     pub age: u32,
     /// Entity.tickCount; independent of item age (which may be loaded/merged).
     pub tick_count: u32,
@@ -42,6 +44,9 @@ impl ItemEnvironmentTick {
 }
 impl ItemEntity {
     pub const WIDTH: f64 = 0.25;
+    /// Java ItemEntity.setUnlimitedLifetime: age -32768 is never incremented
+    /// and is excluded from nearby stack merging.
+    pub const UNLIMITED_AGE: u32 = (-32768_i32) as u32;
     pub fn bounds(&self) -> Aabb {
         let h = Self::WIDTH / 2.0;
         Aabb::new(
@@ -134,7 +139,10 @@ impl ItemEntity {
             self.velocity.y -= 0.04;
         }
         let horizontal = self.velocity.x * self.velocity.x + self.velocity.z * self.velocity.z;
-        if !self.on_ground || horizontal > 1.0e-5 || (self.age + self.id).is_multiple_of(4) {
+        if !self.on_ground
+            || horizontal > 1.0e-5
+            || self.age.wrapping_add(self.id).is_multiple_of(4)
+        {
             let mut scene = SceneCollisions {
                 world,
                 binding: collision,
@@ -177,8 +185,10 @@ impl ItemEntity {
                 self.velocity.y *= -0.5;
             }
         }
-        self.age += 1;
-        self.age < 6000 && self.position.y > -128.0
+        if self.age != Self::UNLIMITED_AGE {
+            self.age = self.age.wrapping_add(1);
+        }
+        (self.age as i32) < 6000 && self.position.y > -128.0
     }
 }
 /// Java 26.3 `ItemEntity.mergeWithNeighbours` following each entity tick.
@@ -248,7 +258,9 @@ pub fn merge_nearby_items(
             receiver_item.stack.count += moved;
             donor_item.stack.count -= moved;
             receiver_item.pickup_delay = receiver_item.pickup_delay.max(donor_item.pickup_delay);
-            receiver_item.age = receiver_item.age.min(donor_item.age);
+            // Java stores Age as signed int: extended (-6000) must win
+            // over an ordinary positive age when two items merge.
+            receiver_item.age = (receiver_item.age as i32).min(donor_item.age as i32) as u32;
             if donor_item.stack.count == 0 {
                 removed[donor] = true;
             }
@@ -266,7 +278,8 @@ fn item_can_merge(item: &ItemEntity, max_stack: &impl Fn(&str) -> u32) -> bool {
     item.health > 0
         && item.pickup_delay != 32767
         && item.pickup_delay != u32::MAX
-        && item.age < 6000
+        && item.age != ItemEntity::UNLIMITED_AGE
+        && (item.age as i32) < 6000
         && item.stack.count > 0
         && item.stack.count < max_stack(&item.stack.item).min(64)
 }
@@ -984,6 +997,54 @@ mod item_merge_parity_tests {
             "active item can merge a nearby dormant candidate"
         );
         assert_eq!(items[0].stack.count, 9);
+    }
+
+    #[test]
+    fn actual_item_physics_tick_preserves_unlimited_age_and_advances_extended_age() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client/26.3");
+        if !root.join("cached-collision.nbt").exists() {
+            return; // Same optional prepared fixture as native world tests.
+        }
+        let assets = crate::assets::Assets::load(&root).unwrap();
+        let render = assets.reload(&root).unwrap();
+        let facts = BlockFacts::load(&root, assets.registry).unwrap();
+        let collision = crate::collisions::load(&root, assets.registry).unwrap();
+        let world = World::test_scene(&assets, &render, 3).unwrap();
+        let mut forever = item(1, "minecraft:stick", 1);
+        forever.age = ItemEntity::UNLIMITED_AGE;
+        forever.position.y = 64.0;
+        assert!(forever.tick(&world, &facts, &collision));
+        assert!(forever.tick(&world, &facts, &collision));
+        assert_eq!(forever.age, ItemEntity::UNLIMITED_AGE);
+        assert_eq!(forever.tick_count, 2);
+        let mut extended = item(2, "minecraft:stick", 1);
+        extended.age = (-6000_i32) as u32;
+        assert!(extended.tick(&world, &facts, &collision));
+        assert_eq!(extended.age as i32, -5999);
+        let mut ordinary = item(3, "minecraft:stick", 1);
+        ordinary.age = 5999;
+        assert!(!ordinary.tick(&world, &facts, &collision));
+        assert_eq!(ordinary.age, 6000);
+    }
+
+    #[test]
+    fn signed_extended_age_merges_into_older_item_but_unlimited_age_cannot_merge() {
+        let mut regular = item(1, "minecraft:stick", 8);
+        regular.tick_count = 40;
+        let mut extended = item(2, "minecraft:stick", 1);
+        extended.age = (-6000_i32) as u32;
+        let mut items = vec![regular, extended];
+        run(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].age as i32, -6000);
+        assert_eq!(items[0].stack.count, 9);
+        let mut never = item(3, "minecraft:stick", 1);
+        never.tick_count = 40;
+        never.age = ItemEntity::UNLIMITED_AGE;
+        let mut items = vec![never, item(4, "minecraft:stick", 8)];
+        run(&mut items);
+        assert_eq!(items.len(), 2, "unlimited-age item cannot merge in Java");
     }
 
     #[test]

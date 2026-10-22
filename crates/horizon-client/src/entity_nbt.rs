@@ -866,7 +866,7 @@ pub fn mob_from_nbt(tag: &Tag, types: &HashMap<String, Arc<MobType>>, id: u32) -
     Some(m)
 }
 
-/// `ItemEntity`: Health, Age, PickupDelay, Item, Thrower.
+/// `ItemEntity`: Health, signed Age, PickupDelay, Item, Thrower and Owner.
 pub fn item_entity_to_nbt(e: &ItemEntity, uuid: [i32; 4], raw: Option<&Tag>) -> Tag {
     let base = Base {
         id: "minecraft:item",
@@ -882,7 +882,10 @@ pub fn item_entity_to_nbt(e: &ItemEntity, uuid: [i32; 4], raw: Option<&Tag>) -> 
         ("Item", item_to_nbt(&e.stack)),
         ("Health", Tag::Short(e.health as i16)),
         ("Fire", Tag::Short(e.fire_ticks as i16)),
-        ("Age", Tag::Short(e.age.min(i16::MAX as u32) as i16)),
+        (
+            "Age",
+            Tag::Short((e.age as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16),
+        ),
         (
             "PickupDelay",
             Tag::Short(e.pickup_delay.min(i16::MAX as u32) as i16),
@@ -913,8 +916,8 @@ pub fn item_entity_from_nbt(tag: &Tag, id: u32, bob_offset: f32) -> Option<ItemE
         previous: position,
         velocity: motion(tag),
         on_ground: flag(tag, "OnGround"),
-        // Age -32768 marks items that never despawn; Horizon counts upwards.
-        age: number(tag.get("Age")).unwrap_or(0).max(0) as u32,
+        // Java signed Age: -32768 never despawns, -6000 has extended life.
+        age: number(tag.get("Age")).unwrap_or(0) as i32 as u32,
         tick_count: 0,
         pickup_delay: number(tag.get("PickupDelay")).unwrap_or(0).clamp(0, 32767) as u32,
         bob_offset,
@@ -1581,6 +1584,31 @@ mod tests {
         let cleared = item_entity_to_nbt(&cleared, [1, 2, 3, 4], Some(&tag));
         assert!(cleared.get("Thrower").is_none());
     }
+    #[test]
+    fn signed_item_age_round_trips_unlimited_and_extended_lifetimes() {
+        let tag = Tag::compound([
+            ("id", string("minecraft:item")),
+            ("Pos", doubles(&[0.5, 64.0, 0.5])),
+            (
+                "Item",
+                Tag::compound([("id", string("minecraft:stone")), ("count", Tag::Int(1))]),
+            ),
+            ("Age", Tag::Short(-32768)),
+        ]);
+        let e = item_entity_from_nbt(&tag, 1, 0.0).expect("unlimited item loads");
+        assert_eq!(e.age, ItemEntity::UNLIMITED_AGE);
+        let saved = item_entity_to_nbt(&e, [1, 2, 3, 4], Some(&tag));
+        assert_eq!(saved.get("Age"), Some(&Tag::Short(-32768)));
+        let mut extended = e;
+        extended.age = (-6000_i32) as u32;
+        let tag2 = item_entity_to_nbt(&extended, [1, 2, 3, 4], None);
+        assert_eq!(tag2.get("Age"), Some(&Tag::Short(-6000)));
+        assert_eq!(
+            item_entity_from_nbt(&tag2, 2, 0.0).unwrap().age as i32,
+            -6000
+        );
+    }
+
     #[test]
     fn unknown_fields_survive() {
         let raw = Tag::compound([
