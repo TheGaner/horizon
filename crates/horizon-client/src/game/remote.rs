@@ -41,7 +41,11 @@ use horizon_protocol::{
     text::{Language, format_java, plain},
 };
 use horizon_world::{nbt::Tag, registry::BlockStateId};
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use winit::{event::MouseButton, keyboard::KeyCode};
 
 /// A text component the server sent, for the HUD.
@@ -112,9 +116,9 @@ pub(super) struct Remote {
     /// only replace the remembered state; then the block takes it.
     predictions: HashMap<[i32; 3], (i32, i32)>,
     /// Open container: (window id, menu name).
-    menu: Option<(i32, String)>,
+    pub(super) menu: Option<(i32, String)>,
     /// The open menu's title as the server named it.
-    menu_title: Option<String>,
+    pub(super) menu_title: Option<String>,
     state_id: i32,
     use_target: Option<[i32; 3]>,
     entities: HashMap<i32, Tracked>,
@@ -162,7 +166,21 @@ pub(super) struct Remote {
     clock_game_time: i64,
     /// `ClientChunkCache.Storage`'s view centre (ClientboundSetChunkCacheCenterPacket).
     chunk_center: (i32, i32),
+    /// Received events a frame left for the next one, in order, and when
+    /// the oldest of them first waited (`poll_remote`).
+    backlog: VecDeque<Event>,
+    backlog_since: Option<Instant>,
 }
+
+/// The time a frame spends on chunk packets before it leaves the rest of
+/// the received events for the next frame. A batch of 25 to 60 columns
+/// (0.1 ms each on an M4 Pro) all in one frame was a 3 to 8 ms frame every
+/// time the player crossed a chunk border at 32 chunks.
+const CHUNK_PACKETS_PER_FRAME: Duration = Duration::from_millis(1);
+/// Events that have waited this long are all handled in the next frame,
+/// whatever their cost: the packets after a slow machine's chunks never
+/// wait more than a tick.
+const BACKLOG_LIMIT: Duration = Duration::from_millis(50);
 
 fn face_direction(face: [i32; 3]) -> u8 {
     match face {
@@ -355,6 +373,8 @@ impl Game<'_> {
             clock_partial: 0.0,
             clock_game_time: 0,
             chunk_center: (0, 0),
+            backlog: VecDeque::new(),
+            backlog_since: None,
         });
         // The level's TickRateManager follows the server's ticking packets.
         self.clock = horizon_client::clock::FixedStep::client();
@@ -451,8 +471,15 @@ impl Game<'_> {
                 .unwrap_or("minecraft:air"),
         )
     }
+    /// The server's network id of a mob effect (`brewing::EFFECTS` id).
+    pub(super) fn remote_effect_network_id(&self, effect: &str) -> Option<i32> {
+        let r = self.remote.as_ref()?;
+        r.builtin
+            .get("minecraft:mob_effect")?
+            .id(&format!("minecraft:{effect}"))
+    }
     /// A mob effect's network id as the effect (`brewing::EFFECTS` id).
-    fn remote_effect_id(&self, effect: i32) -> Option<&'static str> {
+    pub(super) fn remote_effect_id(&self, effect: i32) -> Option<&'static str> {
         let r = self.remote.as_ref()?;
         let name = r.builtin.get("minecraft:mob_effect")?.name(effect)?;
         horizon_client::brewing::effect(name).map(|d| d.id)
@@ -498,6 +525,54 @@ impl Game<'_> {
         if let Some(Component::Int(id)) = s.component(component::MAP_ID) {
             out.data_mut().map_id = Some(*id);
         }
+        if let Some(Component::Int(cost)) = s.component(component::REPAIR_COST) {
+            out.data_mut().repair_cost = (*cost).max(0) as u32;
+        }
+        if let Some(Component::Int(mode)) = s.component(component::MAP_POST_PROCESSING) {
+            out.data_mut().map_post_processing = Some((*mode).clamp(0, 1) as u8);
+        }
+        if let Some(Component::WritableBook(pages)) = s.component(component::WRITABLE_BOOK_CONTENT)
+        {
+            out.data_mut().writable_pages = pages.clone();
+        }
+        if let Some(Component::WrittenBook(b)) = s.component(component::WRITTEN_BOOK_CONTENT) {
+            let lang = self
+                .remote
+                .as_ref()
+                .map(|r| r.lang.clone())
+                .unwrap_or_default();
+            out.data_mut().written = Some(horizon_client::item_data::WrittenBook {
+                title: b.title.clone(),
+                author: b.author.clone(),
+                generation: b.generation.clamp(0, 3) as u8,
+                pages: b.pages.iter().map(|p| plain(p, &lang)).collect(),
+            });
+        }
+        if let Some(Component::Text(name)) = s.component(component::CUSTOM_NAME) {
+            let lang = self
+                .remote
+                .as_ref()
+                .map(|r| r.lang.clone())
+                .unwrap_or_default();
+            out.data_mut().custom_name = Some(plain(name, &lang));
+        }
+        // The enchantments by the server's registry ids.
+        let levels = |list: &[(i32, i32)]| -> Vec<(Arc<str>, u32)> {
+            let names = self.remote.as_ref().map(|r| &r.registries);
+            list.iter()
+                .filter_map(|(id, level)| {
+                    let name = names?.name("minecraft:enchantment", *id)?;
+                    Some((Arc::from(name), (*level).max(0) as u32))
+                })
+                .collect()
+        };
+        if let Some(Component::Enchantments(list)) = s.component(component::ENCHANTMENTS) {
+            out.data_mut().enchantments = levels(list);
+        }
+        if let Some(Component::Enchantments(list)) = s.component(component::STORED_ENCHANTMENTS) {
+            out.data_mut().stored_enchantments = levels(list);
+        }
+        out.tidy();
         Some(out)
     }
     fn to_network(&self, s: &Option<ItemStack>) -> Option<Stack> {
@@ -571,12 +646,34 @@ impl Game<'_> {
         Some(r.chat.iter().rev().take(n).map(|l| l.0.clone()).collect())
     }
 
-    /// Process everything the network thread received (once per frame, like
-    /// the client's packet processor).
+    /// Received events left for the next frame (`poll_remote`): until they
+    /// are handled, the terrain the server sent is not all there.
+    pub(super) fn remote_backlog(&self) -> usize {
+        self.remote.as_ref().map_or(0, |r| r.backlog.len())
+    }
+    /// Process what the network thread received (once per frame, like the
+    /// client's packet processor), in order. Chunk packets get
+    /// `CHUNK_PACKETS_PER_FRAME`: once a frame has spent it, the events from
+    /// the next chunk packet on wait for the next frame, unless they have
+    /// already waited `BACKLOG_LIMIT`.
     pub(super) fn poll_remote(&mut self) -> Result<()> {
-        let Some(r) = &self.remote else { return Ok(()) };
-        let events = r.session.poll();
-        for event in events {
+        let Some(r) = self.remote.as_mut() else {
+            return Ok(());
+        };
+        let mut events = std::mem::take(&mut r.backlog);
+        events.extend(r.session.poll());
+        let overdue = r
+            .backlog_since
+            .is_some_and(|since| since.elapsed() >= BACKLOG_LIMIT);
+        let mut chunks = Duration::ZERO;
+        while let Some(event) = events.pop_front() {
+            let chunk =
+                matches!(&event, Event::Packet(p) if matches!(**p, C::LevelChunkWithLight(_)));
+            if chunk && !overdue && chunks >= CHUNK_PACKETS_PER_FRAME {
+                events.push_front(event);
+                break;
+            }
+            let started = chunk.then(Instant::now);
             match event {
                 Event::Status(s) => {
                     if let Some(r) = self.remote.as_mut() {
@@ -622,9 +719,18 @@ impl Game<'_> {
                 }
                 Event::Packet(packet) => self.handle_packet(*packet)?,
             }
+            chunks += started.map_or(Duration::ZERO, |t| t.elapsed());
             if self.remote.is_none() {
                 break;
             }
+        }
+        if let Some(r) = self.remote.as_mut() {
+            r.backlog_since = if events.is_empty() {
+                None
+            } else {
+                Some(r.backlog_since.unwrap_or_else(Instant::now))
+            };
+            r.backlog = events;
         }
         self.send_suggestion_request();
         Ok(())
@@ -1243,8 +1349,38 @@ impl Game<'_> {
             "minecraft:hopper" => slots(5),
             "minecraft:generic_3x3" => slots(9),
             "minecraft:brewing_stand" => slots(5),
-            _ => None,
+            // CrafterMenu: the grid, the inventory, then the result (the
+            // client's own).
+            "minecraft:crafter_3x3" => slots(9),
+            // A workstation: its inputs, its result, then the inventory.
+            m => {
+                let kind = Self::remote_station_kind(m)?;
+                let inputs = kind.inputs();
+                let own = inputs + usize::from(kind.has_result());
+                match s {
+                    _ if s < inputs => Some(super::stations::INPUT + s),
+                    _ if s < own => Some(super::stations::RESULT),
+                    _ if s < own + 27 => Some(9 + s - own),
+                    _ if s < own + 36 => Some(s - own - 27),
+                    _ => None,
+                }
+            }
         }
+    }
+    /// The workstation screen of a menu type a server opens.
+    pub(super) fn remote_station_kind(menu: &str) -> Option<super::stations::Kind> {
+        use super::stations::Kind;
+        Some(match menu {
+            "minecraft:loom" => Kind::Loom,
+            "minecraft:stonecutter" => Kind::Stonecutter,
+            "minecraft:grindstone" => Kind::Grindstone,
+            "minecraft:anvil" => Kind::Anvil,
+            "minecraft:smithing" => Kind::Smithing,
+            "minecraft:enchantment" => Kind::Enchanting,
+            "minecraft:beacon" => Kind::Beacon,
+            "minecraft:cartography_table" => Kind::Cartography,
+            _ => return None,
+        })
     }
     fn open_menu_name(&self, container: i32) -> String {
         match self.remote.as_ref().and_then(|r| r.menu.as_ref()) {
@@ -1254,6 +1390,12 @@ impl Game<'_> {
     }
     fn set_menu_slot(&mut self, container: i32, slot: i32, item: Option<ItemStack>) {
         let menu = self.open_menu_name(container);
+        if menu == "minecraft:lectern" {
+            if slot == 0 {
+                self.remote_lectern_book(item);
+            }
+            return;
+        }
         if container != 0 && menu == "inventory" {
             return;
         }
@@ -1264,6 +1406,9 @@ impl Game<'_> {
             return; // the result slot is recomputed from the grid
         }
         *self.slot_mut(internal) = item;
+        if internal >= super::stations::INPUT && self.station.is_some() {
+            self.remote_station_slot_changed(internal);
+        }
     }
 
     fn handle_packet(&mut self, packet: C) -> Result<()> {
@@ -1909,6 +2054,12 @@ impl Game<'_> {
                 }
                 self.remote_synced();
             }
+            C::ContainerSetData(p) if self.open_menu_name(p.container) == "minecraft:lectern" => {
+                self.remote_lectern_page(i32::from(p.value));
+            }
+            C::ContainerSetData(p) if self.remote_station_open(p.container) => {
+                self.remote_station_data(usize::try_from(p.id).unwrap_or(usize::MAX), p.value);
+            }
             C::ContainerSetData(p) => {
                 let v = i32::from(p.value);
                 match self
@@ -1920,6 +2071,12 @@ impl Game<'_> {
                         1 => f.lit_total = v,
                         2 => f.cooking_timer = v,
                         3 => f.cooking_total = v,
+                        _ => {}
+                    },
+                    // CrafterBlockEntity.containerData.
+                    Some(BlockEntity::Crafter(c)) => match usize::try_from(p.id) {
+                        Ok(k @ 0..9) => c.disabled[k] = v == 1,
+                        Ok(9) => c.triggered = v == 1,
                         _ => {}
                     },
                     // BrewingStandBlockEntity.dataAccess.
@@ -1939,6 +2096,7 @@ impl Game<'_> {
             C::RecipeBookSettings(p) => self.remote_recipe_book_settings(p),
             C::PlaceGhostRecipe(p) => self.remote_ghost_recipe(p),
             C::MerchantOffers(p) => self.remote_merchant_offers(p),
+            C::ContainerClose(_) if self.remote_lectern_closed() => {}
             C::ContainerClose(_) => {
                 if self.screen == Screen::Inventory {
                     self.remote_close_local();
@@ -3791,6 +3949,10 @@ impl Game<'_> {
     /// engine doesn't model sends the clicks unpredicted. False when a click's
     /// slot isn't one of the menu's.
     pub(super) fn remote_menu_ops(&mut self, ops: &[(Option<usize>, i32, Input)]) -> bool {
+        // CrafterScreen.slotClicked: a slot toggle goes out before the click.
+        if let [(Some(slot), button, input)] = ops {
+            self.crafter_slot_clicked(*slot, *button, *input);
+        }
         let (container, menu) = self.remote_menu();
         let mut clicks = Vec::with_capacity(ops.len());
         for &(slot, button, input) in ops {
@@ -3943,13 +4105,8 @@ impl Game<'_> {
             r.menu = None;
             r.menu_title = None;
         }
-        if self
-            .station
-            .as_ref()
-            .is_some_and(|s| s.kind == super::stations::Kind::Merchant)
-        {
-            self.station = None;
-        }
+        // The client's menu has no level access: what it holds is the server's.
+        self.station = None;
         self.craft_size = 2;
         if let Some(key) = self.container.take() {
             // Server containers stay renderable but lose their copied slots.
@@ -4023,6 +4180,27 @@ impl Game<'_> {
             .as_ref()
             .and_then(|r| r.use_target)
             .map(|t| (t[0], t[1], t[2]));
+        if menu == "minecraft:lectern" {
+            // LecternScreen: the book and page come in the menu's content and data.
+            if let Some(r) = self.remote.as_mut() {
+                r.menu = Some((p.container, menu));
+            }
+            self.remote_open_lectern(target.unwrap_or_default());
+            return;
+        }
+        if let Some(kind) = Self::remote_station_kind(&menu) {
+            let title = plain(
+                &p.title,
+                &self
+                    .remote
+                    .as_ref()
+                    .map(|r| r.lang.clone())
+                    .unwrap_or_default(),
+            );
+            let pos = target.map_or([0, 0, 0], |t| [t.0, t.1, t.2]);
+            self.remote_open_station(p.container, menu, kind, title, pos);
+            return;
+        }
         if menu == "minecraft:merchant" {
             // A trading window: its offers follow in a MerchantOffers packet.
             let title = plain(
@@ -4062,6 +4240,8 @@ impl Game<'_> {
                 horizon_client::brewing::BrewingStand::new(),
             ))),
             "minecraft:generic_3x3" => Some(BlockEntity::Chest(vec![None; 9])),
+            // CrafterMenu: the disabled slots and triggered come in ContainerSetData.
+            "minecraft:crafter_3x3" => Some(BlockEntity::Crafter(Default::default())),
             m if m.starts_with("minecraft:generic_9x") || m == "minecraft:shulker_box" => {
                 let rows = m
                     .strip_prefix("minecraft:generic_9x")

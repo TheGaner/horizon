@@ -74,6 +74,7 @@ mod lan_entities;
 mod lan_mobs;
 mod lan_pvp;
 mod lan_screen;
+mod lan_stations;
 mod lan_trading;
 mod lan_waypoints;
 mod leads;
@@ -119,6 +120,7 @@ mod recipe_book;
 mod remote;
 mod remote_objects;
 mod remote_projectiles;
+mod remote_stations;
 mod render_control;
 mod render_tick;
 mod respawn_anchor;
@@ -902,6 +904,8 @@ struct WorldRest {
     behaviours: Behaviours,
     player_arm: Option<horizon_client::mobs::Part>,
     player_type: Option<Arc<horizon_client::mobs::MobType>>,
+    /// `SpinAttackEffectModel` (Riptide's spinning boxes).
+    spin_attack: Option<horizon_client::mobs::Part>,
     stations: horizon_client::stations::StationData,
 }
 
@@ -976,6 +980,9 @@ impl Resources {
     }
     fn player_type(&self) -> &Option<Arc<horizon_client::mobs::MobType>> {
         &self.rest().player_type
+    }
+    fn spin_attack(&self) -> &Option<horizon_client::mobs::Part> {
+        &self.rest().spin_attack
     }
     fn stations(&self) -> &horizon_client::stations::StationData {
         &self.rest().stations
@@ -2540,14 +2547,23 @@ impl Game<'_> {
                         1029 => Some(("minecraft:block.anvil.destroy", 1.0)),
                         1031 => Some(("minecraft:block.anvil.land", 0.3)),
                         1505 => Some(("minecraft:item.bone_meal.use", 1.0)),
+                        1042 => Some(("minecraft:block.grindstone.use", 1.0)),
+                        1044 => Some(("minecraft:block.smithing_table.use", 1.0)),
+                        // LevelEvent.SOUND_PAGE_TURN (a lectern's page).
+                        1043 => Some(("minecraft:item.book.page_turn", 1.0)),
                         _ => None,
                     };
                     if let Some((name, volume)) = sound {
-                        let pitch = if id == 1009 {
-                            2.6 + (self.world.random.next_float() - self.world.random.next_float())
-                                * 0.8
-                        } else {
-                            1.0
+                        let pitch = match id {
+                            1009 => {
+                                2.6 + (self.world.random.next_float()
+                                    - self.world.random.next_float())
+                                    * 0.8
+                            }
+                            1029 | 1030 | 1042 | 1043 | 1044 => {
+                                self.world.random.next_float() * 0.1 + 0.9
+                            }
+                            _ => 1.0,
                         };
                         self.audio.play(name, c, volume, pitch);
                     }
@@ -3900,6 +3916,7 @@ impl Game<'_> {
         }
         let riding = self.riding.is_some();
         let ghast_collisions = self.happy_ghast_player_collisions();
+        let spin_targets = self.spin_targets();
         let Some(player) = self.player.as_mut() else {
             // A dedicated server has no local player: the world still runs.
             if self.options.dedicated.is_some() {
@@ -3977,6 +3994,7 @@ impl Game<'_> {
             .any(|s| immune.is_some_and(|t| t.contains(&*s.item)));
         // The dimension's FAST_LAVA: the Nether's lava pushes harder.
         player.fluids.fast_lava = self.dim == Dim::Nether;
+        player.spin_targets = spin_targets;
         let grounded = player.ground.on_ground;
         let before = (
             grounded,
@@ -3999,6 +4017,7 @@ impl Game<'_> {
             }
         }
         let events = std::mem::take(&mut player.events);
+        let spin_hit = player.spin_hit.take();
         let glider_wear = std::mem::take(&mut player.glider_wear);
         if glider_wear > 0
             && !self.creative
@@ -4017,6 +4036,7 @@ impl Game<'_> {
         self.eye += (camera_eye.unwrap_or(eye_height) - self.eye) * 0.5;
         let crouching = player.pose == horizon_client::pose::Pose::Crouching;
         self.tick_avatar(before, riding);
+        self.end_spin_attack(spin_hit);
         self.record_combat(&events);
         for event in events {
             match event {
@@ -5416,6 +5436,17 @@ impl Game<'_> {
             .station
             .as_ref()
             .is_some_and(|s| s.kind == stations::Kind::Merchant);
+        let stonecutter_open = self
+            .station
+            .as_ref()
+            .is_some_and(|s| s.kind == stations::Kind::Stonecutter);
+        let station_kind = self.station.as_ref().map(|s| s.kind);
+        let grindstone_open = station_kind == Some(stations::Kind::Grindstone);
+        let cartography_open = station_kind == Some(stations::Kind::Cartography);
+        let anvil_open = station_kind == Some(stations::Kind::Anvil);
+        let smithing_open = station_kind == Some(stations::Kind::Smithing);
+        let enchanting_open = station_kind == Some(stations::Kind::Enchanting);
+        let beacon_open = station_kind == Some(stations::Kind::Beacon);
         let (kind, game_of): (Kind, Vec<Option<usize>>) = if self.creative_tab_open() {
             // ItemPickerMenu: the display slots (clicked by the screen), then the hotbar.
             let mut v = vec![None; 45];
@@ -5442,6 +5473,51 @@ impl Game<'_> {
             v.push(Some(stations::RESULT));
             v.extend((9..36).chain(0..9).map(Some));
             (Kind::Loom, v)
+        } else if stonecutter_open {
+            // StonecutterMenu: the input, the result, then the inventory.
+            let mut v = vec![Some(stations::INPUT), Some(stations::RESULT)];
+            v.extend((9..36).chain(0..9).map(Some));
+            (Kind::Stonecutter, v)
+        } else if grindstone_open || cartography_open {
+            // GrindstoneMenu and CartographyTableMenu: the two inputs, the
+            // result, then the inventory.
+            let mut v = vec![
+                Some(stations::INPUT),
+                Some(stations::INPUT + 1),
+                Some(stations::RESULT),
+            ];
+            v.extend((9..36).chain(0..9).map(Some));
+            let kind = if grindstone_open {
+                Kind::Grindstone
+            } else {
+                Kind::Cartography
+            };
+            (kind, v)
+        } else if enchanting_open {
+            // EnchantmentMenu: the item, the lapis, then the inventory.
+            let mut v = vec![Some(stations::INPUT), Some(stations::INPUT + 1)];
+            v.extend((9..36).chain(0..9).map(Some));
+            (Kind::Enchanting, v)
+        } else if beacon_open {
+            // BeaconMenu: the payment, then the inventory.
+            let mut v = vec![Some(stations::INPUT)];
+            v.extend((9..36).chain(0..9).map(Some));
+            (Kind::Beacon, v)
+        } else if anvil_open || smithing_open {
+            // ItemCombinerMenu: the inputs, the result, then the inventory.
+            let inputs = if anvil_open { 2 } else { 3 };
+            let mut v: Vec<Option<usize>> =
+                (0..inputs).map(|i| Some(stations::INPUT + i)).collect();
+            v.push(Some(stations::RESULT));
+            v.extend((9..36).chain(0..9).map(Some));
+            (
+                if anvil_open {
+                    Kind::Anvil
+                } else {
+                    Kind::Smithing
+                },
+                v,
+            )
         } else {
             let (kind, map) = if self.container.is_some() {
                 let size = self.container_size();
@@ -5524,6 +5600,10 @@ impl Game<'_> {
                 s.loom.patterns.clone(),
             )
         });
+        let stone = self
+            .station
+            .as_ref()
+            .map(|s| (s.selected.map_or(-1, |i| i as i32), s.stone.clone()));
         let crafter_data = match self.container_kind() {
             Some(BlockEntity::Crafter(c)) => Some((c.disabled, c.triggered)),
             _ => None,
@@ -5537,6 +5617,18 @@ impl Game<'_> {
         if let Some((s, mob)) = session.as_mut() {
             self.merchant_sync_in(s, *mob);
         }
+        // The cartography table reads and makes the level's maps; a
+        // server's (the client menu's ContainerLevelAccess.NULL) doesn't.
+        let level_maps = (kind == Kind::Cartography && self.remote.is_none()).then(|| {
+            let held: Vec<ItemStack> = before
+                .iter()
+                .flatten()
+                .chain(self.inventory.iter().flatten())
+                .chain(self.carried.iter())
+                .cloned()
+                .collect();
+            self.level_maps(&held)
+        });
         let next_map = if merchant_open { self.peek_map_id() } else { 0 };
         let tag = |t: &str| self.structure_tag(t);
         let maps = trading::GameMaps {
@@ -5555,10 +5647,21 @@ impl Game<'_> {
             recipes: self.res.recipes(),
             brewing: &self.res.stations().brewing,
             banners: &self.res.stations().banners,
+            station_recipes: &self.res.stations().recipes,
+            enchantments: &self.res.stations().enchantments,
+            names: &self.pack.names,
             trade: Some(&trade_env),
+            maps: level_maps
+                .as_ref()
+                .map(|m| m as &dyn horizon_client::menu::Maps),
         };
         menu.creative = creative;
         menu.selected = self.selected;
+        menu.levels = self.experience.level;
+        if anvil_open {
+            // The rename box as AnvilScreen.onNameChanged gives it to the menu.
+            menu.anvil.name = self.station.as_ref().map(|s| self.anvil_item_name(s));
+        }
         for (i, stack) in before.iter().enumerate() {
             menu.set_slot(&env, i, stack.clone());
         }
@@ -5575,6 +5678,25 @@ impl Game<'_> {
             menu.data[0] = selected;
             menu.loom_patterns = patterns;
             menu.set_slot(&env, 3, before[3].clone());
+        }
+        if kind == Kind::Stonecutter
+            && let Some((selected, state)) = stone
+        {
+            // The same: the list and selection between clicks, then the result.
+            menu.data[0] = selected;
+            menu.stone = state;
+            menu.set_slot(&env, 1, before[1].clone());
+        }
+        if kind == Kind::Enchanting
+            && let Some(s) = self.station.as_ref()
+        {
+            // The offers between clicks (what copying the slots in flagged is not a change).
+            menu.enchant_changed = false;
+            for i in 0..3 {
+                menu.data[i] = s.offers.costs[i];
+                menu.data[7 + i] = s.offers.clues[i].as_ref().map_or(-1, |(_, l)| *l as i32);
+            }
+            menu.data[3] = self.level.xp_seed;
         }
         if let Some((disabled, triggered)) = crafter_data {
             for (i, d) in disabled.iter().enumerate() {
@@ -5630,10 +5752,37 @@ impl Game<'_> {
                 s.loom.selected = usize::try_from(menu.data[0]).ok();
                 s.loom.patterns = std::mem::take(&mut menu.loom_patterns);
             }
-            for sound in sounds {
-                self.loom_sound(sound);
+            // A server's loom plays its own sounds (the client's menu has no level).
+            for sound in sounds.into_iter().filter(|_| !predicting) {
+                self.station_sound(sound);
             }
             self.loom_screen_changed();
+        } else if kind == Kind::Cartography {
+            for sound in sounds.into_iter().filter(|_| !predicting) {
+                self.station_sound(sound);
+            }
+        } else if kind == Kind::Stonecutter {
+            if let Some(s) = self.station.as_mut() {
+                s.selected = usize::try_from(menu.data[0]).ok();
+                s.stone = std::mem::take(&mut menu.stone);
+                s.stonecutter_changed();
+            }
+            for sound in sounds.into_iter().filter(|_| !predicting) {
+                self.station_sound(sound);
+            }
+        }
+        if let Some(amount) = menu.ground.take().filter(|_| !predicting)
+            && let Some(pos) = self.station.as_ref().map(|s| s.pos)
+        {
+            self.grindstone_taken(pos, amount);
+        }
+        if kind == Kind::Anvil || kind == Kind::Smithing {
+            self.combiner_session_end(&menu, predicting);
+        }
+        if kind == Kind::Enchanting && (menu.enchant_changed || before[0] != menu.slot(0).cloned())
+        {
+            // EnchantmentMenu.slotsChanged: new offers for the item.
+            self.station_changed();
         }
         if kind == Kind::CrafterBlock
             && let Some(BlockEntity::Crafter(c)) = self
@@ -5661,6 +5810,9 @@ impl Game<'_> {
             }
         }
         self.apply_equipment();
+        if let Some(maps) = level_maps {
+            self.register_made_maps(maps);
+        }
         true
     }
     /// Number keys, F and Q over a slot of the open menu: SWAP with a hotbar
@@ -6746,7 +6898,13 @@ impl Game<'_> {
     /// enchantments.
     pub(super) fn melee_damage(&mut self, target_kind: &str) -> (f32, f32, bool) {
         let hand_damage = 1.0 + self.attack_item_info().map_or(0.0, |i| i.attack_damage);
-        let damage = hand_damage + self.effect_attack_bonus();
+        // Riptide's spin replaces the attack damage attribute.
+        let spin = self.player.as_ref().map_or(0.0, |p| p.auto_spin_attack_dmg);
+        let damage = if spin > 0.0 {
+            spin
+        } else {
+            hand_damage + self.effect_attack_bonus()
+        };
         let scale = self.attack_strength_scale();
         let mut amount = damage * (0.2 + scale * scale * 0.8);
         // Item.getAttackDamageBonus (a mace's smash), before the critical hit.
@@ -6874,6 +7032,14 @@ impl Game<'_> {
                 return false;
             }
         }
+        self.attack_mob(index);
+        // Minecraft.startAttack swings after the attack.
+        self.swing_arm();
+        true
+    }
+    /// `Player.attack` on a mob: the damage, knockback, sweep, particles and
+    /// sounds.
+    pub(super) fn attack_mob(&mut self, index: usize) {
         let target_kind = self.mobs[index].kind.id.clone();
         let target_kind = format!("minecraft:{}", target_kind.trim_start_matches("minecraft:"));
         let (amount, scale, crit) = self.melee_damage(&target_kind);
@@ -6891,7 +7057,6 @@ impl Game<'_> {
             self.audio
                 .play("minecraft:entity.player.attack.knockback", from, 1.0, 1.0);
         }
-        self.swing_arm();
         // LivingEntity.setLastHurtMob (tamed wolves join in).
         self.combat.last_hurt_mob = Some((self.mobs[index].id, self.world.game_time));
         let old_health = self.mobs[index].health;
@@ -6984,7 +7149,6 @@ impl Game<'_> {
             self.audio
                 .play("minecraft:entity.player.attack.nodamage", from, 1.0, 1.0);
         }
-        true
     }
     /// ServerExplosion: rays from a 16^3 grid lose (resistance + 0.3) * 0.3 per step.
     /// A mob explosion (`Level.ExplosionInteraction.MOB`: drop decay with the
@@ -8492,6 +8656,10 @@ impl Game<'_> {
         }
         let shown = self.hands_to_render();
         let used_hand = self.used_hand();
+        let spinning = self
+            .player
+            .as_ref()
+            .is_some_and(|p| p.auto_spin_attack_ticks > 0);
         for (i, (hand, item)) in Hand::BOTH
             .into_iter()
             .zip(self.visible_hand_items())
@@ -8611,6 +8779,7 @@ impl Game<'_> {
                         ItemPose::Using
                     }
                 }
+                _ if spinning => ItemPose::SpinAttack,
                 _ => ItemPose::Swing,
             };
             let m = to_world
@@ -10967,6 +11136,10 @@ impl ApplicationHandler for Game<'_> {
                 WindowEvent::RedrawRequested => {
                     self.observe_fullscreen();
                     let now = Instant::now();
+                    let frame_cpu = self
+                        .options
+                        .spikes
+                        .and_then(|_| horizon_client::spans::thread_cpu());
                     let elapsed = now.duration_since(self.previous);
                     self.frame_ticks = elapsed.as_secs_f32() * 20.0;
                     self.previous = now;
@@ -10996,6 +11169,8 @@ impl ApplicationHandler for Game<'_> {
                     }
                     let updated = Instant::now();
                     self.track_toggle_screens();
+                    // For the "I'm playing" ping: an atomic, sent on when it changes.
+                    horizon_client::heartbeat::set_lan(self.is_published());
                     let steps = self.clock.advance(elapsed);
                     for _ in 0..steps {
                         let started = Instant::now();
@@ -11033,11 +11208,20 @@ impl ApplicationHandler for Game<'_> {
                         let cpu = now.elapsed().saturating_sub(r.last_wait).as_secs_f32() * 1000.0;
                         let spans = horizon_client::spans::take();
                         if cpu > threshold {
-                            let list = horizon_client::spans::describe(&spans, threshold <= 0.0);
+                            // Include submillisecond spans with HORIZON_SPIKES=0,
+                            // while retaining upstream wall/CPU wait attribution.
+                            let list = if threshold <= 0.0 {
+                                horizon_client::spans::describe_all(&spans)
+                            } else {
+                                horizon_client::spans::describe(&spans)
+                            };
+                            let worked = horizon_client::spans::thread_cpu()
+                                .zip(frame_cpu)
+                                .map_or_else(String::new, |(end, start)| {
+                                    format!(", cpu {:.1} ms", (end - start).as_secs_f32() * 1000.0)
+                                });
                             log::info!(
-                                "Horizon: slow frame {cpu:.1} ms ({} ticks): {}",
-                                steps,
-                                list.join(", ")
+                                "Horizon: slow frame {cpu:.1} ms{worked} ({steps} ticks): {list}"
                             );
                         }
                     }
@@ -12084,6 +12268,7 @@ fn load_world_rest(
         player_type: perspective::player_type(root),
         player_arm: horizon_client::mobs::load_model(root, "minecraft:player#main")
             .and_then(|m| m.children.into_iter().find(|c| c.name == "right_arm")),
+        spin_attack: horizon_client::mobs::load_model(root, "minecraft:spin_attack#main"),
     })
 }
 
@@ -12788,9 +12973,26 @@ pub fn run() -> Result<()> {
     if options.dedicated.is_some() && !dedicated::preflight(&mut options)? {
         return Ok(());
     }
-    if options.dedicated.is_some() {
-        // Before any worker starts: on Linux they go behind the server thread.
-        horizon_threads::put_helpers_behind();
+    // Before any worker starts: on Linux they go behind the server thread
+    // and the render thread.
+    horizon_threads::put_helpers_behind();
+    if options.dedicated.is_none() {
+        // The render thread, like the server thread, ahead of the workers on
+        // macOS and Windows. While terrain loads, the worker pools (two with
+        // single player's server thread) and other programs outnumber the
+        // cores, and a frame that gave its core up (in a GPU submit) waited
+        // 10 to 200 ms to get one back.
+        horizon_threads::favour_current();
+    }
+    // Someone is playing: the anonymous ping behind the launcher's "N playing now". Not for a
+    // server, a benchmark or a run that quits by itself.
+    if options.dedicated.is_none()
+        && options.benchmark.is_none()
+        && !options.offscreen
+        && options.frames.is_none()
+        && options.world_frames.is_none()
+    {
+        horizon_client::heartbeat::start();
     }
     let started = Instant::now();
     horizon_client::spans::enable(options.spikes.is_some());
