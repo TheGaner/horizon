@@ -2391,6 +2391,7 @@ impl Game<'_> {
             health: 5,
             fire_ticks: 0,
             thrower: None,
+            target: None,
             id: id as u32,
             stack,
             position: at,
@@ -2398,6 +2399,7 @@ impl Game<'_> {
             velocity: Vec3::ZERO,
             on_ground: false,
             age: 0,
+            tick_count: 0,
             pickup_delay: 0,
             bob_offset,
         });

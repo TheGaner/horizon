@@ -30,7 +30,11 @@ SOURCE_PARTS=[Path(__file__).resolve(),
  lab.ROOT/'crates/horizon-client/src/game/lan_actions.rs',
  lab.ROOT/'crates/horizon-client/src/game/lan_crafting.rs',
  lab.ROOT/'crates/horizon-client/src/lan/entity.rs',
- lab.ROOT/'crates/horizon-client/src/lan/hub.rs']
+ lab.ROOT/'crates/horizon-client/src/lan/hub.rs',
+ lab.ROOT/'crates/horizon-client/src/game.rs',
+ lab.ROOT/'crates/horizon-client/src/entities.rs',
+ lab.ROOT/'crates/horizon-client/src/entity_nbt.rs',
+ lab.ROOT/'crates/horizon-client/src/game/remote.rs']
 STEP_SECONDS=1.2
 SCRIPT=[('alice-joins',[],['join Alice','cmd Alice gamemode survival']),
         ('bob-joins',[],['join Bob','cmd Bob gamemode survival']),

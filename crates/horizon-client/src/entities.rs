@@ -17,11 +17,15 @@ pub struct ItemEntity {
     pub id: u32,
     pub stack: ItemStack,
     pub thrower: Option<[i32; 4]>,
+    /// Vanilla ItemEntity.target (`Owner` in NBT), not the dropper (`Thrower`).
+    pub target: Option<[i32; 4]>,
     pub position: Vec3,
     pub previous: Vec3,
     pub velocity: Vec3,
     pub on_ground: bool,
     pub age: u32,
+    /// Entity.tickCount; independent of item age (which may be loaded/merged).
+    pub tick_count: u32,
     pub pickup_delay: u32,
     pub bob_offset: f32,
 }
@@ -102,6 +106,7 @@ impl ItemEntity {
         facts: &BlockFacts,
         collision: &BlockCollisionRegistry<'_>,
     ) -> bool {
+        self.tick_count = self.tick_count.wrapping_add(1);
         self.previous = self.position;
         if self.pickup_delay > 0 && self.pickup_delay != u32::MAX {
             self.pickup_delay -= 1;
@@ -176,6 +181,96 @@ impl ItemEntity {
         self.age < 6000 && self.position.y > -128.0
     }
 }
+/// Java 26.3 `ItemEntity.mergeWithNeighbours` following each entity tick.
+/// The player-facing entity tracker observes the *survivor's* changed stack
+/// and the disappeared donor; this function does not emit network packets.
+/// `max_stack` reads the registry's max stack size (usually 64).
+pub fn merge_nearby_items(
+    items: &mut Vec<ItemEntity>,
+    max_stack: impl Fn(&str) -> u32,
+    actively_ticking: impl Fn(&ItemEntity) -> bool,
+) {
+    if items.len() < 2 {
+        return;
+    }
+    let mut removed = vec![false; items.len()];
+    for i in 0..items.len() {
+        if removed[i] || !actively_ticking(&items[i]) || !item_can_merge(&items[i], &max_stack) {
+            continue;
+        }
+        // ItemEntity.tick: crossing an integer block coordinate checks every
+        // 2 ticks, otherwise every 40; the entity tickCount, not its Age.
+        let a = &items[i];
+        let crossed = (a.previous.x.floor() != a.position.x.floor())
+            || (a.previous.y.floor() != a.position.y.floor())
+            || (a.previous.z.floor() != a.position.z.floor());
+        let period = if crossed { 2 } else { 40 };
+        if !a.tick_count.is_multiple_of(period) {
+            continue;
+        }
+        for j in 0..items.len() {
+            if i == j || removed[i] || removed[j] || !item_can_merge(&items[j], &max_stack) {
+                continue;
+            }
+            // getEntitiesOfClass in bounding box inflated by (.5, 0, .5).
+            // Two item AABBs are .25 across; exact overlap uses strict <.
+            let (a, b) = (&items[i], &items[j]);
+            if (a.position.x - b.position.x).abs() >= 0.75
+                || (a.position.y - b.position.y).abs() >= ItemEntity::WIDTH
+                || (a.position.z - b.position.z).abs() >= 0.75
+                || a.target != b.target
+                || !a.stack.same_item_same_components(&b.stack)
+            {
+                continue;
+            }
+            // tryToMerge: the larger stack always survives; when equal,
+            // the *other* entity survives. Capacity is min(64, maxStack).
+            let (receiver, donor) = if a.stack.count > b.stack.count {
+                (i, j)
+            } else {
+                (j, i)
+            };
+            let (receiver_item, donor_item) = if receiver < donor {
+                let (head, tail) = items.split_at_mut(donor);
+                (&mut head[receiver], &mut tail[0])
+            } else {
+                let (head, tail) = items.split_at_mut(receiver);
+                (&mut tail[0], &mut head[donor])
+            };
+            let cap = max_stack(&receiver_item.stack.item).min(64);
+            let moved = donor_item
+                .stack
+                .count
+                .min(cap.saturating_sub(receiver_item.stack.count));
+            if moved == 0 {
+                continue;
+            }
+            receiver_item.stack.count += moved;
+            donor_item.stack.count -= moved;
+            receiver_item.pickup_delay = receiver_item.pickup_delay.max(donor_item.pickup_delay);
+            receiver_item.age = receiver_item.age.min(donor_item.age);
+            if donor_item.stack.count == 0 {
+                removed[donor] = true;
+            }
+        }
+    }
+    let mut next = 0;
+    items.retain(|_| {
+        let keep = !removed[next];
+        next += 1;
+        keep
+    });
+}
+
+fn item_can_merge(item: &ItemEntity, max_stack: &impl Fn(&str) -> u32) -> bool {
+    item.health > 0
+        && item.pickup_delay != 32767
+        && item.pickup_delay != u32::MAX
+        && item.age < 6000
+        && item.stack.count > 0
+        && item.stack.count < max_stack(&item.stack.item).min(64)
+}
+
 /// ExperienceOrb: gravity 0.03, homing towards the player within 8 blocks.
 #[derive(Clone, Debug)]
 pub struct ExperienceOrb {
@@ -618,6 +713,7 @@ mod fire_environment_tests {
         let make = |id: &str| ItemEntity {
             id: 1,
             thrower: None,
+            target: None,
             stack: ItemStack {
                 item: std::sync::Arc::from(id),
                 count: 1,
@@ -631,6 +727,7 @@ mod fire_environment_tests {
             velocity: Vec3::ZERO,
             on_ground: false,
             age: 0,
+            tick_count: 0,
             pickup_delay: 0,
             bob_offset: 0.0,
         };
@@ -702,5 +799,205 @@ mod fire_environment_tests {
             assert!(stand.environment_tick(&world, &facts, assets.registry));
         }
         assert_eq!(stand.health, 20.0, "lava does not hurt armor stands");
+    }
+}
+
+#[cfg(test)]
+mod item_merge_parity_tests {
+    use super::*;
+
+    fn item(id: u32, item: &str, count: u32) -> ItemEntity {
+        ItemEntity {
+            id,
+            stack: ItemStack::new(item, count),
+            target: None,
+            thrower: None,
+            health: 5,
+            fire_ticks: 0,
+            position: Vec3::new(0.5, 65.0, 0.5),
+            previous: Vec3::new(0.5, 65.0, 0.5),
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            age: 10,
+            tick_count: 0,
+            pickup_delay: 20,
+            bob_offset: 0.0,
+        }
+    }
+
+    fn run(items: &mut Vec<ItemEntity>) {
+        merge_nearby_items(
+            items,
+            |id| {
+                if id == "minecraft:diamond_sword" {
+                    1
+                } else if id == "minecraft:snowball" {
+                    16
+                } else {
+                    64
+                }
+            },
+            |_| true,
+        );
+    }
+
+    #[test]
+    fn stationary_check_uses_entity_tick_count_not_saved_age() {
+        let mut left = item(1, "minecraft:stick", 1);
+        left.age = 135;
+        left.tick_count = 39;
+        let mut right = item(2, "minecraft:stick", 8);
+        right.tick_count = 39;
+        let mut items = vec![left, right];
+        run(&mut items);
+        assert_eq!(items.len(), 2, "no merge before stationary tick 40");
+        for item in &mut items {
+            item.tick_count = 40;
+        }
+        run(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!((items[0].id, items[0].stack.count), (2, 9));
+        assert_eq!(items[0].age, 10, "survivor adopts donor's earlier age");
+    }
+
+    #[test]
+    fn boundary_crossing_checks_every_second_tick() {
+        let mut a = item(1, "minecraft:stick", 1);
+        let mut b = item(2, "minecraft:stick", 1);
+        a.previous.x = -0.2;
+        a.tick_count = 1;
+        b.tick_count = 1;
+        let mut items = vec![a, b];
+        run(&mut items);
+        assert_eq!(items.len(), 2);
+        items[0].tick_count = 2;
+        run(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, 2, "equal counts merge into other entity");
+        assert_eq!(items[0].stack.count, 2);
+    }
+
+    #[test]
+    fn owner_target_not_thrower_controls_merge_compatibility() {
+        let mut a = item(1, "minecraft:stick", 1);
+        let mut b = item(2, "minecraft:stick", 8);
+        a.tick_count = 40;
+        a.thrower = Some([1, 0, 0, 0]);
+        b.thrower = Some([2, 0, 0, 0]);
+        a.target = Some([3, 0, 0, 0]);
+        b.target = Some([4, 0, 0, 0]);
+        let mut items = vec![a, b];
+        run(&mut items);
+        assert_eq!(items.len(), 2, "different Owner tags must not merge");
+        items[1].target = items[0].target;
+        run(&mut items);
+        assert_eq!(items.len(), 1, "different Thrower tags may merge");
+    }
+
+    #[test]
+    fn item_components_and_item_type_prevent_merging() {
+        let mut a = item(1, "minecraft:stick", 1);
+        a.tick_count = 40;
+        let mut b = item(2, "minecraft:stone", 8);
+        let mut items = vec![a.clone(), b.clone()];
+        run(&mut items);
+        assert_eq!(items.len(), 2);
+        b.stack = ItemStack::new("minecraft:stick", 8);
+        b.stack.damage = 1;
+        items = vec![a.clone(), b.clone()];
+        run(&mut items);
+        assert_eq!(items.len(), 2, "damage components must match");
+        b.stack.damage = 0;
+        b.stack.data_mut().repair_cost = 2;
+        items = vec![a, b];
+        run(&mut items);
+        assert_eq!(items.len(), 2, "extra components must match");
+    }
+
+    #[test]
+    fn precise_aabb_overlap_and_special_delay_must_allow_merge() {
+        let mut a = item(1, "minecraft:stick", 1);
+        a.tick_count = 40;
+        let mut b = item(2, "minecraft:stick", 8);
+        b.position.x = 1.25;
+        let mut items = vec![a.clone(), b.clone()];
+        run(&mut items);
+        assert_eq!(items.len(), 2, "x boundary is exclusive");
+        b.position.x = 1.2;
+        b.position.y += 0.25;
+        items = vec![a.clone(), b.clone()];
+        run(&mut items);
+        assert_eq!(items.len(), 2, "y boundary is exclusive");
+        b.position.y = a.position.y;
+        b.pickup_delay = 32767;
+        items = vec![a.clone(), b.clone()];
+        run(&mut items);
+        assert_eq!(items.len(), 2, "never-pickup items are not mergeable");
+        b.pickup_delay = 40;
+        items = vec![a, b];
+        run(&mut items);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].pickup_delay, 40);
+    }
+
+    #[test]
+    fn capacity_caps_at_registry_max_and_remembers_partial_donor() {
+        let mut a = item(1, "minecraft:stick", 63);
+        a.tick_count = 40;
+        let b = item(2, "minecraft:stick", 2);
+        let mut items = vec![a, b];
+        run(&mut items);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items.iter().map(|i| i.stack.count).sum::<u32>(), 65);
+        assert_eq!(items.iter().map(|i| i.stack.count).max(), Some(64));
+        let mut a = item(1, "minecraft:snowball", 15);
+        a.tick_count = 40;
+        items = vec![a, item(2, "minecraft:snowball", 3)];
+        run(&mut items);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items.iter().map(|i| i.stack.count).max(), Some(16));
+        let mut sword = item(3, "minecraft:diamond_sword", 1);
+        sword.tick_count = 40;
+        items = vec![sword, item(4, "minecraft:diamond_sword", 1)];
+        run(&mut items);
+        assert_eq!(items.len(), 2);
+    }
+
+    #[test]
+    fn dormant_chunk_item_does_not_initiate_a_frozen_tick_40_merge() {
+        let mut frozen = item(1, "minecraft:stick", 1);
+        frozen.tick_count = 40;
+        let mut other = item(2, "minecraft:stick", 8);
+        other.tick_count = 1;
+        let mut items = vec![frozen, other];
+        merge_nearby_items(&mut items, |_| 64, |item| item.id != 1);
+        assert_eq!(
+            items.len(),
+            2,
+            "unticked item must not scan at tick 40 again"
+        );
+        items[1].tick_count = 40;
+        merge_nearby_items(&mut items, |_| 64, |item| item.id != 1);
+        assert_eq!(
+            items.len(),
+            1,
+            "active item can merge a nearby dormant candidate"
+        );
+        assert_eq!(items[0].stack.count, 9);
+    }
+
+    #[test]
+    fn no_merge_across_distant_items_or_already_aged_out() {
+        let mut a = item(1, "minecraft:stick", 1);
+        a.tick_count = 40;
+        let mut b = item(2, "minecraft:stick", 1);
+        b.position.z += 5.0;
+        let mut items = vec![a.clone(), b];
+        run(&mut items);
+        assert_eq!(items.len(), 2);
+        a.age = 6000;
+        items = vec![a, item(2, "minecraft:stick", 1)];
+        run(&mut items);
+        assert_eq!(items.len(), 2);
     }
 }

@@ -1815,6 +1815,7 @@ impl Game<'_> {
             health: 5,
             fire_ticks: 0,
             thrower: None,
+            target: None,
             id: self.next_entity,
             stack,
             position: p,
@@ -1822,6 +1823,7 @@ impl Game<'_> {
             velocity: Vec3::new(velocity[0], velocity[1], velocity[2]),
             on_ground: false,
             age: 0,
+            tick_count: 0,
             pickup_delay,
             bob_offset: bob,
         });
@@ -1934,6 +1936,20 @@ impl Game<'_> {
             }
             environment.alive
         });
+        // Only the server owns item merges. The remote client receives
+        // authoritative dirty item metadata and entity removals over TCP.
+        if self.remote.is_none() {
+            horizon_client::entities::merge_nearby_items(
+                &mut items,
+                |id| self.res.items().get(id).map_or(64, |info| info.max_stack),
+                |item| {
+                    ticking(
+                        item.position.x.floor() as i32,
+                        item.position.z.floor() as i32,
+                    )
+                },
+            );
+        }
         let Some(p) = self.player.as_ref() else {
             self.dropped = items;
             return;

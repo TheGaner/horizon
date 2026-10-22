@@ -43,6 +43,10 @@ SOURCE_PARTS = [
     lab.ROOT / 'crates/horizon-client/src/lan/containers.rs',
     lab.ROOT / 'crates/horizon-client/src/lan/menu.rs',
     lab.ROOT / 'crates/horizon-client/src/lan/hub.rs',
+    lab.ROOT / 'crates/horizon-client/src/game.rs',
+    lab.ROOT / 'crates/horizon-client/src/entities.rs',
+    lab.ROOT / 'crates/horizon-client/src/entity_nbt.rs',
+    lab.ROOT / 'crates/horizon-client/src/game/remote.rs',
     lab.ROOT / 'crates/horizon-client/src/lan/entity.rs',
 ]
 

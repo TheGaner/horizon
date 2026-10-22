@@ -135,6 +135,9 @@ struct ServerEntity {
     velocity: [f64; 3],
     /// trackedDataValues: the entity data the clients hold.
     meta: Vec<(u8, i32, Value)>,
+    /// The original ItemEntity stack is dirty once after its first pairing.
+    is_item: bool,
+    initial_item_dirty_sent: bool,
     equipment: Vec<(u8, Option<Stack>)>,
     /// The attribute instances the clients hold.
     attributes: Vec<AttributeSnapshot>,
@@ -149,6 +152,8 @@ struct ServerEntity {
     /// whether it was added in it (its first update is the next tick's).
     seen: u32,
     index: usize,
+    /// Previous tick's live index, retained when merged donors disappear.
+    previous_index: usize,
     added: bool,
     /// TrackedEntity.lastSectionPos: its pairs are checked again when it
     /// moves to another section.
@@ -181,6 +186,8 @@ impl ServerEntity {
             head: pack_degrees(e.head_yaw),
             velocity: e.velocity,
             meta: e.meta.clone(),
+            is_item: e.kind == "minecraft:item",
+            initial_item_dirty_sent: false,
             equipment: e.equipment.clone(),
             attributes: e.attributes.clone(),
             was_on_ground: e.on_ground,
@@ -190,6 +197,7 @@ impl ServerEntity {
             was_riding: false,
             seen: 0,
             index: 0,
+            previous_index: 0,
             added: true,
             section: section_of(e.position),
         }
@@ -411,7 +419,11 @@ impl ServerEntity {
                 }));
             }
             self.meta.clone_from(&e.meta);
-        } else if self.tick == 0 && e.kind == "minecraft:item" && !self.meta.is_empty() {
+        } else if self.tick == 0
+            && self.is_item
+            && !self.initial_item_dirty_sent
+            && !self.meta.is_empty()
+        {
             // Mojang 26.3 ServerEntity.sendPairingData sends the non-default
             // item stack on pair, while the ItemEntity's initially dirty
             // SynchedEntityData is broadcast again on the first following
@@ -616,6 +628,7 @@ impl Entities {
                 ServerEntity::new(e, kind(&e.kind), riding)
             });
             s.seen = now;
+            s.previous_index = s.index;
             s.index = index;
             // ChunkMap.addEntity, and ChunkMap.tick's section change:
             // updatePlayers.
@@ -641,6 +654,48 @@ impl Entities {
                 range: s.range,
                 chunk,
             });
+        }
+        // Mojang's ItemEntity DATA_ITEM starts dirty. A receiver gets the
+        // pairing stack immediately, then this initial dirty state once on
+        // its first tracking update. A fast drop can merge/discard the item
+        // *on that same tick*. Preserve the original pre-merge metadata for
+        // every previously paired item (even one now absent from `entities`)
+        // before the removal and current merged stack packets. Otherwise
+        // an update from x1 to x2 hides the required intermediate x1.
+        // In the actual Java 26.3 repeated-Q server traces, independent
+        // item dirty metadata groups sometimes reverse order from run to
+        // run. Preserve stable prior-level entity order rather than infer a
+        // globally fixed new/old precedence from a single socket trace.
+        let mut initial_items: Vec<_> = self
+            .states
+            .iter_mut()
+            .filter_map(|(&id, s)| {
+                if s.is_item
+                    && !s.added
+                    && s.tick == 0
+                    && !s.initial_item_dirty_sent
+                    && !s.meta.is_empty()
+                {
+                    s.initial_item_dirty_sent = true;
+                    Some((s.previous_index, id, s.meta.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        initial_items.sort_unstable_by_key(|(prior_index, _, _)| *prior_index);
+        for v in viewers.iter_mut() {
+            for (_, id, values) in &initial_items {
+                if v.tracker.is_tracking(*id) {
+                    v.out.push(
+                        play::Clientbound::SetEntityData(SetEntityData {
+                            id: *id,
+                            values: values.clone(),
+                        })
+                        .encode(),
+                    );
+                }
+            }
         }
         self.flags.resize_with(viewers.len(), Vec::new);
         self.pairs.clear();
@@ -841,6 +896,47 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[test]
+    fn previously_flushed_item_initial_stack_is_not_repeated_on_update() {
+        let mut e = state(0.0);
+        e.kind = "minecraft:item".into();
+        e.meta = vec![(8, serializer::ITEM_STACK, Value::Item(None))];
+        let mut s = added(&e);
+        s.initial_item_dirty_sent = true;
+        assert!(
+            changes(&mut s, &e)
+                .iter()
+                .all(|p| !matches!(p, play::Clientbound::SetEntityData(_)))
+        );
+    }
+
+    #[test]
+    fn merged_first_item_update_still_sends_final_stack_delta() {
+        let mut e = state(0.0);
+        e.kind = "minecraft:item".into();
+        e.meta = vec![(
+            8,
+            serializer::ITEM_STACK,
+            Value::Item(Some(Stack::new(5, 1))),
+        )];
+        let mut s = added(&e);
+        s.initial_item_dirty_sent = true;
+        e.meta = vec![(
+            8,
+            serializer::ITEM_STACK,
+            Value::Item(Some(Stack::new(5, 2))),
+        )];
+        let data: Vec<_> = changes(&mut s, &e)
+            .into_iter()
+            .filter_map(|p| match p {
+                play::Clientbound::SetEntityData(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].values, e.meta);
     }
 
     #[test]
@@ -1072,6 +1168,58 @@ mod tests {
     /// walking into range within its section isn't paired with a client
     /// standing still until the client moves, and one walking out stays
     /// tracked until it changes section.
+    #[test]
+    fn rapid_item_merge_flushes_both_original_metadata_before_remove_and_survivor_update() {
+        let mut level = Entities::default();
+        let mut clients = Clients::new();
+        let item = |id, count| {
+            let mut e = state(0.0);
+            e.id = id;
+            e.kind = "minecraft:item".into();
+            e.meta = vec![(
+                8,
+                serializer::ITEM_STACK,
+                Value::Item(Some(Stack::new(5, count))),
+            )];
+            e
+        };
+        let a = item(7, 1);
+        let b = item(8, 1);
+        clients.tick(&mut level, &[&a, &b]);
+        assert!(
+            clients
+                .trackers
+                .iter()
+                .all(|t| t.is_tracking(7) && t.is_tracking(8))
+        );
+        // The first item merged into the other before the tracker's next
+        // update: the second item's new index is zero; flush both prior
+        // snapshots in their original level-order indices 7 then 8.
+        let merged = item(8, 2);
+        clients.tick(&mut level, &[&merged]);
+        let p = &clients.out[0];
+        let before = |id| {
+            body(play::Clientbound::SetEntityData(SetEntityData {
+                id,
+                values: item(id, 1).meta,
+            }))
+        };
+        assert_eq!(p.first(), Some(&before(7)));
+        assert_eq!(p.get(1), Some(&before(8)));
+        assert!(p.contains(&body(play::Clientbound::RemoveEntities(
+            play::RemoveEntities { ids: vec![7] },
+        ))));
+        assert!(
+            p.contains(&body(play::Clientbound::SetEntityData(SetEntityData {
+                id: 8,
+                values: merged.meta.clone(),
+            })))
+        );
+        assert_eq!(clients.out[0], clients.out[1]);
+        clients.tick(&mut level, &[&merged]);
+        assert!(clients.out[0].iter().all(|pkt| pkt != &before(8)));
+    }
+
     #[test]
     fn pairs_are_checked_again_when_a_side_moves() {
         let mut level = Entities::default();
