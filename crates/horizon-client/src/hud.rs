@@ -18,7 +18,42 @@ pub struct Rect {
     pub w: u32,
     pub h: u32,
 }
+/// Java 26.3 `TextureMetadataSection`: standalone texture sampling overrides.
+/// Defaults are nearest-neighbour and repeating when the `texture` section
+/// omits either flag. Resolved against the resource-pack overlay tree.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextureSampling {
+    pub blur: bool,
+    pub clamp: bool,
+}
+impl TextureSampling {
+    pub fn from_png(path: &Path) -> Self {
+        let path = path.with_extension("png.mcmeta");
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Self::default(),
+            Err(e) => {
+                log::warn!("Cannot read {}: {e}", path.display());
+                return Self::default();
+            }
+        };
+        let parsed: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(e) => {
+                log::warn!("Invalid {}: {e}", path.display());
+                return Self::default();
+            }
+        };
+        let texture = &parsed["texture"];
+        Self {
+            blur: texture["blur"].as_bool().unwrap_or(false),
+            clamp: texture["clamp"].as_bool().unwrap_or(false),
+        }
+    }
+}
+
 pub struct HudAtlas {
+    pub sampling: HashMap<String, TextureSampling>,
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
@@ -258,6 +293,16 @@ impl HudAtlas {
         if full {
             Self::slots(&mut images);
         }
+        // A pack may override a PNG's .mcmeta without replacing the PNG.
+        // Keep only nondefault modes: atlas sprites without overrides retain
+        // their ordinary nearest/repeat rendering path.
+        let sampling: HashMap<_, _> = images
+            .iter()
+            .filter_map(|(name, _, _, _)| {
+                let flags = TextureSampling::from_png(&textures.join(format!("{name}.png")));
+                (flags != TextureSampling::default()).then_some((name.clone(), flags))
+            })
+            .collect();
         images.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
         let width = 4096u32;
         let mut placements = Vec::with_capacity(images.len());
@@ -333,6 +378,7 @@ impl HudAtlas {
             white,
         );
         Ok(Self {
+            sampling,
             pixels,
             width,
             height,
@@ -350,6 +396,10 @@ pub struct HudVertex {
     pub uv: [f32; 2],
     pub color: u32,
     pub depth: f32,
+    /// Original standalone atlas rectangle, unused for ordinary atlas draws.
+    pub sample_rect: [f32; 4],
+    /// [standalone, blur, clamp, unused]: other GUI quads keep zero flags.
+    pub sample_flags: [f32; 4],
 }
 /// The GUI Scale option (0 = auto).
 pub static GUI_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -464,9 +514,29 @@ impl HudBatch {
                 uv: uv[i],
                 color,
                 depth: 0.0,
+                sample_rect: [0.0; 4],
+                sample_flags: [0.0; 4],
             });
         }
     }
+    /// Blits are standalone textures packed into the HUD atlas. Preserve the
+    /// original entire texture rectangle even when drawing a subregion: the
+    /// GPU uses it to repeat or clamp the texture without sampling its atlas
+    /// neighbours. Ordinary atlas sprites/fonts don't take this path.
+    pub fn standalone_since(&mut self, start: usize, rect: Rect, sampling: TextureSampling) {
+        let region = [rect.u0, rect.v0, rect.u1, rect.v1];
+        let flags = [
+            1.0,
+            f32::from(sampling.blur),
+            f32::from(sampling.clamp),
+            0.0,
+        ];
+        for v in &mut self.vertices[start..] {
+            v.sample_rect = region;
+            v.sample_flags = flags;
+        }
+    }
+
     pub fn quad_3d(&mut self, p: [[f32; 3]; 4], uv: [[f32; 2]; 4], color: u32) {
         for i in [0, 1, 2, 0, 2, 3] {
             self.vertices.push(HudVertex {
@@ -474,6 +544,8 @@ impl HudBatch {
                 uv: uv[i],
                 color,
                 depth: p[i][2],
+                sample_rect: [0.0; 4],
+                sample_flags: [0.0; 4],
             });
         }
     }
@@ -638,6 +710,8 @@ impl HudBatch {
                 uv,
                 color: c[i],
                 depth: 0.0,
+                sample_rect: [0.0; 4],
+                sample_flags: [0.0; 4],
             });
         }
     }
@@ -878,7 +952,7 @@ impl HudRenderer {
             bind_group_layouts: &[Some(&layout)],
             ..Default::default()
         });
-        let attributes = wgpu::vertex_attr_array![0=>Float32x2,1=>Float32x2,2=>Unorm8x4,3=>Float32];
+        let attributes = wgpu::vertex_attr_array![0=>Float32x2,1=>Float32x2,2=>Unorm8x4,3=>Float32,4=>Float32x4,5=>Float32x4];
         let create = |label, blend, fragment_entry, depth: bool| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
@@ -1146,6 +1220,132 @@ impl HudRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn texture_sampler_flags_follow_pack_mcmeta_and_default_when_absent() {
+        let root =
+            std::env::temp_dir().join(format!("horizon-335-metadata-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let png = root.join("vignette.png");
+        assert_eq!(TextureSampling::from_png(&png), TextureSampling::default());
+        fs::write(
+            png.with_extension("png.mcmeta"),
+            r#"{"texture":{"blur":true,"clamp":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            TextureSampling::from_png(&png),
+            TextureSampling {
+                blur: true,
+                clamp: true
+            }
+        );
+        fs::write(
+            png.with_extension("png.mcmeta"),
+            r#"{"texture":{"blur":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            TextureSampling::from_png(&png),
+            TextureSampling {
+                blur: true,
+                clamp: false
+            }
+        );
+        fs::write(
+            png.with_extension("png.mcmeta"),
+            r#"{"animation":{"frametime":2},"texture":{"blur":false,"clamp":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            TextureSampling::from_png(&png),
+            TextureSampling {
+                blur: false,
+                clamp: true
+            }
+        );
+        fs::write(
+            png.with_extension("png.mcmeta"),
+            r#"{"animation":{"frametime":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(TextureSampling::from_png(&png), TextureSampling::default());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn packed_resource_overlay_changes_sampler_without_changing_png() {
+        use crate::hud_layout::{self, Blend, GuiDraw};
+        use std::borrow::Cow;
+        let root = std::env::temp_dir().join(format!("horizon-335-pack-{}", std::process::id()));
+        let textures = root.join("assets/minecraft/textures/misc");
+        fs::create_dir_all(&textures).unwrap();
+        for name in ["vignette", "underwater"] {
+            let mut png = png::Encoder::new(
+                fs::File::create(textures.join(format!("{name}.png"))).unwrap(),
+                16,
+                16,
+            );
+            png.set_color(png::ColorType::Rgba);
+            png.set_depth(png::BitDepth::Eight);
+            png.write_header()
+                .unwrap()
+                .write_image_data(&vec![255; 16 * 16 * 4])
+                .unwrap();
+        }
+        let meta = textures.join("vignette.png.mcmeta");
+        fs::write(&meta, r#"{"texture":{"blur":true,"clamp":true}}"#).unwrap();
+        let atlas = HudAtlas::build(&root).unwrap();
+        assert_eq!(
+            atlas.sampling["misc/vignette"],
+            TextureSampling {
+                blur: true,
+                clamp: true
+            }
+        );
+        assert!(!atlas.sampling.contains_key("misc/underwater"));
+        let mut batch = HudBatch::new([320, 240]);
+        let blit = GuiDraw::Blit {
+            texture: Cow::Borrowed("misc/vignette"),
+            blend: Blend::Textured,
+            x: 0,
+            y: 0,
+            w: 16,
+            h: 16,
+            uv: [0.0, 0.0],
+            src: [16, 16],
+            tex: [16, 16],
+            color: u32::MAX,
+        };
+        hud_layout::paint(&mut batch, &atlas, &[blit]);
+        assert_eq!(batch.vertices.len(), 6);
+        assert_eq!(batch.vertices[0].sample_flags, [1.0, 1.0, 1.0, 0.0]);
+        let r = atlas.sprites["misc/vignette"];
+        assert_eq!(batch.vertices[0].sample_rect, [r.u0, r.v0, r.u1, r.v1]);
+        let shader = naga::front::wgsl::parse_str(include_str!("hud.wgsl")).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&shader)
+        .unwrap();
+        // A pack can change the .mcmeta flags without changing any pixels.
+        fs::write(&meta, r#"{"texture":{"blur":false,"clamp":true}}"#).unwrap();
+        let reloaded = HudAtlas::build(&root).unwrap();
+        assert_eq!(
+            reloaded.sampling["misc/vignette"],
+            TextureSampling {
+                blur: false,
+                clamp: true
+            }
+        );
+        assert_eq!(reloaded.pixels, atlas.pixels);
+        // No texture section returns to nearest/repeat on the next reload.
+        fs::remove_file(meta).unwrap();
+        let default = HudAtlas::build(&root).unwrap();
+        assert!(!default.sampling.contains_key("misc/vignette"));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn the_fonts_only_atlas_measures_text_like_the_full_one() {

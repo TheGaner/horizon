@@ -41,7 +41,7 @@ harness named checks that loader against vanilla).
 | Texture animation: frames, frame time, frame size | `*.png.mcmeta` `animation` | works | `test_sprite_animation_parity` |
 | Texture animation: `interpolate` | `*.png.mcmeta` `animation` | **no** | frames step instead of blending (vanilla's own prismarine, magma, stems, lit furnaces and campfires, command blocks, sculk too): fix in progress |
 | Mipmap strategy, alpha cutoff bias | `*.png.mcmeta` `texture` | works | `test_mipmap_parity` |
-| `blur` / `clamp` | `*.png.mcmeta` `texture` | partly | vanilla's own files (vignette, pumpkin blur, shadow, glint, nausea) are drawn with their vanilla sampling; a pack that changes the flags is ignored |
+| `blur` / `clamp` | `*.png.mcmeta` `texture` | partly | GUI `Blit` and screen-effect overlays read pack metadata, use per-texture nearest/bilinear and clamp/repeat without atlas bleed; `hud.rs` and `screen_effects.rs` tests. Entity shadows and procedural enchantment glint still need texture-specific GPU sampling |
 | Atlases and sprite sources: `directory`, `single`, `filter`, `unstitch`, `paletted_permutations` | `atlases/` | works | `test_resource_pack_parity` (merged source lists), `atlas_sources.rs` tests |
 | GUI sprites | `textures/gui/sprites/` | works | `test_hud_parity`, `test_screen_layout_parity` |
 | GUI sprite scaling: `nine_slice` border | `*.png.mcmeta` `gui` | works | `ui.rs` reads the border; vanilla's buttons, sliders and frames use it |

@@ -847,6 +847,7 @@ pub fn paint(batch: &mut crate::hud::HudBatch, atlas: &crate::hud::HudAtlas, dra
                 let Some(mut r) = atlas.sprites.get(texture.as_ref()).copied() else {
                     continue;
                 };
+                let full_rect = r;
                 let (du, dv) = (r.u1 - r.u0, r.v1 - r.v0);
                 let u0 = r.u0 + du * uv[0] / tex[0] as f32;
                 let v0 = r.v0 + dv * uv[1] / tex[1] as f32;
@@ -854,7 +855,17 @@ pub fn paint(batch: &mut crate::hud::HudBatch, atlas: &crate::hud::HudAtlas, dra
                 r.v1 = r.v0 + dv * (uv[1] + src[1] as f32) / tex[1] as f32;
                 r.u0 = u0;
                 r.v0 = v0;
+                let start = batch.vertices.len();
                 batch.rect_uv(*x as f32, *y as f32, *w as f32, *h as f32, r, abgr(*color));
+                batch.standalone_since(
+                    start,
+                    full_rect,
+                    atlas
+                        .sampling
+                        .get(texture.as_ref())
+                        .copied()
+                        .unwrap_or_default(),
+                );
             }
             GuiDraw::Blit { .. } | GuiDraw::Item { .. } => {}
             GuiDraw::Fill {

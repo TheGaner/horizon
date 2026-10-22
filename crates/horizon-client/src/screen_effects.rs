@@ -24,6 +24,8 @@ pub struct ScreenVertex {
     /// Atlas rectangle (u0, v0, u1, v1) of the sprite.
     pub rect: [f32; 4],
     pub color: [f32; 4],
+    /// TextureMetadataSection blur/clamp (0 or 1) resolved per sprite.
+    pub sampling: [f32; 2],
 }
 #[derive(Clone, Debug)]
 pub struct ScreenQuad {
@@ -34,6 +36,7 @@ pub struct ScreenQuad {
 /// What the camera sees this frame.
 pub struct ScreenInputs<'a> {
     pub sprites: &'a HashMap<String, Rect>,
+    pub sampling: &'a HashMap<String, crate::hud::TextureSampling>,
     pub aspect: f32,
     pub partial: f32,
     /// Particle sprite of the view-blocking block around the eye.
@@ -92,17 +95,24 @@ impl ScreenEffects {
     pub fn build(&self, input: &ScreenInputs) -> Vec<ScreenQuad> {
         let mut out = Vec::new();
         let sprite = |name: &str| input.sprites.get(name).map(|r| [r.u0, r.v0, r.u1, r.v1]);
+        let sampling = |name: &str| input.sampling.get(name).copied().unwrap_or_default();
+        let flags = |name: &str| {
+            let flags = sampling(name);
+            [f32::from(flags.blur), f32::from(flags.clamp)]
+        };
         let scale = hand_scale(input.aspect);
         // Screen-effect quads live at view depth 0.5 in the hand projection.
         let hand_quad = |corners: [[f32; 2]; 4],
                          uv: [[f32; 2]; 4],
                          rect: [f32; 4],
-                         color: [f32; 4]| ScreenQuad {
+                         color: [f32; 4],
+                         sampling: [f32; 2]| ScreenQuad {
             vertices: std::array::from_fn(|i| ScreenVertex {
                 pos: [corners[i][0] * scale[0], corners[i][1] * scale[1]],
                 uv: uv[i],
                 rect,
                 color,
+                sampling,
             }),
             blend: Blend::Alpha,
         };
@@ -117,6 +127,7 @@ impl ScreenEffects {
                 [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
                 rect,
                 [c, c, c, 1.0],
+                flags(name),
             ));
         }
         if let Some((brightness, yaw, pitch)) = input.water
@@ -129,6 +140,7 @@ impl ScreenEffects {
                 uv,
                 rect,
                 [brightness, brightness, brightness, 0.1],
+                flags("misc/underwater"),
             ));
         }
         if input.on_fire
@@ -150,11 +162,12 @@ impl ScreenEffects {
                     [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
                     rect,
                     [1.0, 1.0, 1.0, alpha],
+                    flags("block/fire_1"),
                 ));
             }
         }
         // Hud camera overlays: GUI-space full-screen blits (v grows downwards).
-        let gui = |rect: [f32; 4], color: [f32; 4], blend: Blend| ScreenQuad {
+        let gui = |rect: [f32; 4], color: [f32; 4], blend: Blend, sampling: [f32; 2]| ScreenQuad {
             vertices: std::array::from_fn(|i| {
                 let p = [[-1.0f32, 1.0], [1.0, 1.0], [1.0, -1.0], [-1.0, -1.0]][i];
                 ScreenVertex {
@@ -162,6 +175,7 @@ impl ScreenEffects {
                     uv: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]][i],
                     rect,
                     color,
+                    sampling,
                 }
             }),
             blend,
@@ -188,7 +202,7 @@ impl ScreenEffects {
                         Blend::Alpha
                     };
                     if let Some(rect) = sprite(texture) {
-                        out.push(gui(rect, rgba(*color), blend));
+                        out.push(gui(rect, rgba(*color), blend, flags(texture)));
                     }
                 }
                 GuiDraw::AtlasSprite {
@@ -197,7 +211,7 @@ impl ScreenEffects {
                     ..
                 } => {
                     if let Some(rect) = sprite(name) {
-                        out.push(gui(rect, rgba(*color), Blend::Alpha));
+                        out.push(gui(rect, rgba(*color), Blend::Alpha, flags(name)));
                     }
                 }
                 _ => {}
@@ -229,6 +243,110 @@ mod tests {
         assert!(e.vignette_brightness < 1.0);
     }
     #[test]
+    fn shader_understands_sprite_local_bilinear_and_wrap_sampling() {
+        let shader = naga::front::wgsl::parse_str(include_str!("screen.wgsl")).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&shader)
+        .unwrap();
+    }
+
+    #[test]
+    fn blur_and_clamp_are_independent_for_each_overlay() {
+        let sprites = HashMap::from([
+            (
+                "misc/vignette".to_owned(),
+                Rect {
+                    u0: 0.1,
+                    v0: 0.1,
+                    u1: 0.2,
+                    v1: 0.2,
+                    w: 16,
+                    h: 16,
+                },
+            ),
+            (
+                "misc/underwater".to_owned(),
+                Rect {
+                    u0: 0.3,
+                    v0: 0.3,
+                    u1: 0.4,
+                    v1: 0.4,
+                    w: 16,
+                    h: 16,
+                },
+            ),
+        ]);
+        let sampling = HashMap::from([
+            (
+                "misc/vignette".to_owned(),
+                crate::hud::TextureSampling {
+                    blur: true,
+                    clamp: false,
+                },
+            ),
+            (
+                "misc/underwater".to_owned(),
+                crate::hud::TextureSampling {
+                    blur: false,
+                    clamp: true,
+                },
+            ),
+        ]);
+        let input = ScreenInputs {
+            sprites: &sprites,
+            sampling: &sampling,
+            aspect: 1.6,
+            partial: 0.0,
+            block_overlay: None,
+            water: Some((1.0, 0.0, 0.0)),
+            on_fire: false,
+            gui_overlays: &[crate::hud_overlays::vignette(320, 240, 1.0, 0.0)],
+        };
+        let quads = ScreenEffects::default().build(&input);
+        assert_eq!(quads.len(), 2);
+        assert_eq!(quads[0].vertices[0].sampling, [0.0, 1.0]);
+        assert_eq!(quads[1].vertices[0].sampling, [1.0, 0.0]);
+    }
+
+    #[test]
+    fn vignette_sampling_is_read_from_the_texture_not_the_pipeline() {
+        let sprites = HashMap::from([(
+            "misc/vignette".to_owned(),
+            Rect {
+                u0: 0.125,
+                v0: 0.25,
+                u1: 0.375,
+                v1: 0.75,
+                w: 16,
+                h: 16,
+            },
+        )]);
+        let sampling = HashMap::from([(
+            "misc/vignette".to_owned(),
+            crate::hud::TextureSampling {
+                blur: true,
+                clamp: true,
+            },
+        )]);
+        let input = ScreenInputs {
+            sprites: &sprites,
+            sampling: &sampling,
+            aspect: 1.6,
+            partial: 0.0,
+            block_overlay: None,
+            water: None,
+            on_fire: false,
+            gui_overlays: &[crate::hud_overlays::vignette(320, 240, 1.0, 0.0)],
+        };
+        let quad = ScreenEffects::default().build(&input).remove(0);
+        assert_eq!(quad.vertices[0].sampling, [1.0, 1.0]);
+        assert_eq!(quad.blend, Blend::Vignette);
+    }
+
+    #[test]
     fn overlays_need_their_sprites() {
         let mut sprites = HashMap::new();
         sprites.insert(
@@ -245,6 +363,7 @@ mod tests {
         let e = ScreenEffects::default();
         let input = ScreenInputs {
             sprites: &sprites,
+            sampling: &HashMap::new(),
             aspect: 1.6,
             partial: 0.0,
             block_overlay: None,

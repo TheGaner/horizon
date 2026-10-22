@@ -706,6 +706,8 @@ impl<'a> Ui<'a> {
                 uv: [cu, cv],
                 color: c[i],
                 depth: 0.0,
+                sample_rect: [0.0; 4],
+                sample_flags: [0.0; 4],
             });
         }
     }
