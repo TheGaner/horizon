@@ -8,8 +8,10 @@ global packet order. Compare observed packet streams per receiver and script
 stage, retaining both strict-order and unordered event-set comparisons.
 
 The original-codec driver sends valid packets, not physical GLFW keypresses.
-The inventory click driver deliberately supplies an EMPTY client delta to test
-server reconciliation (rather than mimicking vanilla UI prediction).
+The original click/throw commands deliberately supply an EMPTY client delta
+to test server reconciliation. Opt-in predictclick/predictthrow commands use
+vanilla's HashedStack codec and locally predicted menu/cursor stacks instead;
+keep the two input models as separate regression batches.
 
 Run with source ../scripts/horizon_parity_env.sh then
   python3 tools/test_packet_order_parity.py
@@ -74,7 +76,7 @@ def case(family, label, console=(), actions=(), *, clear_drops=True):
     # setup and the measured action in separate, settled script stages.
     actions = list(actions)
     first_action = next((i for i, a in enumerate(actions)
-                         if a.startswith(('drop ', 'throw ', 'click '))), len(actions))
+                         if a.startswith(('drop ', 'throw ', 'click ', 'predictthrow ', 'predictclick '))), len(actions))
     prepare, execute = actions[:first_action], actions[first_action:]
     assert execute, label
     # Even a previous selection or menu cursor pickup must not leak into an
@@ -83,6 +85,12 @@ def case(family, label, console=(), actions=(), *, clear_drops=True):
     setup = ['select Alice 0', 'select Bob 0']
     if family == 'menu-click':
         setup.append('click Alice -999:0:PICKUP')
+    if family.startswith('predicted-'):
+        # The predicted cursor reset can itself drop a stack. It MUST run
+        # before the following stage's kill-entities command; otherwise
+        # surviving reset drops can merge with the measured item's stack.
+        SCRIPT.append((label+'-cursor-reset', [],
+                       ['predictclick Alice -999:0:PICKUP']))
     setup.extend(prepare)
     SCRIPT.append((label+'-prepare',
                    (['kill @e[type=minecraft:item]'] if clear_drops else []) + list(console), setup))
@@ -164,6 +172,31 @@ case('menu-click','swap-hotbar', actions=[
 case('menu-click','pickup-empty-slot', actions=[
     replace('Alice','inventory.10','air',1), 'click Alice 19:0:PICKUP'])
 
+# Batch F: opt-in *locally predicted* Java 26.3 menu clicks. These are
+# intentionally separate from the adversarial empty-changedSlots tests above.
+for count in (1, 2, 8, 64):
+    for mode in ('single','all'):
+        case('predicted-throw', f'predicted-{mode}-stick-{count}', actions=[
+            replace('Alice','hotbar.0','stick',count), f'predictthrow Alice {mode}:36'])
+case('predicted-click','predicted-pickup-left', actions=[
+    replace('Alice','hotbar.0','stick',8), 'predictclick Alice 36:0:PICKUP'])
+case('predicted-click','predicted-pickup-right', actions=[
+    replace('Alice','hotbar.0','stick',8), 'predictclick Alice 36:1:PICKUP'])
+case('predicted-click','predicted-pickup-outside-all', actions=[
+    replace('Alice','hotbar.0','stick',8), 'predictclick Alice 36:0:PICKUP',
+    'predictclick Alice -999:0:PICKUP'])
+case('predicted-click','predicted-pickup-outside-one', actions=[
+    replace('Alice','hotbar.0','stick',8), 'predictclick Alice 36:1:PICKUP',
+    'predictclick Alice -999:1:PICKUP'])
+case('predicted-click','predicted-pickup-empty-slot', actions=[
+    replace('Alice','inventory.10','air',1), 'predictclick Alice 19:0:PICKUP'])
+case('predicted-rapid','predicted-same-step-throw-then-drop', actions=[
+    replace('Alice','hotbar.0','stick',9), 'predictthrow Alice single:36',
+    'drop Alice all'])
+case('predicted-rapid','predicted-same-step-drop-then-throw', actions=[
+    replace('Alice','hotbar.0','stick',9), 'drop Alice single',
+    'predictthrow Alice all:36'])
+
 SCRIPT.append(('done', [], ['items off', 'state off']))
 
 # Observe only packet types whose fields are normalized by the original codec.
@@ -219,7 +252,7 @@ def assess(vanilla, horizon, cases=None):
     # success. Vanilla may intentionally reject some inputs, or a stateful
     # rate limit may suppress it; expose these as coverage gaps for review.
     expected_spawns={'hotbar-drop','gui-throw','gui-slots','selection',
-                     'rapid-actions','two-player'}
+                     'rapid-actions','two-player','predicted-throw','predicted-rapid'}
     unobserved=[]
     for label, family in FAMILIES.items():
         if label not in selected or family not in expected_spawns:
@@ -271,6 +304,12 @@ def main():
         'hotbar': {'hotbar-drop','hotbar-empty','selection','rapid-actions'},
         'gui': {'gui-throw','gui-empty','gui-slots'},
         'multiplayer-menus': {'two-player','menu-click'},
+        # All predicted cases remain strict, and may deliberately fail from
+        # cross-item same-tick metadata interleaving. Keep the stable
+        # predicted client-input behavior as a separate permanent CI gate.
+        'predicted': {'predicted-throw','predicted-click','predicted-rapid'},
+        'predicted-stable': {'predicted-throw','predicted-click'},
+        'predicted-rapid': {'predicted-rapid'},
     }
     assert set().union(*batches.values())==set(FAMILIES.values())
     if len(sys.argv)>1:
@@ -288,7 +327,13 @@ def main():
             directory.mkdir(exist_ok=True)
             selected={key for key,family in FAMILIES.items() if family in families}
             loc.SCRIPT=SCRIPT[:3]+[stage for stage in SCRIPT[3:-1]
-                                  if stage[0] in selected or stage[0].removesuffix('-prepare') in selected]+SCRIPT[-1:]
+                                  if stage[0] in selected
+                                  or stage[0].removesuffix('-prepare') in selected
+                                  or stage[0].removesuffix('-cursor-reset') in selected]+SCRIPT[-1:]
+            if batch_name.startswith('predicted'):
+                reset_stages = {stage[0].removesuffix('-cursor-reset')
+                                for stage in loc.SCRIPT if stage[0].endswith('-cursor-reset')}
+                assert reset_stages == selected, ('cursor cleanup stage coverage', sorted(selected - reset_stages))
             print(f'Running {batch_name}: {len(selected)} cases, {len(loc.SCRIPT)} stages',flush=True)
             left=loc.run_side('vanilla',vanilla_server,client,directory,world)
             right=loc.run_side('horizon',horizon_server,client,directory,world)

@@ -137,6 +137,8 @@ public final class LocatorBarClient {
                     case "objectives" -> objectiveWire = w[1].equals("on");
                     case "drop" -> players.get(w[1]).drop(w[2]);
                     case "throw" -> players.get(w[1]).throwInventorySlot(w[2]);
+                    case "predictthrow" -> players.get(w[1]).predictedThrow(w[2]);
+                    case "predictclick" -> players.get(w[1]).predictedClick(w[2]);
                     case "select" -> players.get(w[1]).selectHotbar(Integer.parseInt(w[2]));
                     case "click" -> players.get(w[1]).clickInventory(w[2]);
                     case "end" -> {
@@ -204,6 +206,13 @@ public final class LocatorBarClient {
         private int replies;
         /** Last inventory menu state so GUI Q uses the real menu sequence. */
         private volatile int inventoryStateId;
+        /** Original-codec GUI prediction is deliberately opt-in; normal click/throw
+         * remains the adversarial empty-delta test. This state follows every
+         * server inventory packet, even with state telemetry disabled. */
+        private final Object menuLock = new Object();
+        private final Map<Integer, net.minecraft.world.item.ItemStack> menuSlots = new java.util.HashMap<>();
+        private net.minecraft.world.item.ItemStack menuCarried = net.minecraft.world.item.ItemStack.EMPTY;
+        private boolean menuInitialized;
         /** Track dropped items by entity id, but never compare the random id. */
         private final java.util.Set<Integer> itemEntities = java.util.concurrent.ConcurrentHashMap.newKeySet();
         /** Mapped only within one TCP receiver, not between servers/players. */
@@ -270,6 +279,144 @@ public final class LocatorBarClient {
                 new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>(),
                 net.minecraft.network.HashedStack.EMPTY));
             record("sent gui " + spec + " button=" + button);
+        }
+
+        /** Keep authoritative menu snapshots distinct from client prediction.
+         * Menu 0 maps main inventory indices 9..35 to the same menu slots,
+         * hotbar indices 0..8 to menu slots 36..44, and offhand 40 to 45.
+         */
+        private void receiveMenu(Packet<?> p) {
+            synchronized (menuLock) {
+                if (p instanceof net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket c
+                    && c.containerId() == 0) {
+                    menuSlots.clear();
+                    for (int i = 0; i < c.items().size(); i++) menuSlots.put(i, c.items().get(i).copy());
+                    menuCarried = c.carriedItem().copy();
+                    inventoryStateId = c.stateId();
+                    menuInitialized = true;
+                } else if (p instanceof net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket c) {
+                    if (c.getContainerId() == 0) {
+                        menuSlots.put(c.getSlot(), c.getItem().copy());
+                        inventoryStateId = c.getStateId();
+                        menuInitialized = true;
+                    } else if (c.getContainerId() == -1 && c.getSlot() == -1) {
+                        menuCarried = c.getItem().copy();
+                    }
+                } else if (p instanceof net.minecraft.network.protocol.game.ClientboundSetCursorItemPacket c) {
+                    // Vanilla's client cursor is authoritative on correction;
+                    // otherwise a predicted pickup can contaminate later cases.
+                    menuCarried = c.contents().copy();
+                } else if (p instanceof net.minecraft.network.protocol.game.ClientboundSetPlayerInventoryPacket i) {
+                    int slot = i.slot();
+                    int menu = slot <= 8 ? 36 + slot : slot <= 35 ? slot : slot <= 39 ? 8 - (slot - 36) : slot == 40 ? 45 : -1;
+                    if (menu >= 0 && slot >= 0) {
+                        menuSlots.put(menu, i.contents().copy());
+                        menuInitialized = true;
+                    }
+                }
+            }
+        }
+
+        /** Vanilla HashedStack.create handles normal item IDs/counts and an
+         * empty component patch. Refuse custom patches rather than fabricating
+         * the decorated registry hash used by the real Java client. */
+        private static net.minecraft.network.HashedStack knownHash(net.minecraft.world.item.ItemStack stack) {
+            if (!stack.isEmpty() && !stack.getComponentsPatch().isEmpty()) {
+                throw new IllegalArgumentException("component-hashed predicted items require registry hash generator");
+            }
+            return net.minecraft.network.HashedStack.create(stack,
+                component -> { throw new IllegalStateException("unexpected custom component hash"); });
+        }
+
+        private void sendPredicted(short slot, byte button, net.minecraft.world.inventory.ContainerInput mode,
+                                   net.minecraft.world.item.ItemStack next, boolean changed,
+                                   net.minecraft.world.item.ItemStack nextCursor) throws Exception {
+            if (!menuInitialized) throw new IllegalStateException("no observed inventory slots for predicted click");
+            // Fail *before* mutating the local prediction if a hash is unavailable.
+            var changedSlots = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<net.minecraft.network.HashedStack>();
+            if (changed) changedSlots.put(slot & 0xffff, knownHash(next));
+            var carried = knownHash(nextCursor);
+            int stateId = inventoryStateId;
+            send(new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(
+                0, stateId, slot, button, mode, changedSlots, carried));
+            if (changed) menuSlots.put((int) slot, next.copy());
+            menuCarried = nextCursor.copy();
+        }
+
+        /** Real Java UI prediction for THROW: locally decrement slot, then send
+         * its hashed changed value rather than the legacy empty change map. */
+        void predictedThrow(String spec) throws Exception {
+            String[] parts = spec.split(":", -1);
+            if (parts.length > 2) throw new IllegalArgumentException("predictthrow " + spec);
+            byte button = switch (parts[0]) {
+                case "single" -> 0;
+                case "all" -> 1;
+                default -> throw new IllegalArgumentException("predictthrow mode " + spec);
+            };
+            short slot = (short) (parts.length == 2 ? Integer.parseInt(parts[1]) : 36);
+            synchronized (menuLock) {
+                var before = menuSlots.get(slot & 0xffff);
+                if (before == null) throw new IllegalStateException("unknown predicted slot " + slot);
+                var after = before.copy();
+                if (!after.isEmpty()) {
+                    if (button == 1 || after.getCount() == 1) after = net.minecraft.world.item.ItemStack.EMPTY;
+                    else after.shrink(1);
+                }
+                sendPredicted(slot, button, net.minecraft.world.inventory.ContainerInput.THROW,
+                    after, !net.minecraft.world.item.ItemStack.matches(before, after), menuCarried);
+            }
+            record("sent predicted-gui " + spec);
+        }
+
+        /** Narrow vanilla PICKUP subset with fully known plain stacks. Clicks
+         * with custom components or unknown slots explicitly fail this oracle. */
+        void predictedClick(String spec) throws Exception {
+            String[] parts = spec.split(":", -1);
+            if (parts.length != 3 || !parts[2].equals("PICKUP"))
+                throw new IllegalArgumentException("predictclick supports PICKUP only: " + spec);
+            short slot = Short.parseShort(parts[0]);
+            byte button = Byte.parseByte(parts[1]);
+            if (button != 0 && button != 1) throw new IllegalArgumentException("PICKUP button " + button);
+            synchronized (menuLock) {
+                var cursor = menuCarried.copy();
+                if (slot == -999) {
+                    if (!cursor.isEmpty()) {
+                        if (button == 0 || cursor.getCount() == 1) cursor = net.minecraft.world.item.ItemStack.EMPTY;
+                        else cursor.shrink(1);
+                    }
+                    sendPredicted(slot, button, net.minecraft.world.inventory.ContainerInput.PICKUP,
+                        net.minecraft.world.item.ItemStack.EMPTY, false, cursor);
+                } else {
+                    var old = menuSlots.get((int) slot);
+                    if (old == null) throw new IllegalStateException("unknown predicted slot " + slot);
+                    var next = old.copy();
+                    if (cursor.isEmpty()) {
+                        if (!next.isEmpty()) {
+                            int count = button == 0 ? next.getCount() : (next.getCount() + 1) / 2;
+                            cursor = next.copy();
+                            cursor.setCount(count);
+                            next.shrink(count);
+                        }
+                    } else if (next.isEmpty()) {
+                        next = cursor.copy();
+                        if (button == 1) {
+                            next.setCount(1);
+                            cursor.shrink(1);
+                        } else cursor = net.minecraft.world.item.ItemStack.EMPTY;
+                    } else if (net.minecraft.world.item.ItemStack.isSameItemSameComponents(next, cursor)) {
+                        int room = next.getMaxStackSize() - next.getCount();
+                        int count = Math.min(cursor.getCount(), button == 1 ? Math.min(1, room) : room);
+                        if (count > 0) { next.grow(count); cursor.shrink(count); }
+                    } else if (button == 0) {
+                        var swap = next;
+                        next = cursor;
+                        cursor = swap;
+                    } else throw new IllegalArgumentException("different-item right-click not in supported oracle");
+                    sendPredicted(slot, button, net.minecraft.world.inventory.ContainerInput.PICKUP,
+                        next, !net.minecraft.world.item.ItemStack.matches(old, next), cursor);
+                }
+            }
+            record("sent predicted-click " + spec);
         }
 
         /** Uses the 26.3 vanilla codec for hotbar changes; 0..8 is a client slot. */
@@ -372,6 +519,7 @@ public final class LocatorBarClient {
                     if (p instanceof net.minecraft.network.protocol.game.ClientboundLoginPacket l) {
                         id = l.playerId();
                     }
+                    receiveMenu(p);
                     if (state) recordState(p);
                     if ((items || entityLife)
                         && p instanceof net.minecraft.network.protocol.game.ClientboundAddEntityPacket a
