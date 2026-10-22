@@ -111,7 +111,8 @@ struct Globals {
     fog_ends: [f32; 4],
     /// Atlas rects (u0, v0, width, height) of end_sky.png and end_portal.png.
     end_portal_sprites: [[f32; 4]; 2],
-    /// x: vanilla's `GameTime` uniform; y: nether cardinal lighting, zw unused.
+    /// x: vanilla's `GameTime` uniform; y: nether cardinal lighting; z: how many
+    /// `dynamic_lights` are set; w unused.
     time: [f32; 4],
     /// Atlas rect of a destroy stage (entity.wgsl takes only its size: every stage's is the same,
     /// and each crack carries its own stage's origin).
@@ -122,6 +123,8 @@ struct Globals {
     shadow_rect: [f32; 4],
     /// PNG.mcmeta texture blur/clamp override, from selected packs.
     shadow_sampling: [f32; 4],
+    /// Horizon Extras' dynamic lights: camera-relative position and level.
+    dynamic_lights: [[f32; 4]; crate::dynamic_light::MAX],
 }
 pub type SectionKey = (i32, i32, i32);
 struct SectionGpu {
@@ -194,6 +197,8 @@ pub struct Frame<'a> {
     pub nether_lighting: bool,
     /// Camera-relative entity geometry textured from the shared atlas.
     pub entities: &'a [Vertex],
+    /// Horizon Extras' dynamic lights, nearest first (`dynamic_light::select`); empty when off.
+    pub dynamic_lights: &'a [[f32; 4]],
     /// Cloud mesh inputs; geometry and GPU storage are retained by the renderer.
     pub clouds: Option<crate::clouds::Input<'a>>,
     /// Additive translucent geometry after the entities (lightning, dragon rays).
@@ -2933,12 +2938,19 @@ impl Renderer {
             time: [
                 frame.shader_game_time,
                 f32::from(frame.nether_lighting),
-                0.0,
+                frame.dynamic_lights.len().min(crate::dynamic_light::MAX) as f32,
                 0.0,
             ],
             outline_params: outline_params(self.config.width, self.config.height),
             shadow_rect: frame.shadow_rect,
             shadow_sampling: frame.shadow_sampling,
+            dynamic_lights: {
+                let mut lights = [[0.0; 4]; crate::dynamic_light::MAX];
+                for (to, from) in lights.iter_mut().zip(frame.dynamic_lights) {
+                    *to = *from;
+                }
+                lights
+            },
         };
         self.uploads
             .buffer(&mut encoder, &self.globals, 0, bytemuck::bytes_of(&globals));
