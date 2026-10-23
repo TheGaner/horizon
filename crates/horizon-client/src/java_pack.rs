@@ -273,20 +273,21 @@ mod tests {
         for path in entries {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             match load(&path, &BTreeMap::new(), "Apple", "Apple M4 Pro") {
-                Ok(pack) if let Some(e) = reparse_error(&pack) => {
-                    println!("{name}: {e}");
-                    failures.push(name);
-                }
                 Ok(pack) => {
-                    let folders: Vec<String> = pack
-                        .folders
-                        .iter()
-                        .map(|f| {
-                            let n = f.passes.len() + usize::from(f.final_pass.is_some());
-                            format!("{} {n} passes", f.folder)
-                        })
-                        .collect();
-                    println!("{name}: loads ({})", folders.join(", "));
+                    if let Some(e) = reparse_error(&pack) {
+                        println!("{name}: {e}");
+                        failures.push(name);
+                    } else {
+                        let folders: Vec<String> = pack
+                            .folders
+                            .iter()
+                            .map(|f| {
+                                let n = f.passes.len() + usize::from(f.final_pass.is_some());
+                                format!("{} {n} passes", f.folder)
+                            })
+                            .collect();
+                        println!("{name}: loads ({})", folders.join(", "));
+                    }
                 }
                 Err(e) => {
                     println!("{name}: {e}");
