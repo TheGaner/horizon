@@ -810,11 +810,10 @@ impl Game<'_> {
                         None => break,
                     },
                 };
-                // AIR is Items.AIR's empty stack, never an inventory item.
-                // Keeping Some(air) makes a later Q drop spawn a ghost item
-                // entity with empty item metadata, unlike Java 26.3.
-                let item = item.filter(|stack| &*stack.item != "minecraft:air");
-                if self.slot_get(slot) != item && self.slot_set(slot, item) {
+                // ItemStack.isEmpty: air (or a count of 0) is an empty slot.
+                // SlotAccess.set counts every slot it sets, the same item too.
+                let item = item.filter(|s| &*s.item != "minecraft:air" && s.count > 0);
+                if self.slot_set(slot, item) {
                     changed += 1;
                 }
             }
