@@ -192,7 +192,7 @@ impl TileIndex {
                         let rel = origin(key, camera);
                         Some(((rel + DVec3::splat(8.0)).length_squared(), rel.as_vec3()))
                     } else if mask == 0b11_1111 {
-                        in_frustum(key, camera, frustum)
+                        in_frustum(key, camera, frustum, false)
                     } else {
                         let rel = origin(key, camera);
                         let pos = rel.as_vec3();
