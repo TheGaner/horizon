@@ -112,14 +112,15 @@ impl Shared {
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
     }
-    /// Rebuild the code from the invite and the relay's short code.
-    fn publish(&self, short: Option<Code>) {
+    /// Publish only the currently registered relay in the full invite.
+    /// The configured relay pool is never leaked as a single invalid address.
+    fn publish(&self, short: Option<Code>, active_relay: Option<&str>) {
         let text = {
             let mut invite = self.invite.lock().unwrap();
             let Some(inv) = invite.as_mut() else { return };
-            inv.relay = match (&short, &self.config.relay) {
+            inv.relay = match (&short, active_relay) {
                 (Some(code), Some(address)) => Some(RelayRef {
-                    address: address.clone(),
+                    address: address.to_owned(),
                     code: code.clone(),
                 }),
                 _ => None,
@@ -253,7 +254,7 @@ fn share(shared: Arc<Shared>, port: u16) {
     if shared.stopped() {
         return;
     }
-    shared.publish(None);
+    shared.publish(None, None);
     let relay = match &config.relay {
         Some(r) => {
             let s = shared.clone();
@@ -396,28 +397,47 @@ fn connect_relay(relay: &str, port: Option<u16>) -> io::Result<(TcpStream, Socke
     Err(last)
 }
 
-/// Register, serve the control connection, register again when it drops
-/// (a new short code) until stopped.
+/// Relays are tried in user preference order. On a failed registration or
+/// dropped connection we advance to the next candidate instead of endlessly
+/// retrying a dead server. Once a relay succeeds, short codes remain scoped
+/// to that relay until it drops (the active address goes in the full invite).
 fn run_relay(shared: Arc<Shared>, relay: String) {
+    let candidates = crate::relay_candidates(&relay);
+    if candidates.is_empty() {
+        shared.state.lock().unwrap().relay_problem = Some("No relay address configured".into());
+        return;
+    }
+    let mut index = 0;
     let mut backoff = Duration::from_secs(1);
     while !shared.stopped() {
-        match register(&shared, &relay) {
+        let current = candidates[index];
+        match register(&shared, current) {
             Ok(()) => {
                 backoff = Duration::from_secs(1);
                 shared.state.lock().unwrap().relay_problem = None;
+                if shared.stopped() {
+                    break;
+                }
+                // Normal registration ends when the host retires a guessed
+                // short code. Re-register on the same healthy relay.
             }
             Err(e) => {
                 if shared.stopped() {
                     break;
                 }
                 shared.state.lock().unwrap().relay_problem =
-                    Some(format!("Couldn't reach the relay {relay}: {e}"));
-                shared.publish(None);
-                let until = Instant::now() + backoff;
-                while Instant::now() < until && !shared.stopped() {
-                    std::thread::sleep(Duration::from_millis(50));
+                    Some(format!("Couldn't reach the relay {current}: {e}"));
+                shared.publish(None, None);
+                index = (index + 1) % candidates.len();
+                // Try other relays immediately; only back off after a full
+                // failed pass so one dead endpoint does not delay recovery.
+                if index == 0 {
+                    let until = Instant::now() + backoff;
+                    while Instant::now() < until && !shared.stopped() {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(30));
                 }
-                backoff = (backoff * 2).min(Duration::from_secs(30));
             }
         }
     }
@@ -449,13 +469,16 @@ fn register(shared: &Arc<Shared>, relay_url: &str) -> io::Result<()> {
         other => return Err(io::Error::other(format!("unexpected answer {other:?}"))),
     };
     let code = Code::new(&nameplate)?;
+    // A prior candidate may have failed; the new registration is healthy
+    // immediately, not only after the control stream eventually closes.
+    shared.state.lock().unwrap().relay_problem = None;
     *shared.control.lock().unwrap() = Some(control.try_clone()?);
     if shared.stopped() {
         let _ = control.shutdown(Shutdown::Both);
         return Ok(());
     }
     shared.relay_wrong.store(0, Ordering::Relaxed);
-    shared.publish(Some(code.clone()));
+    shared.publish(Some(code.clone()), Some(relay_url));
     loop {
         let message = match wire::recv_buffered::<_, FromRelay>(&mut reader) {
             Ok(m) => m,

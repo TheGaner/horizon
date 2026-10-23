@@ -114,7 +114,22 @@ pub fn join(config: &GuestConfig) -> Result<Tunnel, JoinError> {
     match crate::invite::parse_detailed(&config.code).map_err(JoinError::BadCode)? {
         Parsed::Short(code) => {
             let relay = config.relay.as_deref().ok_or(JoinError::NeedsRelay)?;
-            join_relay(config, relay, &code)
+            let candidates = crate::relay_candidates(relay);
+            if candidates.is_empty() {
+                return Err(JoinError::NeedsRelay);
+            }
+            let mut last = JoinError::NeedsRelay;
+            for relay in candidates {
+                match join_relay(config, relay, &code) {
+                    Ok(tunnel) => return Ok(tunnel),
+                    // A nameplate may exist on a different relay with a
+                    // different secret; try the remaining explicitly trusted
+                    // candidates before concluding the short code is wrong.
+                    Err(e @ (JoinError::WrongCode | JoinError::RateLimited)) => return Err(e),
+                    Err(e) => last = e,
+                }
+            }
+            Err(last)
         }
         Parsed::Long(invite) => {
             if config.path != PathMode::RelayOnly

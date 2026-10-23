@@ -95,6 +95,22 @@ pub fn relay_url() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Parse an ordered, semicolon-separated relay pool. Preserve the existing
+/// single `host:port` configuration and ignore duplicate entries. Keep a
+/// small bound on untrusted configuration to limit failed dial attempts.
+pub(crate) fn relay_candidates(spec: &str) -> Vec<&str> {
+    let mut relays = Vec::new();
+    for candidate in spec.split(';').map(str::trim).filter(|r| !r.is_empty()) {
+        if !relays.contains(&candidate) {
+            relays.push(candidate);
+        }
+        if relays.len() == 8 {
+            break;
+        }
+    }
+    relays
+}
+
 /// `host:port`, optionally written `tcp://host:port`.
 pub fn resolve_relay(url: &str) -> io::Result<Vec<SocketAddr>> {
     let address = url
@@ -186,5 +202,22 @@ mod tests {
             e.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
         ));
+    }
+}
+
+#[cfg(test)]
+mod relay_pool_tests {
+    #[test]
+    fn bounded_ordered_relay_candidates() {
+        assert_eq!(
+            super::relay_candidates("  relay-a:7000; relay-b:7000;;relay-a:7000 ;"),
+            ["relay-a:7000", "relay-b:7000"]
+        );
+        assert!(super::relay_candidates("; ; ").is_empty());
+        let list = (0..10)
+            .map(|n| format!("relay-{n}:7000"))
+            .collect::<Vec<_>>()
+            .join(";");
+        assert_eq!(super::relay_candidates(&list).len(), 8);
     }
 }

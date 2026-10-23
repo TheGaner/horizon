@@ -122,6 +122,19 @@ There is no default relay. With one configured:
 Configuring it: the **Relay** field on the Join a friend page (saved to `horizon.txt` as
 `friendsRelay:host:port`, used for hosting too), or `HORIZON_RELAY_URL`.
 
+**Optional relay failover (networking branch):** The same setting can hold up to eight
+semicolon-separated `host:port` addresses, in preferred order (for example,
+`HORIZON_RELAY_URL='relay-a.example:7000;relay-b.example:7000'`). The host tries
+another relay after registration or control-stream failures; a complete failed
+pass gets exponential backoff. The invitation code names **only the relay
+actually serving the host**, so a guest joining with the full code requires
+no matching relay configuration. A guest entering just the eight-character
+short code may supply the same trusted relay list, which it tries in order;
+otherwise enter the active relay address individually. Duplicate or blank
+entries are ignored. This does not provide public relays or proximity-based
+routing: the player still needs reachable, configured relay servers. Existing
+single-address settings and direct connections remain supported.
+
 ### Running your own relay
 
 The relay needs one TCP port reachable by your friends and almost nothing else (a few MB of memory, no

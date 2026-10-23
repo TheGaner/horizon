@@ -203,6 +203,33 @@ fn a_short_code_through_a_self_hosted_relay() {
 }
 
 #[test]
+fn relay_pool_skips_dead_first_relay_and_publishes_only_the_live_address() {
+    // Reserve a local port and release it, leaving an unreachable first hop.
+    let dead = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let dead_address = dead.local_addr().unwrap().to_string();
+    drop(dead);
+    let (_relay, address) = relay(generous());
+    let pool = format!("{dead_address}; {address}; {address}");
+    let host = start(Some(&pool), PathMode::RelayOnly);
+    let (code, short) = invite_of(&host, true);
+    let full = long(&code);
+    let relay_ref = full.relay.unwrap();
+    assert!(host.state().relay_problem.is_none());
+    assert_eq!(relay_ref.address, address);
+    assert_eq!(short.unwrap(), relay_ref.code);
+    let tunnel = join(&code, None, PathMode::RelayOnly).unwrap();
+    assert!(!tunnel.direct);
+    round_trip(tunnel, b"failover-works");
+    // Short codes work with a trusted relay pool too; the guest must try
+    // the same fallback candidates instead of treating the entire pool as
+    // one invalid host:port string.
+    let short_code = relay_ref.code.to_string();
+    let short_tunnel = join(&short_code, Some(&pool), PathMode::RelayOnly).unwrap();
+    assert!(!short_tunnel.direct);
+    round_trip(short_tunnel, b"short-code-through-pool");
+}
+
+#[test]
 fn unreachable_endpoints_fall_back_to_the_relay_in_the_code() {
     let (relay, address) = relay(generous());
     let host = start(Some(&address), PathMode::Auto);
