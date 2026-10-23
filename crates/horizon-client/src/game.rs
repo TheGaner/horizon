@@ -1021,9 +1021,11 @@ pub struct UiResources {
     pub panorama: Arc<horizon_client::gfx::panorama::Faces>,
 }
 impl UiResources {
-    pub fn load(root: &std::path::Path) -> Result<Self> {
+    /// From a resource root layering packs over `defaults`, the game's own
+    /// resources (`root` itself when no pack is on).
+    pub fn load(root: &std::path::Path, defaults: &std::path::Path) -> Result<Self> {
         Ok(Self {
-            atlas: HudAtlas::build(root)?,
+            atlas: HudAtlas::build_over(root, defaults)?,
             panorama: Arc::new(horizon_client::gfx::panorama::Faces::load(root)),
         })
     }
@@ -9564,6 +9566,7 @@ impl Game<'_> {
                 );
                 map.insert("Air".into(), horizon_world::nbt::Tag::Short(p.air as i16));
             }
+            level.fall_distance = p.fall_distance;
 
             level.food = p.health.food.food;
             level.saturation = p.health.food.saturation;
@@ -12131,7 +12134,20 @@ fn load_resources(
     // loads; the synchronous launch instead carries it in `Loaded`.
     let mut loaded_gui = None;
     let mut ui_ready = false;
-    if let Ok(ui) = UiResources::load(&root) {
+    let mut pack_error = None;
+    let ui = match UiResources::load(&root, vanilla_root) {
+        Ok(ui) => Some(ui),
+        // Minecraft.rollbackResourcePacks: the packs' textures don't fit, start
+        // with the game's own resources.
+        Err(e) if root != vanilla_root => {
+            log::warn!("Horizon: resource packs failed to load ({e}); using the default resources");
+            pack_error = Some(e.to_string());
+            root = vanilla_root.to_path_buf();
+            None
+        }
+        Err(_) => None,
+    };
+    if let Some(ui) = ui {
         if menu {
             horizon_client::telemetry::mark_ui_ready();
             log::info!(
@@ -12145,7 +12161,6 @@ fn load_resources(
         ui_ready = true;
     }
     progress.set(0);
-    let mut pack_error = None;
     let (assets, render) = match Assets::load(&root).and_then(|assets| {
         let render = assets.reload(&root)?;
         Ok((assets, render))
@@ -12172,7 +12187,7 @@ fn load_resources(
     let render = Arc::new(render);
     // The menu bundle must come from the same root as the world bundle.
     if !ui_ready || root != requested_root {
-        let ui = UiResources::load(&root)?;
+        let ui = UiResources::load(&root, vanilla_root)?;
         if menu {
             horizon_client::telemetry::mark_ui_ready();
             log::info!(
@@ -12585,6 +12600,10 @@ fn start_game<'a>(
     game.rest_loader = rest_loader;
     game.ui.vanilla_root = vanilla_root;
     if let Some(error) = pack_error {
+        // Minecraft.clearResourcePacksOnError: the selection is cleared and
+        // saved, so the next launch starts without the packs.
+        game.settings.resource_packs.clear();
+        game.settings.save(&Game::options_path());
         game.open_options_at(true, horizon_client::options_ui::Page::Packs);
         game.ui.options.resource_error = Some(error);
     }
