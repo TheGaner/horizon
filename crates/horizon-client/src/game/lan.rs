@@ -23,7 +23,7 @@ use horizon_protocol::{
     entity_data::{Value, serializer},
 };
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
 };
 
@@ -844,6 +844,11 @@ impl Game<'_> {
         if !self.admin_feedback.is_empty() {
             self.send_admin_feedback(&mut host, None);
         }
+        // Commands emit ordered packets independently from the per-guest
+        // end-of-tick scoreboard projection. Track which guests already
+        // received those packets or an authoritative join snapshot.
+        let mut scoreboard_packets_sent = !self.score.pending_packets.is_empty();
+        let mut scoreboard_joined = HashSet::new();
         // Updates produced by command blocks before the LAN poll belong to
         // the players already connected. Send before processing new joins;
         // a new player instead receives one authoritative snapshot below.
@@ -933,6 +938,7 @@ impl Game<'_> {
                     }
                     HostEvent::Joined(conn) => {
                         self.lan_guest_joined(&mut host, conn, state.as_ref(), entities, spawn);
+                        scoreboard_joined.insert(conn);
                         // Late joins receive the authoritative current scoreboard,
                         // rather than mutations delivered to pre-existing guests.
                         for packet in super::scoreboard::scoreboard_network_delta(
@@ -1007,6 +1013,7 @@ impl Game<'_> {
             }
             host.states = states;
         }
+        scoreboard_packets_sent |= !self.score.pending_packets.is_empty();
         // ServerScoreboard mutations during this tick (including individual
         // conditional chain links) go to every online player in source order.
         // Deliver before the tick's end-of-network flush, not as one final
@@ -1022,7 +1029,7 @@ impl Game<'_> {
         self.lan_update_streaming(&host);
         self.lan_update_models(&mut host);
         self.lan_update_waypoints(&mut host, state.as_ref());
-        self.lan_sync_scoreboard(&mut host);
+        self.lan_sync_scoreboard(&mut host, scoreboard_packets_sent, &scoreboard_joined);
         self.lan_sync_border(&mut host);
         drop(holding);
         lan::flush_all(host.hub.guests.iter().map(|g| &g.sender));

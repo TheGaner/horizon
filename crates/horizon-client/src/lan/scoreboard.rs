@@ -117,6 +117,17 @@ impl View {
         }
     }
 
+    /// The server also broadcasts per-mutation objective/score packets.
+    /// Avoid replaying those changes from an end-of-tick snapshot (which
+    /// duplicates or reorders the wire stream). Teams are not in the mutation
+    /// queue and must always be delivered by this per-guest projection.
+    pub fn changes_without_rebroadcast(&self, next: &View) -> Vec<C> {
+        self.changes(next)
+            .into_iter()
+            .filter(|packet| matches!(packet, C::SetPlayerTeam(_)))
+            .collect()
+    }
+
     /// The packets that take a client from `self` to `next`.
     pub fn changes(&self, next: &View) -> Vec<C> {
         let mut out = Vec::new();
@@ -280,6 +291,31 @@ mod tests {
             methods(&reset.changes(&View::of(&board))),
             ["display 1 ", "objective audit 1"]
         );
+    }
+
+    #[test]
+    fn command_mutations_and_join_snapshot_do_not_rebroadcast_scores_but_keep_teams() {
+        let mut board = Scoreboard::default();
+        board.add_objective(
+            "audit",
+            "dummy",
+            json!("Audit"),
+            RenderType::Integer,
+            false,
+            None,
+        );
+        board.score_mut("Alice", "audit").value = 5;
+        board.set_display_objective("sidebar", Some("audit"));
+        board.add_team("red");
+        board.add_to_team("Alice", "red");
+        let next = View::of(&board);
+        assert_eq!(
+            methods(&View::default().changes_without_rebroadcast(&next)),
+            ["team red 0 [\"Alice\"]"]
+        );
+        let all = methods(&View::default().changes(&next));
+        assert!(all.iter().any(|p| p.starts_with("score Alice audit 5")));
+        assert!(all.iter().any(|p| p.starts_with("objective audit 0")));
     }
 
     #[test]

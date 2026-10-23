@@ -493,7 +493,12 @@ impl Game<'_> {
     /// `ServerScoreboard`'s packets: each placed player's client is sent
     /// what changed on the board since it was last sent it (all of it on
     /// joining), lan/scoreboard.rs.
-    pub(super) fn lan_sync_scoreboard(&mut self, host: &mut super::lan::LanHost) {
+    pub(super) fn lan_sync_scoreboard(
+        &mut self,
+        host: &mut super::lan::LanHost,
+        scoreboard_packets_sent: bool,
+        joined_this_tick: &HashSet<u32>,
+    ) {
         if host.hub.guests.iter().all(|g| !g.placed) {
             return;
         }
@@ -501,7 +506,16 @@ impl Game<'_> {
         let view = horizon_client::lan::scoreboard::View::of(&self.score.board);
         for g in host.hub.guests.iter_mut().filter(|g| g.placed) {
             if g.scoreboard != view {
-                g.send_all(&g.scoreboard.changes(&view));
+                // Snapshot sends are still needed for non-command criteria
+                // updates, but command deltas and join snapshots have already
+                // been placed on the wire; replaying them here doubles the
+                // packets and can turn a vanilla null reset into a scoped one.
+                let changes = if scoreboard_packets_sent || joined_this_tick.contains(&g.conn) {
+                    g.scoreboard.changes_without_rebroadcast(&view)
+                } else {
+                    g.scoreboard.changes(&view)
+                };
+                g.send_all(&changes);
                 g.scoreboard = view.clone();
             }
         }
