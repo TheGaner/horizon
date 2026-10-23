@@ -84,6 +84,7 @@ mod level_particles;
 mod levels;
 mod lightning;
 mod llamas;
+mod locator_bar;
 mod loom;
 mod mace;
 mod machines;
@@ -1384,6 +1385,14 @@ struct Game<'a> {
     /// Entities of types Horizon does not simulate.
     others: Vec<commands::OtherEntity>,
     armor_stand_assets: armor_stands::ArmorStandAssets,
+    /// `WaypointStyleManager`.
+    waypoint_styles: horizon_client::locator_bar::WaypointStyles,
+    /// `ClientWaypointManager`: the locator bar's waypoints.
+    waypoints: horizon_client::locator_bar::ClientWaypoints,
+    /// The camera the last frame drew from (position, yaw, pitch, fov), for the locator bar.
+    locator_camera: Option<([f64; 3], f32, f32, f32)>,
+    /// `LocalPlayer.experienceDisplayStartTick`: (last progress, seen a change, tick).
+    experience_display: (f32, bool, u64),
     boats: Vec<boats::Boat>,
     boat_models: boats::BoatModels,
     /// EndCrystalModel's baked layer.
@@ -1406,6 +1415,8 @@ struct Game<'a> {
     /// (least recently shown first).
     skin_downloads: RefCell<horizon_client::skins::Downloader>,
     skin_slots: Vec<(String, usize)>,
+    /// Atlas trim slots in use: (sprite name, slot), least recently drawn first.
+    trim_slots: Vec<(String, usize)>,
     cart_models: minecarts::CartModels,
     /// The boat the player rides.
     riding: Option<u32>,
@@ -3897,6 +3908,7 @@ impl Game<'_> {
             None => 0.0,
         };
         self.ticks += 1;
+        self.track_experience_display();
         // `/tick freeze` stops the world but not the player.
         let running = self.clock.world_runs();
         if running {
@@ -4751,12 +4763,41 @@ impl Game<'_> {
             self.draw_extras(&mut batch);
         }
         if show_hud {
-            // The mount's hearts (and the jump bar that replaces the experience bar).
-            let (vehicle_hearts, jump_bar) = if spectator {
-                (0, false)
+            // Hud.nextContextualInfoState: the jump bar, the experience bar or
+            // the locator bar above the hotbar.
+            let has_experience = !self.creative && !spectator;
+            let contextual = horizon_client::locator_bar::ContextualBar::next(
+                self.waypoints.has_waypoints(),
+                !spectator && self.jumpable_mount(),
+                self.mount_jumping(),
+                has_experience,
+                self.experience_recent(),
+            );
+            use horizon_client::locator_bar::ContextualBar;
+            // The mount's hearts (and the jump bar).
+            let vehicle_hearts = if spectator {
+                0
             } else {
-                self.draw_mount_hud(&mut batch, wi, hi)
+                self.draw_mount_hud(
+                    &mut batch,
+                    wi,
+                    hi,
+                    contextual == ContextualBar::JumpableVehicle,
+                )
             };
+            if contextual == ContextualBar::Locator {
+                let (sprite, [x, y, w, h]) = horizon_client::locator_bar::background(wi, hi);
+                horizon_client::ui::nine_slice(
+                    &mut batch,
+                    &self.gui.atlas,
+                    sprite,
+                    x as f32,
+                    y as f32,
+                    w as f32,
+                    h as f32,
+                    u32::MAX,
+                );
+            }
             if !self.creative
                 && !spectator
                 && let Some(p) = &mut self.player
@@ -4768,7 +4809,7 @@ impl Game<'_> {
                     hi,
                     self.experience.progress,
                     self.experience.level,
-                    !jump_bar,
+                    contextual == ContextualBar::Experience,
                     &width,
                 );
                 hud_layout::paint(&mut batch, atlas, &draws);
@@ -4817,6 +4858,10 @@ impl Game<'_> {
                 };
                 let draws = self.health_hud.layout(&inputs, wi, hi);
                 hud_layout::paint(&mut batch, atlas, &draws);
+            }
+            if contextual == ContextualBar::Locator {
+                let draws = self.locator_bar_draws(wi, hi);
+                hud_layout::paint(&mut batch, &self.gui.atlas, &draws);
             }
             if !spectator {
                 self.draw_selected_name(&mut batch, !self.creative);
@@ -6459,6 +6504,7 @@ impl Game<'_> {
         mut out: Vec<Vertex>,
     ) -> Vec<Vertex> {
         self.prepare_entity_culling(camera);
+        self.prepare_trims();
         let fire_yaw = if self.camera_type == perspective::CameraType::ThirdPersonFront {
             self.yaw + 180.0
         } else {
@@ -7760,6 +7806,7 @@ impl Game<'_> {
         Ok(())
     }
     fn close_world(&mut self) -> Result<()> {
+        self.clear_waypoints();
         self.begin_closing_save(false)
     }
     fn finish_close_world(&mut self) -> Result<()> {
@@ -9779,6 +9826,8 @@ impl Game<'_> {
         } else {
             self.fov_degrees(camera_alpha as f32, camera.to_array())
         };
+        self.locator_camera =
+            (!title).then_some((camera.to_array(), view_yaw, view_pitch, fov_degrees));
         let bob = if title {
             glam::Mat4::IDENTITY
         } else {
@@ -11649,6 +11698,10 @@ impl<'a> Game<'a> {
             armor_stands: Vec::new(),
             others: Vec::new(),
             armor_stand_assets: prepared.armor_stand_assets,
+            waypoint_styles: prepared.waypoint_styles,
+            waypoints: Default::default(),
+            locator_camera: None,
+            experience_display: Default::default(),
             boats: Vec::new(),
             boat_models: prepared.boat_models,
             crystal_model: prepared.crystal_model,
@@ -11669,6 +11722,7 @@ impl<'a> Game<'a> {
                     .join("assets/skins"),
             )),
             skin_slots: Vec::new(),
+            trim_slots: Vec::new(),
             cart_models: prepared.cart_models,
             riding: None,
             ender_items: vec![None; 27],
@@ -11775,6 +11829,7 @@ struct GameCpuResources {
     map_frame_model: frames::FrameModel,
     glow_map_frame_model: frames::FrameModel,
     armor_stand_assets: armor_stands::ArmorStandAssets,
+    waypoint_styles: horizon_client::locator_bar::WaypointStyles,
     boat_models: boats::BoatModels,
     cart_models: minecarts::CartModels,
     crystal_model: Option<horizon_client::mobs::Part>,
@@ -11794,6 +11849,7 @@ impl GameCpuResources {
             map_frame_model: frames::bake_frame(root, "item_frame_map"),
             glow_map_frame_model: frames::bake_frame(root, "glow_item_frame_map"),
             armor_stand_assets: armor_stands::ArmorStandAssets::load(root, document.as_ref()),
+            waypoint_styles: horizon_client::locator_bar::WaypointStyles::load(root),
             boat_models: boats::BoatModels::load(document.as_ref()),
             cart_models: minecarts::CartModels::load(document.as_ref()),
             crystal_model: model("minecraft:end_crystal#main"),
