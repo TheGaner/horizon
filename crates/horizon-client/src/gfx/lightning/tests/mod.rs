@@ -214,13 +214,11 @@ fn long_flash_sequence_keeps_only_active_seeds() {
 #[ignore = "requires GPU; run separately with --ignored --exact"]
 fn retained_gpu_draw_matches_transient_additive_draw() {
     use bytemuck::Zeroable;
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&Default::default())) else {
-        eprintln!("no GPU adapter: skipped");
+    // Reuse the same adapter discovery as all other renderer tests; creating
+    // concurrent wgpu instances can crash Vulkan driver enumeration.
+    let Some((device, queue)) = crate::gfx::test_device::device() else {
         return;
     };
-    eprintln!("lightning differential GPU: {}", adapter.get_info().name);
-    let (device, queue) = pollster::block_on(adapter.request_device(&Default::default())).unwrap();
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Lightning differential shader"),
         source: wgpu::ShaderSource::Wgsl(crate::gfx::entity_shader().into()),
