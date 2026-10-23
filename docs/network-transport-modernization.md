@@ -120,6 +120,46 @@ wire the adapter into the host/guest lifecycle. Add per-client concurrency
 budgets, slowloris/replay tests, multi-guest sessions, and a real CGNAT / relay
 harness before selecting QUIC by default.
 
+## NET-02B — experimental versioned `friendq:` invitations
+
+**Implemented in this topic branch, but still feature-gated and not usable from
+Horizon gameplay UI:** `crates/horizon-friends/src/iroh_invite.rs` adds a strict
+Rust encoder/decoder for a separate `friendq:` prefix. The legacy `friend:`
+v2 TCP + SPAKE2 code, parser and gameplay networking call graph are unchanged.
+
+The experimental V3 binary payload is `HIFQ` magic (4 bytes), version `3`
+(1), Iroh authenticated endpoint public key (32), randomly generated capability
+from `Host::bind_local_random` (32), address count (1, max 8), tagged direct
+IPv4/IPv6 sockets (tag+IP+big-endian port), one optional HTTPS-compatible
+Iroh relay URL (length byte, max 255), and an eight-byte SHA-256 checksum
+prefix for accidental corruption **only**. Crockford Base32 groups of five
+follow existing share-code conventions. Decoder rejects malformed/invalid
+Iroh keys, zero ports, duplicate sockets, oversized text/bytes, invalid tags,
+unsupported versions, trailing binary data, overlong fields, noncanonical
+representations and redundant padding bits. The new token is a *bearer
+credential* and must never be logged or sent as telemetry. The checksum is
+**not a signature**, and does not protect an invite from intentional edits.
+
+`iroh_transport::tests::authenticated_quic_carries_minecraft_tcp_without_public_services`
+now transports actual Minecraft TCP bytes over a localhost Iroh QUIC session
+**using a decoded V3 invitation**, not just an in-memory ticket. Dedicated
+codec tests cover IPv4, IPv6, relay URLs, legacy-v2 separation, corruption,
+duplicate/invalid endpoints, size limits and noncanonical representations.
+Running all tests with `RUSTUP_TOOLCHAIN=1.91.0 cargo test --locked -p
+horizon-friends --features iroh-experimental --lib` exercises both existing
+friends/relay logic and the new codec. This is a localhost proof only; Iroh
+relay discovery, real NAT traversal, PathMode-specific builders, multi-guest
+acceptance, replay controls, connection UI and production security review are
+**not implemented**. An encoded relay URL does not configure a relay, nor
+imply authorization to use a third party's relay service.
+
+The design contract in
+`/home/pc/Projects/horizon-parity-performance/reports/networking/NET-02B-IROH-INVITE-AND-SECURITY-CONTRACT-2026-10-23.md`
+is the basis for continued hardening. Its provisional format sketch differs
+from the implemented V3 payload (no flag byte yet); this section and the
+source module define the **implemented experimental format**. No production
+commit should rely on the experimental format without compatibility review.
+
 ## NET-03 relay discovery and usability
 
 A public relay broker requires **operator-provided infrastructure**. e4mc's
@@ -159,3 +199,8 @@ separately in [`network-kryptonreno-research.md`](network-kryptonreno-research.m
 for follow-on work **after** the native Iroh connection path. These optimizations
 need identical packet-contract tests and A/B profiling; they do not replace
 NAT traversal or offer free access to e4mc public relays.
+
+
+## Combined networking reference library
+
+The [unified optimization research index](network-optimization-research.md) groups the native-Iroh/e4mc connectivity priorities with the [KryptonReno](network-kryptonreno-research.md) and [PulseNet](network-pulsenet-research.md) packet-processing findings. They are independent layers: PulseNet-style packet batching is **not** a substitute for UDP NAT traversal, and Horizon already has an ordered tick-batching implementation. Preserve the original documents and license restrictions; use controlled performance and Java26.3 parity tests before adopting a new packet-level optimization.

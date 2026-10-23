@@ -58,3 +58,8 @@ every complete frame and drains consumed bytes from its persistent buffer;
 that payload to another `Vec`. This is source observation, not a benchmark.
 No KryptonReno-inspired runtime optimization has been implemented or measured
 in this session; all KR tasks remain research/pending after native Iroh work.
+
+
+## Relationship to PulseNet and other network work
+
+The companion [PulseNet research](network-pulsenet-research.md) covers server-side packet scheduling, ordered batching, bounded queues, chunk/bundle correctness and honest performance metrics. The [unified network optimization index](network-optimization-research.md) maps the two backlogs to distinct parts of Horizon's Rust implementation. PulseNet's full high-fidelity source review remains at `/home/pc/Projects/horizon-parity-performance/pulsenet-documentation/` and is **not** copied into this MIT repository. KR-04 and PN-01/02 overlap; investigate Horizon's existing `lan/conn.rs::PlayerSender` ordering and backpressure before building another queue.

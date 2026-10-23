@@ -34,6 +34,11 @@ impl Ticket {
     pub fn new(endpoint: EndpointAddr, secret: [u8; SECRET_LENGTH]) -> Self {
         Self { endpoint, secret }
     }
+    /// Internal exposure only for the authenticated, versioned invitation
+    /// codec. Do not expose this capability in Debug/log output.
+    pub(crate) fn capability(&self) -> &[u8; SECRET_LENGTH] {
+        &self.secret
+    }
 }
 
 /// An experimental QUIC host; the TCP destination is always explicitly local.
@@ -214,7 +219,11 @@ mod tests {
             conn.write_all(b"PONG").await.unwrap();
         });
         let host = Host::bind_local([23u8; SECRET_LENGTH]).await.unwrap();
-        let ticket = host.ticket();
+        // Exercise the real QUIC path using a decoded V3 invitation, not
+        // merely an in-memory ticket, without routing through game UI.
+        let ticket =
+            crate::iroh_invite::decode(&crate::iroh_invite::encode(&host.ticket()).unwrap())
+                .unwrap();
         let hosting = tokio::spawn(async move {
             let result = host.serve_one(server_addr).await;
             host.close().await;
