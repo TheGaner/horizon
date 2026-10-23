@@ -12,8 +12,8 @@ use horizon_protocol::{
     item::Stack,
     packets::play::{
         self, AddEntity, AttributeSnapshot, EntityPositionSync, MoveEntity, MoveEntityPos,
-        MoveEntityPosRot, MoveEntityRot, PositionPath, RotateHead, SetEntityData, SetEntityMotion,
-        SetEquipment, SetPassengers, UpdateAttributes, VecDelta,
+        MoveEntityPosRot, MoveEntityRot, PositionPath, RotateHead, SetEntityData, SetEntityLink,
+        SetEntityMotion, SetEquipment, SetPassengers, UpdateAttributes, VecDelta,
     },
 };
 
@@ -50,6 +50,10 @@ pub struct EntityState {
     pub data: i32,
     /// SynchedEntityData entries that differ from the defaults.
     pub meta: Vec<(u8, i32, Value)>,
+    /// The defaults of entries `meta` leaves out while they are at them,
+    /// sent when one goes back to its default (a calf grown up, a mob healed
+    /// back to 1, wool grown back white) beyond Entity's own below.
+    pub defaults: Vec<(u8, i32, Value)>,
     /// EquipmentSlot ordinals (0 main hand, 1 off hand, 2 feet, 3 legs,
     /// 4 chest, 5 head, 6 body, 7 saddle) and their stacks.
     pub equipment: Vec<(u8, Option<Stack>)>,
@@ -61,6 +65,8 @@ pub struct EntityState {
     pub precise: bool,
     /// `Entity.needsSync`: send its changes this tick, due or not.
     pub needs_sync: bool,
+    /// `Leashable.getLeashHolder`: the entity holding its lead.
+    pub leash: Option<i32>,
 }
 
 impl EntityState {
@@ -78,10 +84,12 @@ impl EntityState {
         self.velocity = [0.0; 3];
         self.data = 0;
         self.meta.clear();
+        self.defaults.clear();
         self.equipment.clear();
         self.attributes.clear();
         self.precise = false;
         self.needs_sync = false;
+        self.leash = None;
     }
 }
 
@@ -204,6 +212,9 @@ struct ServerEntity {
     velocity: [f64; 3],
     /// trackedDataValues: the entity data the clients hold.
     meta: Vec<(u8, i32, Value)>,
+    /// The original ItemEntity stack is dirty once after its first pairing.
+    is_item: bool,
+    initial_item_dirty_sent: bool,
     equipment: Vec<(u8, Option<Stack>)>,
     /// The attribute instances the clients hold.
     attributes: Vec<AttributeSnapshot>,
@@ -214,10 +225,14 @@ struct ServerEntity {
     /// and the first update after it dismounts is a full position sync.
     passengers: Vec<i32>,
     was_riding: bool,
+    /// The lead's holder the clients were told of.
+    leash: Option<i32>,
     /// The level tick it was last seen in, its place in that tick's list, and
     /// whether it was added in it (its first update is the next tick's).
     seen: u32,
     index: usize,
+    /// Previous tick's live index, retained when merged donors disappear.
+    previous_index: usize,
     added: bool,
     /// TrackedEntity.lastSectionPos: its pairs are checked again when it
     /// moves to another section.
@@ -250,6 +265,8 @@ impl ServerEntity {
             head: pack_degrees(e.head_yaw),
             velocity: e.velocity,
             meta: e.meta.clone(),
+            is_item: e.kind == "minecraft:item",
+            initial_item_dirty_sent: false,
             equipment: e.equipment.clone(),
             attributes: e.attributes.clone(),
             was_on_ground: e.on_ground,
@@ -257,8 +274,10 @@ impl ServerEntity {
             teleport_delay: 0,
             passengers: riding.passengers(e.id).to_vec(),
             was_riding: false,
+            leash: e.leash,
             seen: 0,
             index: 0,
+            previous_index: 0,
             added: true,
             section: section_of(e.position),
         }
@@ -309,6 +328,13 @@ impl ServerEntity {
         if let Some(&vehicle) = riding.vehicle.get(&e.id) {
             out.push(riding.set_passengers(vehicle));
         }
+        // A leashed entity: who holds its lead.
+        if let Some(dest) = e.leash {
+            out.push(play::Clientbound::SetEntityLink(SetEntityLink {
+                source: e.id,
+                dest,
+            }));
+        }
     }
 
     /// Changes since the last update (ServerEntity.sendChanges): movement and
@@ -321,6 +347,14 @@ impl ServerEntity {
             out.push(riding.set_passengers(e.id));
             self.passengers.clear();
             self.passengers.extend_from_slice(passengers);
+        }
+        // Leashable.setLeashedTo / dropLeash: sendToTrackingPlayers at once.
+        if e.leash != self.leash {
+            out.push(play::Clientbound::SetEntityLink(SetEntityLink {
+                source: e.id,
+                dest: e.leash.unwrap_or(0),
+            }));
+            self.leash = e.leash;
         }
         // SynchedEntityData.isDirty: once for every client.
         let dirty = e.meta != self.meta;
@@ -469,7 +503,10 @@ impl ServerEntity {
                     (0, serializer::BYTE) => Value::Byte(0),
                     (6, serializer::POSE) => Value::Id(0),
                     (14, serializer::OPTIONAL_BLOCK_POS) => Value::OptPos(None),
-                    _ => continue,
+                    _ => match e.defaults.iter().find(|d| (d.0, d.1) == (*index, *kind)) {
+                        Some(d) => d.2.clone(),
+                        None => continue,
+                    },
                 };
                 if !e.meta.iter().any(|m| m.0 == *index) {
                     changed.push((*index, *kind, default));
@@ -482,6 +519,20 @@ impl ServerEntity {
                 }));
             }
             self.meta.clone_from(&e.meta);
+        } else if self.tick == 0
+            && self.is_item
+            && !self.initial_item_dirty_sent
+            && !self.meta.is_empty()
+        {
+            // Mojang 26.3 ServerEntity.sendPairingData sends the non-default
+            // item stack on pair, while the ItemEntity's initially dirty
+            // SynchedEntityData is broadcast again on the first following
+            // ServerEntity.sendChanges (packDirty). The second packet is
+            // after the player's slot correction, not in the initial pair.
+            out.push(play::Clientbound::SetEntityData(SetEntityData {
+                id: e.id,
+                values: self.meta.clone(),
+            }));
         }
         if e.attributes != self.attributes {
             let changed = changed_attributes(&e.attributes, &self.attributes);
@@ -677,6 +728,7 @@ impl Entities {
                 ServerEntity::new(e, kind(&e.kind), riding)
             });
             s.seen = now;
+            s.previous_index = s.index;
             s.index = index;
             // ChunkMap.addEntity, and ChunkMap.tick's section change:
             // updatePlayers.
@@ -702,6 +754,48 @@ impl Entities {
                 range: s.range,
                 chunk,
             });
+        }
+        // Mojang's ItemEntity DATA_ITEM starts dirty. A receiver gets the
+        // pairing stack immediately, then this initial dirty state once on
+        // its first tracking update. A fast drop can merge/discard the item
+        // *on that same tick*. Preserve the original pre-merge metadata for
+        // every previously paired item (even one now absent from `entities`)
+        // before the removal and current merged stack packets. Otherwise
+        // an update from x1 to x2 hides the required intermediate x1.
+        // In the actual Java 26.3 repeated-Q server traces, independent
+        // item dirty metadata groups sometimes reverse order from run to
+        // run. Preserve stable prior-level entity order rather than infer a
+        // globally fixed new/old precedence from a single socket trace.
+        let mut initial_items: Vec<_> = self
+            .states
+            .iter_mut()
+            .filter_map(|(&id, s)| {
+                if s.is_item
+                    && !s.added
+                    && s.tick == 0
+                    && !s.initial_item_dirty_sent
+                    && !s.meta.is_empty()
+                {
+                    s.initial_item_dirty_sent = true;
+                    Some((s.previous_index, id, s.meta.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        initial_items.sort_unstable_by_key(|(prior_index, _, _)| *prior_index);
+        for v in viewers.iter_mut() {
+            for (_, id, values) in &initial_items {
+                if v.tracker.is_tracking(*id) {
+                    v.out.push(
+                        play::Clientbound::SetEntityData(SetEntityData {
+                            id: *id,
+                            values: values.clone(),
+                        })
+                        .encode(),
+                    );
+                }
+            }
         }
         self.flags.resize_with(viewers.len(), Vec::new);
         self.pairs.clear();
@@ -855,10 +949,12 @@ mod tests {
             velocity: [0.0; 3],
             data: 0,
             meta: Vec::new(),
+            defaults: Vec::new(),
             equipment: Vec::new(),
             attributes: Vec::new(),
             precise: false,
             needs_sync: false,
+            leash: None,
         }
     }
 
@@ -895,6 +991,80 @@ mod tests {
         let mut out = Vec::new();
         s.send_changes(e, &Riding::default(), &mut out);
         out
+    }
+
+    #[test]
+    fn item_initial_data_is_paired_then_replayed_once_on_first_update() {
+        let mut e = state(0.0);
+        e.kind = "minecraft:item".into();
+        e.meta = vec![(8, serializer::ITEM_STACK, Value::Item(None))];
+        let mut tracker = added(&e);
+        let mut paired = Vec::new();
+        tracker.pairing(&e, 100, &Riding::default(), &mut paired);
+        assert!(matches!(
+            paired.as_slice(),
+            [
+                play::Clientbound::AddEntity(_),
+                play::Clientbound::SetEntityData(_)
+            ]
+        ));
+        let first = changes(&mut tracker, &e);
+        assert_eq!(
+            first
+                .iter()
+                .filter(|p| matches!(p, play::Clientbound::SetEntityData(_)))
+                .count(),
+            1
+        );
+        let second = changes(&mut tracker, &e);
+        assert_eq!(
+            second
+                .iter()
+                .filter(|p| matches!(p, play::Clientbound::SetEntityData(_)))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn previously_flushed_item_initial_stack_is_not_repeated_on_update() {
+        let mut e = state(0.0);
+        e.kind = "minecraft:item".into();
+        e.meta = vec![(8, serializer::ITEM_STACK, Value::Item(None))];
+        let mut s = added(&e);
+        s.initial_item_dirty_sent = true;
+        assert!(
+            changes(&mut s, &e)
+                .iter()
+                .all(|p| !matches!(p, play::Clientbound::SetEntityData(_)))
+        );
+    }
+
+    #[test]
+    fn merged_first_item_update_still_sends_final_stack_delta() {
+        let mut e = state(0.0);
+        e.kind = "minecraft:item".into();
+        e.meta = vec![(
+            8,
+            serializer::ITEM_STACK,
+            Value::Item(Some(Stack::new(5, 1))),
+        )];
+        let mut s = added(&e);
+        s.initial_item_dirty_sent = true;
+        e.meta = vec![(
+            8,
+            serializer::ITEM_STACK,
+            Value::Item(Some(Stack::new(5, 2))),
+        )];
+        let data: Vec<_> = changes(&mut s, &e)
+            .into_iter()
+            .filter_map(|p| match p {
+                play::Clientbound::SetEntityData(p) => Some(p),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0].values, e.meta);
     }
 
     #[test]
@@ -1076,6 +1246,29 @@ mod tests {
     }
 
     #[test]
+    fn a_value_back_at_a_listed_default_is_sent() {
+        let mut e = state(0.0);
+        e.defaults = vec![(16, serializer::BOOLEAN, Value::Bool(false))];
+        // A calf: paired with its baby flag, then grown up.
+        e.meta = vec![(16, serializer::BOOLEAN, Value::Bool(true))];
+        let mut s = added(&e);
+        changes(&mut s, &e);
+        e.meta.clear();
+        let data = changes(&mut s, &e)
+            .into_iter()
+            .find_map(|p| match p {
+                play::Clientbound::SetEntityData(d) => Some(d),
+                _ => None,
+            })
+            .expect("growing up is sent");
+        assert_eq!(
+            data.values,
+            vec![(16, serializer::BOOLEAN, Value::Bool(false))]
+        );
+        assert!(changes(&mut s, &e).is_empty());
+    }
+
+    #[test]
     fn metadata_and_equipment_send_only_the_changes() {
         let mut e = state(0.0);
         let mut s = added(&e);
@@ -1098,6 +1291,24 @@ mod tests {
             panic!("expected equipment");
         };
         assert_eq!(eq.slots, vec![(0, None)]);
+    }
+
+    #[test]
+    fn a_lead_tied_and_untied_reaches_the_clients() {
+        let link = |out: &[play::Clientbound]| {
+            out.iter().find_map(|p| match p {
+                play::Clientbound::SetEntityLink(l) => Some((l.source, l.dest)),
+                _ => None,
+            })
+        };
+        let mut e = state(0.0);
+        let mut s = added(&e);
+        changes(&mut s, &e);
+        e.leash = Some(7);
+        assert_eq!(link(&changes(&mut s, &e)), Some((e.id, 7)));
+        assert_eq!(link(&changes(&mut s, &e)), None);
+        e.leash = None;
+        assert_eq!(link(&changes(&mut s, &e)), Some((e.id, 0)));
     }
 
     /// Two clients at the origin; the chunks they hold.
@@ -1157,6 +1368,58 @@ mod tests {
     /// walking into range within its section isn't paired with a client
     /// standing still until the client moves, and one walking out stays
     /// tracked until it changes section.
+    #[test]
+    fn rapid_item_merge_flushes_both_original_metadata_before_remove_and_survivor_update() {
+        let mut level = Entities::default();
+        let mut clients = Clients::new();
+        let item = |id, count| {
+            let mut e = state(0.0);
+            e.id = id;
+            e.kind = "minecraft:item".into();
+            e.meta = vec![(
+                8,
+                serializer::ITEM_STACK,
+                Value::Item(Some(Stack::new(5, count))),
+            )];
+            e
+        };
+        let a = item(7, 1);
+        let b = item(8, 1);
+        clients.tick(&mut level, &[&a, &b]);
+        assert!(
+            clients
+                .trackers
+                .iter()
+                .all(|t| t.is_tracking(7) && t.is_tracking(8))
+        );
+        // The first item merged into the other before the tracker's next
+        // update: the second item's new index is zero; flush both prior
+        // snapshots in their original level-order indices 7 then 8.
+        let merged = item(8, 2);
+        clients.tick(&mut level, &[&merged]);
+        let p = &clients.out[0];
+        let before = |id| {
+            body(play::Clientbound::SetEntityData(SetEntityData {
+                id,
+                values: item(id, 1).meta,
+            }))
+        };
+        assert_eq!(p.first(), Some(&before(7)));
+        assert_eq!(p.get(1), Some(&before(8)));
+        assert!(p.contains(&body(play::Clientbound::RemoveEntities(
+            play::RemoveEntities { ids: vec![7] },
+        ))));
+        assert!(
+            p.contains(&body(play::Clientbound::SetEntityData(SetEntityData {
+                id: 8,
+                values: merged.meta.clone(),
+            })))
+        );
+        assert_eq!(clients.out[0], clients.out[1]);
+        clients.tick(&mut level, &[&merged]);
+        assert!(clients.out[0].iter().all(|pkt| pkt != &before(8)));
+    }
+
     #[test]
     fn pairs_are_checked_again_when_a_side_moves() {
         let mut level = Entities::default();

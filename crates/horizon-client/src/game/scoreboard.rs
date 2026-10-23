@@ -17,8 +17,9 @@ use horizon_client::{
     tab_list::TabPlayer,
     text::Text,
 };
+use horizon_protocol::packets::play::{self as play, Clientbound as C};
 use horizon_world::nbt::Tag;
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 /// What `ServerPlayer` last recorded for the criteria that follow the player.
 #[derive(Default)]
@@ -39,6 +40,161 @@ pub(super) struct ScoreState {
     pub stopwatches: horizon_client::stopwatches::Stopwatches,
     loaded: bool,
     recorded: Recorded,
+    /// Ordered scoreboard mutations waiting for server clients. Do not
+    /// coalesce across command blocks: vanilla sends every intermediate
+    /// ClientboundSetScorePacket even within one game tick.
+    pub(super) pending_packets: Vec<C>,
+}
+
+/// The already-tracked visible objectives' wire snapshots after a command.
+///
+/// Only displayed objectives are tracked by ServerScoreboard; after an
+/// objective is put on sidebar the client first receives its definition,
+/// then its display slot, then every score. Do not squash score changes
+/// from successive chain command blocks: each command generates its own
+/// ordered packet. Team scoreboard packets are a separate outstanding gate.
+fn scoreboard_number_format(format: &sb::NumberFormat) -> play::NumberFormat {
+    match format {
+        sb::NumberFormat::Blank => play::NumberFormat::Blank,
+        sb::NumberFormat::Styled(style) => play::NumberFormat::Styled(sb::json_to_tag(style)),
+        sb::NumberFormat::Fixed(component) => {
+            play::NumberFormat::Fixed(horizon_client::lan::data::component_nbt(component))
+        }
+    }
+}
+
+pub(super) fn scoreboard_network_delta(before: &Scoreboard, after: &Scoreboard) -> Vec<C> {
+    let mut out = Vec::new();
+    let tracked_before: BTreeSet<_> = before.display.values().cloned().collect();
+    let tracked_after: BTreeSet<_> = after.display.values().cloned().collect();
+    for name in tracked_after.difference(&tracked_before) {
+        if let Some(objective) = after.objective(name) {
+            out.push(C::SetObjective(play::SetObjective {
+                name: name.clone(),
+                method: 0,
+                display: Some((
+                    horizon_client::lan::data::component_nbt(&objective.display_name),
+                    i32::from(objective.render_type == sb::RenderType::Hearts),
+                    objective
+                        .number_format
+                        .as_ref()
+                        .map(scoreboard_number_format),
+                )),
+            }));
+        }
+    }
+    // A displayed objective may change its name, render mode or number
+    // format without changing the slot that displays it.
+    for name in tracked_after.intersection(&tracked_before) {
+        if let (Some(old), Some(new)) = (before.objective(name), after.objective(name))
+            && old != new
+        {
+            out.push(C::SetObjective(play::SetObjective {
+                name: name.clone(),
+                method: 2,
+                display: Some((
+                    horizon_client::lan::data::component_nbt(&new.display_name),
+                    i32::from(new.render_type == sb::RenderType::Hearts),
+                    new.number_format.as_ref().map(scoreboard_number_format),
+                )),
+            }));
+        }
+    }
+    // Mojang's ServerScoreboard.stopTrackingObjective emits METHOD_REMOVE
+    // instead of clearing the *final* display reference for an objective
+    // that was deleted. Earlier slots are cleared normally, and hiding an
+    // objective (which still exists) still sends a slot-clear packet.
+    // Its final slot goes away during removeObjective, not via an explicit
+    // setDisplayObjective command. Without this distinction we send extra
+    // `SetDisplayObjective(..., null)` packets on objective deletion.
+    let display_slots = sb::display_slots();
+    let last_removed_slot = tracked_before
+        .difference(&tracked_after)
+        .filter(|name| after.objective(name).is_none())
+        .filter_map(|name| {
+            display_slots
+                .iter()
+                .enumerate()
+                .filter(|(_, slot)| {
+                    before.display.get(*slot) == Some(name) && after.display.get(*slot).is_none()
+                })
+                .map(|(index, _)| (name.to_owned(), index))
+                .last()
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    for (slot_id, slot) in display_slots.into_iter().enumerate() {
+        if before.display.get(&slot) != after.display.get(&slot) {
+            if let Some(name) = before.display.get(&slot)
+                && last_removed_slot.get(name) == Some(&slot_id)
+            {
+                continue;
+            }
+            out.push(C::SetDisplayObjective(play::SetDisplayObjective {
+                slot: slot_id as i32,
+                objective: after.display.get(&slot).cloned().unwrap_or_default(),
+            }));
+        }
+    }
+    for (holder, scores) in &after.scores {
+        for (objective, score) in scores {
+            if !tracked_after.contains(objective) {
+                continue;
+            }
+            let old = before.scores.get(holder).and_then(|s| s.get(objective));
+            if old == Some(score) && tracked_before.contains(objective) {
+                continue;
+            }
+            out.push(C::SetScore(play::SetScore {
+                owner: holder.clone(),
+                objective: objective.clone(),
+                score: score.value,
+                display: score
+                    .display
+                    .as_ref()
+                    .map(horizon_client::lan::data::component_nbt),
+                number_format: score.number_format.as_ref().map(scoreboard_number_format),
+            }));
+        }
+    }
+    for (holder, scores) in &before.scores {
+        let removed: Vec<_> = scores
+            .keys()
+            .filter(|objective| {
+                tracked_before.contains(*objective)
+                    && tracked_after.contains(*objective)
+                    && after
+                        .scores
+                        .get(holder)
+                        .is_none_or(|s| !s.contains_key(*objective))
+            })
+            .collect();
+        // Mojang onPlayerRemoved broadcasts one null-objective reset,
+        // even if the holder had several displayed objectives. Emitting
+        // multiple null resets can incorrectly repeat client UI changes.
+        if !removed.is_empty() && after.scores.get(holder).is_none_or(|s| s.is_empty()) {
+            out.push(C::ResetScore(play::ResetScore {
+                owner: holder.clone(),
+                objective: None,
+            }));
+        } else {
+            // onPlayerScoreRemoved is scoped to the objective while the
+            // holder still has other score entries (including hidden ones).
+            for objective in removed {
+                out.push(C::ResetScore(play::ResetScore {
+                    owner: holder.clone(),
+                    objective: Some(objective.clone()),
+                }));
+            }
+        }
+    }
+    for name in tracked_before.difference(&tracked_after) {
+        out.push(C::SetObjective(play::SetObjective {
+            name: name.clone(),
+            method: 1,
+            display: None,
+        }));
+    }
+    out
 }
 
 fn in_range(v: i32, (lo, hi): IntRange) -> bool {
@@ -179,8 +335,18 @@ impl Game<'_> {
             | Target::Boat(id)
             | Target::Cart(id)
             | Target::Other(id) => self.persist.raw.get(&id),
+            // A remote player must use their own persisted player data;
+            // the local world's player_extra belongs to the host, not to
+            // the guest whose command happens to be executing.
+            Target::Player if self.lan_acting.is_some() => self
+                .lan_acting
+                .and_then(|conn| self.command_guest(conn))
+                .and_then(|guest| guest.saved.as_ref()),
             Target::Player => self.level.player_extra.as_ref(),
-            Target::Guest(_) | Target::Orb(_) | Target::Arrow(_) => None,
+            Target::Guest(conn) => self
+                .command_guest(conn)
+                .and_then(|guest| guest.saved.as_ref()),
+            Target::Orb(_) | Target::Arrow(_) => None,
         };
         match raw.and_then(|r| r.get("Tags")) {
             Some(Tag::List(l)) => l
@@ -321,6 +487,36 @@ impl Game<'_> {
                 board.for_all_objectives(&criteria, name, |v| {
                     amount.map_or(0, |n| v.wrapping_add(n))
                 });
+            }
+        }
+    }
+    /// `ServerScoreboard`'s packets: each placed player's client is sent
+    /// what changed on the board since it was last sent it (all of it on
+    /// joining), lan/scoreboard.rs.
+    pub(super) fn lan_sync_scoreboard(
+        &mut self,
+        host: &mut super::lan::LanHost,
+        scoreboard_packets_sent: bool,
+        joined_this_tick: &HashSet<u32>,
+    ) {
+        if host.hub.guests.iter().all(|g| !g.placed) {
+            return;
+        }
+        self.load_scoreboard();
+        let view = horizon_client::lan::scoreboard::View::of(&self.score.board);
+        for g in host.hub.guests.iter_mut().filter(|g| g.placed) {
+            if g.scoreboard != view {
+                // Snapshot sends are still needed for non-command criteria
+                // updates, but command deltas and join snapshots have already
+                // been placed on the wire; replaying them here doubles the
+                // packets and can turn a vanilla null reset into a scoped one.
+                let changes = if scoreboard_packets_sent || joined_this_tick.contains(&g.conn) {
+                    g.scoreboard.changes_without_rebroadcast(&view)
+                } else {
+                    g.scoreboard.changes(&view)
+                };
+                g.send_all(&changes);
+                g.scoreboard = view.clone();
             }
         }
     }
@@ -492,6 +688,9 @@ impl Game<'_> {
         )
     }
     pub(super) fn cmd_scoreboard(&mut self, id: &str, ctx: &Context) -> super::commands::R<i32> {
+        // Local/offline worlds have no network subscribers: avoid an
+        // unbounded packet queue and the full scoreboard copy per command.
+        let before = self.lan.as_ref().map(|_| self.score.board.clone());
         let mut env = GameEnv { g: self };
         let result = scoreboard_cmd::execute(id, ctx, &mut env).unwrap_or_else(|| {
             Err(horizon_client::command::CommandError::tr(
@@ -499,6 +698,11 @@ impl Game<'_> {
                 &[],
             ))
         });
+        if let Some(before) = before {
+            self.score
+                .pending_packets
+                .extend(scoreboard_network_delta(&before, &self.score.board));
+        }
         self.sync_score_registries();
         result
     }
@@ -563,19 +767,42 @@ impl Game<'_> {
 
     // ---- the sidebar -----------------------------------------------------------
 
-    /// `Hud.extractScoreboardSidebar` / `displayScoreboardSidebar`.
-    pub(super) fn draw_scoreboard(&self, batch: &mut HudBatch) {
+    /// The objective in the player's team's sidebar slot, else the sidebar's.
+    fn sidebar_objective(&self) -> Option<&sb::Objective> {
         let board = &self.score.board;
         if board.display.is_empty() {
-            return;
+            return None;
         }
+        // A server's client is in its team by its profile name.
+        let name = self
+            .remote
+            .as_ref()
+            .map_or(PLAYER_NAME, |r| r.profile_name.as_str());
         let team_slot = board
-            .players_team(PLAYER_NAME)
+            .players_team(name)
             .and_then(|t| t.color.as_ref())
             .map(|c| format!("sidebar.team.{c}"))
             .and_then(|slot| board.display_objective(&slot));
-        let Some(objective) = team_slot.or_else(|| board.display_objective(sb::SLOT_SIDEBAR))
-        else {
+        team_slot.or_else(|| board.display_objective(sb::SLOT_SIDEBAR))
+    }
+    /// The sidebar the HUD shows: its objective and its lines, for `status`.
+    pub(super) fn sidebar_status(&self) -> serde_json::Value {
+        let board = &self.score.board;
+        let Some(objective) = self.sidebar_objective() else {
+            return serde_json::Value::Null;
+        };
+        let scores: serde_json::Map<String, serde_json::Value> = board
+            .scores
+            .iter()
+            .filter_map(|(holder, s)| Some((holder.clone(), s.get(&objective.name)?.value.into())))
+            .collect();
+        serde_json::json!({ "objective": objective.name, "title": objective.display_text().plain(), "scores": scores })
+    }
+
+    /// `Hud.extractScoreboardSidebar` / `displayScoreboardSidebar`.
+    pub(super) fn draw_scoreboard(&self, batch: &mut HudBatch) {
+        let board = &self.score.board;
+        let Some(objective) = self.sidebar_objective() else {
             return;
         };
         let draws = hud_overlays::sidebar(
@@ -724,6 +951,154 @@ impl Env for GameEnv<'_, '_> {
     }
     fn feedback(&mut self, message: Text) {
         self.g.feedback(message);
+    }
+}
+
+#[cfg(test)]
+mod scoreboard_packet_tests {
+    use super::*;
+
+    fn board() -> Scoreboard {
+        let mut board = Scoreboard::default();
+        assert!(board.add_objective(
+            "cbview",
+            "dummy",
+            serde_json::json!("cbview"),
+            sb::RenderType::Integer,
+            false,
+            None,
+        ));
+        board
+    }
+
+    #[test]
+    fn tracking_sidebar_sends_definition_before_display_and_scores() {
+        let original = board();
+        let mut displayed = original.clone();
+        displayed.set("Alice", "cbview", 0);
+        displayed.set_display_objective("sidebar", Some("cbview"));
+        let events = scoreboard_network_delta(&original, &displayed);
+        assert!(
+            matches!(events.first(), Some(C::SetObjective(p)) if p.name == "cbview" && p.method == 0)
+        );
+        assert!(
+            matches!(events.get(1), Some(C::SetDisplayObjective(p)) if p.slot == 1 && p.objective == "cbview")
+        );
+        assert!(
+            matches!(events.get(2), Some(C::SetScore(p)) if p.owner == "Alice" && p.score == 0)
+        );
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn intermediate_command_chain_values_are_not_coalesced() {
+        let mut board = board();
+        board.set_display_objective("sidebar", Some("cbview"));
+        board.set("Alice", "cbview", 0);
+        let mut queue = Vec::new();
+        for wanted in [1, 2, 5] {
+            let before = board.clone();
+            board.set("Alice", "cbview", wanted);
+            queue.extend(scoreboard_network_delta(&before, &board));
+        }
+        let values: Vec<_> = queue
+            .iter()
+            .filter_map(|p| match p {
+                C::SetScore(p) if p.owner == "Alice" => Some(p.score),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(values, [1, 2, 5]);
+        assert!(scoreboard_network_delta(&board, &board).is_empty());
+    }
+
+    #[test]
+    fn resetting_last_score_is_holder_wide_but_other_scores_are_objective_scoped() {
+        let mut before = board();
+        before.set_display_objective("sidebar", Some("cbview"));
+        before.set("Alice", "cbview", 5);
+        let mut after = before.clone();
+        after.reset_one("Alice", "cbview");
+        let packets = scoreboard_network_delta(&before, &after);
+        assert!(matches!(packets.as_slice(),
+            [C::ResetScore(p)] if p.owner == "Alice" && p.objective.is_none()));
+        let _ = before.add_objective(
+            "hidden",
+            "dummy",
+            serde_json::json!("hidden"),
+            sb::RenderType::Integer,
+            false,
+            None,
+        );
+        before.set("Alice", "hidden", 1);
+        after = before.clone();
+        after.reset_one("Alice", "cbview");
+        let packets = scoreboard_network_delta(&before, &after);
+        assert!(matches!(packets.as_slice(),
+            [C::ResetScore(p)] if p.owner == "Alice" && p.objective.as_deref() == Some("cbview")));
+    }
+
+    #[test]
+    fn resetting_multiple_tracked_scores_sends_one_holder_wide_reset() {
+        let mut before = board();
+        let _ = before.add_objective(
+            "other",
+            "dummy",
+            serde_json::json!("other"),
+            sb::RenderType::Integer,
+            false,
+            None,
+        );
+        before.set_display_objective("sidebar", Some("cbview"));
+        before.set_display_objective("list", Some("other"));
+        before.set("Alice", "cbview", 4);
+        before.set("Alice", "other", 9);
+        let mut after = before.clone();
+        after.reset_all("Alice");
+        let packets = scoreboard_network_delta(&before, &after);
+        assert!(matches!(packets.as_slice(),
+            [C::ResetScore(p)] if p.owner == "Alice" && p.objective.is_none()));
+    }
+
+    #[test]
+    fn deleting_last_tracked_objective_sends_no_final_display_clear() {
+        let mut before = board();
+        before.set_display_objective("sidebar", Some("cbview"));
+        let mut after = before.clone();
+        after.remove_objective("cbview");
+        let packets = scoreboard_network_delta(&before, &after);
+        assert!(matches!(packets.as_slice(),
+            [C::SetObjective(p)] if p.method == 1 && p.name == "cbview"));
+    }
+
+    #[test]
+    fn deleting_objective_with_two_slots_clears_first_then_removes_it() {
+        let mut before = board();
+        before.set_display_objective("list", Some("cbview"));
+        before.set_display_objective("below_name", Some("cbview"));
+        let mut after = before.clone();
+        after.remove_objective("cbview");
+        let packets = scoreboard_network_delta(&before, &after);
+        assert!(matches!(packets.as_slice(), [
+            C::SetDisplayObjective(clear), C::SetObjective(remove)
+        ] if clear.slot == 0 && clear.objective.is_empty() && remove.method == 1));
+    }
+
+    #[test]
+    fn hiding_objective_untracks_it_instead_of_replaying_old_scores() {
+        let mut board = board();
+        board.set_display_objective("sidebar", Some("cbview"));
+        board.set("Alice", "cbview", 5);
+        let mut hidden = board.clone();
+        hidden.set_display_objective("sidebar", None);
+        let events = scoreboard_network_delta(&board, &hidden);
+        assert!(
+            matches!(events.first(), Some(C::SetDisplayObjective(p)) if p.slot == 1 && p.objective.is_empty())
+        );
+        assert!(
+            matches!(events.last(), Some(C::SetObjective(p)) if p.method == 1 && p.name == "cbview")
+        );
+        assert!(events.iter().all(|p| !matches!(p, C::SetScore(_))));
     }
 }
 

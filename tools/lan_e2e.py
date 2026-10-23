@@ -24,6 +24,13 @@ address. The script then checks, from both sides, what a guest's game used to ge
 
 
 - arrows:    the guest and the host shoot each other with a bow; with the pvp game rule off, nothing (#484);
+- looks:     mobs look on both sides as the server has them (their synched data): a calf is a
+             baby, a red sheep is sheared, a size 4 slime, a tamed wolf sits with its blue collar, a
+             cow on fire burns and goes out; then the wither's health drops when it is hurt, the
+             sheep is dyed blue with its wool back and the calf grows up (#1367, #1368, #1370,
+             #1371, #1385, #1390);
+- leads:     the host and the guest each tie a cow to a lead and untie it: the rope shows on both
+             sides, held by the player who tied it, and goes on both (#1360);
 - respawn:   a player killed is drawn dead by the other side, and alive again once it respawns (the
              respawned player is a new entity to the others); the host dies, and on the server thread
              the guest too;
@@ -100,6 +107,11 @@ address. The script then checks, from both sides, what a guest's game used to ge
              guest as the host has them (kind, place, rotation, what they hold or wear, the variant).
 - projectiles: primed TNT (one falling), an end crystal and an arrow that lands reach the guest where
              the host has them; a falling block lands on both sides.
+- thrown:    a splash potion and an eye of ender the host and the guest each throw fly on both
+             sides (#1363, #1391);
+- sparks:    level events' particles on both sides: the host's and the guest's bone meal on wheat
+             (growth sparks), honeycomb on copper and an axe taking the wax off, and a spawner's
+             burst when it spawns (#1395, #1401, #1402);
 - fireball:  a fire charge a dispenser shoots onto stone lights a fire both sides see, and the fire
              goes out on its own within a minute (it ticks: FireBlock.tick on a floor that doesn't burn)
 
@@ -201,7 +213,7 @@ ROOT = Path(__file__).resolve().parents[1]
 GUEST_NAME = 'Guest'
 # The host plays single player on its server thread (--server-thread).
 SERVER_THREAD = False
-CHECKS = ['tab', 'self', 'armour', 'nametags', 'walls', 'chest', 'crafting', 'sign', 'damage', 'mobs', 'hazards', 'pvp', 'arrows', 'kills', 'hurt', 'respawn', 'containers', 'feedback', 'titles', 'chat', 'commands', 'recipes', 'machines', 'brewing', 'loom', 'stonecutter', 'grindstone', 'anvil', 'smithing', 'enchanting', 'beacon', 'crafter', 'lectern', 'cartography', 'trials', 'clicks', 'sleep', 'predict', 'push', 'eat', 'eating', 'xp', 'objects', 'projectiles', 'worn', 'blast', 'barter', 'deflect', 'fireball', 'light', 'time', 'swings', 'cracks', 'plates', 'effects', 'portals', 'distance', 'growth', 'flight', 'ladder', 'boats', 'minecarts', 'frames', 'lightning', 'riding', 'mounts', 'worldspawn', 'beds', 'shield', 'deathmining', 'contacts', 'absorption', 'breath', 'lava', 'levels', 'drops', 'underwater']
+CHECKS = ['tab', 'self', 'armour', 'nametags', 'walls', 'chest', 'crafting', 'sign', 'damage', 'mobs', 'hazards', 'pvp', 'arrows', 'kills', 'hurt', 'looks', 'leads', 'respawn', 'containers', 'feedback', 'titles', 'chat', 'commands', 'recipes', 'machines', 'brewing', 'loom', 'stonecutter', 'grindstone', 'anvil', 'smithing', 'enchanting', 'beacon', 'crafter', 'lectern', 'cartography', 'trials', 'clicks', 'sleep', 'predict', 'push', 'eat', 'eating', 'xp', 'objects', 'projectiles', 'thrown', 'sparks', 'hud', 'sidebar', 'border', 'particles', 'worn', 'blast', 'barter', 'deflect', 'fireball', 'light', 'time', 'swings', 'cracks', 'plates', 'effects', 'portals', 'distance', 'growth', 'flight', 'ladder', 'boats', 'minecarts', 'frames', 'lightning', 'riding', 'mounts', 'worldspawn', 'beds', 'shield', 'deathmining', 'contacts', 'absorption', 'breath', 'lava', 'levels', 'drops', 'underwater']
 
 
 class Game:
@@ -1145,6 +1157,116 @@ def check_hurt(host, guest, out):
     for name, sides in seen.items():
         assert all(t > 0 for t in sides.values()), f'{name}: the pig\'s hurt flash {seen}'
     return seen
+
+
+def mob_looks(game, centre):
+    """What `check_looks` compares of each mob around `centre`, by kind and column."""
+    found = {}
+    for m in game.raw('mobs', 32).get('near', []):
+        if abs(m['pos'][0] - centre[0]) > 12 or abs(m['pos'][2] - centre[2]) > 14:
+            continue
+        key = f"{m['kind'].removeprefix('minecraft:')}@{round(m['pos'][0] - centre[0])}"
+        found[key] = {'baby': m['baby'], 'color': m['color'], 'sheared': m['sheared'], 'size': m['size'],
+                      'tame': m['tame'], 'sitting': m['sitting'], 'burning': m['burning'],
+                      'health': round(m['health'])}
+    return found
+
+
+def check_looks(host, guest, out):
+    x, y, z = (int(v // 1) for v in pos_of(host))
+    centre = (x + 0.5, y, z + 0.5)
+    # Each mob in a column of its own (the key), standing on the stone floor.
+    looks = {
+        'cow@-5': ('{NoAI:1b,Fire:80s}', {'burning': True}),
+        'cow@-3': ('{NoAI:1b,Age:-24000}', {'baby': True}),
+        'cow@-1': ('{NoAI:1b}', {'baby': False}),
+        'sheep@1': ('{NoAI:1b,Color:14b,Sheared:1b}', {'color': 14, 'sheared': True}),
+        'slime@3': ('{NoAI:1b,Size:3}', {'size': 4}),
+        'wolf@5': ('{NoAI:1b,Owner:[I;1,2,3,4],Sitting:1b,CollarColor:11b}',
+                   {'tame': True, 'sitting': True, 'color': 11}),
+    }
+    sides = {'host': host, 'guest': guest}
+    seen = {}
+    try:
+        for key, (tag, _) in looks.items():
+            kind, dx = key.split('@')
+            host('command', command=f'summon minecraft:{kind} {centre[0] + int(dx)} {y} {z + 4.5} {tag}')
+        host('command', command=f'summon minecraft:wither {centre[0]} {y + 3} {z + 10.5} {{NoAI:1b,Invul:0}}')
+        host.wait(30)
+        seen['spawned'] = {name: mob_looks(g, centre) for name, g in sides.items()}
+        # Changes after the spawn: the wither hurt, the sheep dyed and grown back, the calf grown up.
+        host('command', command='damage @e[type=minecraft:wither,limit=1] 150 minecraft:generic')
+        for kind, dx, tag in (('sheep', 1, '{Color:11b,Sheared:0b}'), ('cow', -3, '{Age:0}')):
+            host('command', command=f'data merge entity @e[type=minecraft:{kind},x={centre[0] + dx},y={y},'
+                                    f'z={z + 4.5},distance=..0.5,limit=1] {tag}')
+        guest.raw('look-at', centre[0], y + 1, z + 4.5)
+        host.raw('look-at', centre[0], y + 1, z + 4.5)
+        # The fire (80 ticks) goes out in the meantime.
+        host.wait(80)
+        for name, g in sides.items():
+            g.shot(out, 'looks')
+        seen['later'] = {name: mob_looks(g, centre) for name, g in sides.items()}
+    finally:
+        # A killed slime splits: shrink it first so no children are left hopping into the next check.
+        host('command', command=f'data merge entity @e[type=minecraft:slime,x={centre[0] + 3},y={y},z={z + 4.5},'
+                                f'distance=..2,limit=1] {{Size:0}}')
+        host('command', command=f'kill @e[type=!minecraft:player,x={x - 12},y={y - 2},z={z - 2},dx=24,dy=12,dz=16]')
+    wrong = []
+    for name in sides:
+        spawned, later = seen['spawned'][name], seen['later'][name]
+        for key, (_, want) in looks.items():
+            got = spawned.get(key)
+            if got is None or any(got[k] != v for k, v in want.items()):
+                wrong.append(f'{name} {key}: {got}, wants {want}')
+        if later.get('cow@-5', {}).get('burning') is not False:
+            wrong.append(f"{name}: the cow's fire never went out: {later.get('cow@-5')}")
+        if [later.get('sheep@1', {}).get(k) for k in ('color', 'sheared')] != [11, False]:
+            wrong.append(f"{name}: the sheep dyed blue with its wool back: {later.get('sheep@1')}")
+        if later.get('cow@-3', {}).get('baby') is not False:
+            wrong.append(f"{name}: the calf grown up: {later.get('cow@-3')}")
+        withers = [v['health'] for k, v in spawned.items() if k.startswith('wither')]
+        hurt = [v['health'] for k, v in later.items() if k.startswith('wither')]
+        if withers != [300] or hurt != [150]:
+            wrong.append(f"{name}: the wither's health {withers} then {hurt}, wants [300] then [150]")
+    assert not wrong, '\n'.join(wrong)
+    return seen['later']['guest']
+
+
+def check_leads(host, guest, out):
+    spots = apart(host, guest)
+    result = {}
+    for label, player, other in (('host', host, guest), ('guest', guest, host)):
+        x, y, z = spots[label]
+        at = (x + 0.5, y, z + 2.5)
+
+        def cow(game):
+            found = [m for m in game.raw('mobs', 32).get('near', []) if m['kind'] == 'minecraft:cow'
+                     and abs(m['pos'][0] - at[0]) < 1 and abs(m['pos'][2] - at[2]) < 1]
+            assert found, f'{game.name} sees no cow at {at}'
+            return found[0]
+        player('command', command='gamemode survival')
+        player('command', command=f'summon minecraft:cow {at[0]} {y} {at[2]} {{NoAI:1b}}')
+        player('command', command='item replace entity @s weapon.mainhand with minecraft:lead')
+        player.wait(30)
+        try:
+            player.raw('look-at', f'{at[0]:.2f}', f'{y + 0.7:.2f}', f'{at[2]:.2f}')
+            player.raw('mouse', 'right', 'click')
+            player.wait(20)
+            tied = {'own': cow(player)['leash'], 'other': cow(other)['leash']}
+            player.shot(out, 'leads-' + label)
+            other.shot(out, f'leads-{label}-seen')
+            # An empty hand unties it (the lead was used up).
+            player.raw('mouse', 'right', 'click')
+            player.wait(20)
+            untied = {'own': cow(player)['leash'], 'other': cow(other)['leash']}
+        finally:
+            player('command', command=f'kill @e[type=!minecraft:player,x={at[0]},y={y},z={at[2]},distance=..6]')
+            player('command', command='clear @s')
+        result[label] = {'tied': tied, 'untied': untied}
+        # The other side draws it held by the player who tied it (another player to it).
+        assert tied['own'] == 'Player' and tied['other'], f"the {label}'s cow on its lead: {tied}"
+        assert untied == {'own': None, 'other': None}, f"the {label}'s cow untied: {untied}"
+    return result
 
 
 def container_items(game):
@@ -2495,6 +2617,291 @@ def check_projectiles(host, guest, out):
     return f'{len(theirs)} identical, fuses (host, guest) {fuses}'
 
 
+def check_thrown(host, guest, out):
+    spots = apart(host, guest)
+    result = {}
+    for label, player, other in (('host', host, guest), ('guest', guest, host)):
+        x, y, z = spots[label]
+        player('command', command='gamemode survival')
+        for item, kind in (('splash_potion', 'minecraft:splash_potion'), ('ender_eye', 'minecraft:eye_of_ender')):
+            player('command', command=f'item replace entity @s weapon.mainhand with minecraft:{item}')
+            player.wait(10)
+            # Up at 45 degrees, into open sky.
+            player.raw('look-at', f'{x + 0.5:.2f}', f'{y + 11.6:.2f}', f'{z + 10.5:.2f}')
+            player.raw('use-item')
+            seen = {'own': 0, 'other': 0}
+            for _ in range(10):
+                player.wait(2)
+                for side, game in (('own', player), ('other', other)):
+                    if any(p['kind'] == kind for p in game('status')['projectiles']):
+                        seen[side] += 1
+                if all(seen.values()):
+                    break
+            player.shot(out, f'thrown-{label}-{item}')
+            other.shot(out, f'thrown-{label}-{item}-seen')
+            player.wait(100)  # it lands or drops
+            result[f'{label} {item}'] = seen
+    for name, seen in result.items():
+        assert all(seen.values()), f'{name}: seen in flight (samples) {result}'
+    return result
+
+
+def made(game, kind):
+    """How many `kind` particles `game` has made so far."""
+    return game('status').get('particles', {}).get(kind, 0)
+
+
+def sparked(player, other, kinds, act, ticks=20):
+    """The `kinds` particles each side makes while `act` runs and for up to `ticks` after."""
+    before = {(side, k): made(g, k) for side, g in (('own', player), ('other', other)) for k in kinds}
+    act()
+    seen = {}
+    for _ in range(ticks // 2):
+        player.wait(2)
+        seen = {f'{side} {k}': made(g, k) - before[(side, k)]
+                for side, g in (('own', player), ('other', other)) for k in kinds}
+        if all(seen.values()):
+            break
+    return seen
+
+
+def check_sparks(host, guest, out):
+    spots = apart(host, guest)
+    result = {}
+    for label, player, other in (('host', host, guest), ('guest', guest, host)):
+        x, y, z = spots[label]
+        at = (x, y, z + 2)
+        player('command', command='gamemode survival')
+        try:
+            player('command', command=f'setblock {at[0]} {at[1] - 1} {at[2]} minecraft:farmland')
+            player('command', command=f'setblock {at[0]} {at[1]} {at[2]} minecraft:wheat')
+            player('command', command='item replace entity @s weapon.mainhand with minecraft:bone_meal 8')
+            player.wait(10)
+
+            def click(height):
+                player.raw('look-at', f'{at[0] + 0.5:.2f}', f'{at[1] + height:.2f}', f'{at[2] + 0.5:.2f}')
+                player.raw('mouse', 'right', 'click')
+            result[f'{label} bone meal'] = sparked(player, other, ['happy_villager'], lambda: click(0.1))
+            player('command', command=f'setblock {at[0]} {at[1]} {at[2]} minecraft:copper_block')
+            player('command', command='item replace entity @s weapon.mainhand with minecraft:honeycomb')
+            player.wait(10)
+            result[f'{label} wax'] = sparked(player, other, ['wax_on'], lambda: click(0.5))
+            player('command', command='item replace entity @s weapon.mainhand with minecraft:iron_axe')
+            player.wait(10)
+            result[f'{label} wax off'] = sparked(player, other, ['wax_off'], lambda: click(0.5))
+            block = player.raw('block', *at).get('block', '')
+            result[f'{label} copper'] = block
+        finally:
+            player('command', command=f'fill {at[0]} {at[1] - 1} {at[2]} {at[0]} {at[1]} {at[2]} minecraft:air')
+            player('command', command=f'setblock {at[0]} {at[1] - 1} {at[2]} minecraft:stone')
+            player('command', command='clear @s')
+    # A spawner beside the host, at night: its burst when the zombie comes.
+    x, y, z = spots['host']
+    host('command', command='time set midnight')
+    try:
+        host('command', command=f'setblock {x} {y} {z + 3} minecraft:spawner{{Delay:20s,SpawnCount:1s,'
+                                'SpawnData:{entity:{id:"minecraft:zombie",NoAI:1b}}}')
+        result['spawner'] = sparked(host, guest, ['flame', 'smoke'], lambda: None, ticks=200)
+    finally:
+        host('command', command=f'setblock {x} {y} {z + 3} minecraft:air')
+        host('command', command=f'kill @e[type=minecraft:zombie,x={x},y={y},z={z},distance=..12]')
+        host('command', command='time set day')
+    wrong = {k: v for k, v in result.items() if isinstance(v, dict) and not all(n > 0 for n in v.values())}
+    assert not wrong, f'no particles: {wrong}\n{result}'
+    return result
+
+
+def hearts(game):
+    """The player's maximum and current health as its own client holds them."""
+    p = game('status')['player']
+    return p.get('max_health'), round(p['health'], 1)
+
+
+def check_hud(host, guest, out):
+    result = {}
+    for label, player in (('host', host), ('guest', guest)):
+        player('command', command='gamemode survival')
+        try:
+            for maximum in (40, 10):
+                player('command', command=f'attribute @s minecraft:max_health base set {maximum}')
+                player.wait(10)
+                player('command', command='effect give @s minecraft:instant_health 1 10')
+                seen = None
+                for _ in range(15):
+                    player.wait(2)
+                    seen = hearts(player)
+                    if seen == (maximum, maximum):
+                        break
+                result[f'{label} {maximum}'] = seen
+                player.shot(out, f'hearts-{label}-{maximum}')
+        finally:
+            player('command', command='attribute @s minecraft:max_health base reset')
+            player('command', command='effect give @s minecraft:instant_health 1 10')
+    # BossBarCommands' new bar starts visible (ServerBossEvent's constructor).
+    host('command', command='bossbar add lan_e2e:bar "LAN bar"')
+    try:
+        host('command', command='bossbar get lan_e2e:bar visible')
+        host.wait(5)
+        result['bar'] = [line for line in host.raw('messages', 5)['chat'] if 'lan_e2e:bar' in line or 'LAN bar' in line]
+    finally:
+        host('command', command='bossbar remove lan_e2e:bar')
+    wrong = {k: v for k, v in result.items() if k != 'bar' and v != (int(k.split()[1]),) * 2}
+    assert not wrong, f'hearts: {wrong}\n{result}'
+    assert any('currently visible' in line for line in result['bar']), f'bar: {result["bar"]}'
+    return result
+
+
+def sidebars(host, guest, want, ticks=40):
+    """Each side's sidebar (objective and scores) once both show `want` (host, guest), or after `ticks`."""
+    seen = None
+    for _ in range(ticks // 2):
+        host.wait(2)
+        seen = tuple(g('status').get('sidebar') for g in (host, guest))
+        got = tuple(s and (s['objective'], s['scores']) for s in seen)
+        if got == want:
+            break
+    return seen
+
+
+def check_sidebar(host, guest, out):
+    result = {}
+    run = lambda *cmds: [host('command', command=c) for c in cmds]
+    try:
+        run('scoreboard objectives add audit dummy {"text":"Audit board","color":"aqua"}',
+            'scoreboard players set Alpha audit 7', 'scoreboard players set Beta audit 3',
+            'scoreboard objectives setdisplay sidebar audit')
+        both = ('audit', {'Alpha': 7, 'Beta': 3})
+        result['shown'] = sidebars(host, guest, (both, both))
+        host.shot(out, 'sidebar')
+        guest.shot(out, 'sidebar')
+        run('scoreboard players set Alpha audit 12', 'scoreboard players reset Beta audit')
+        both = ('audit', {'Alpha': 12})
+        result['changed'] = sidebars(host, guest, (both, both))
+        # The guest's team's sidebar replaces the sidebar for the guest only.
+        run('team add red', 'team modify red color red', f'team join red {GUEST_NAME}',
+            'scoreboard objectives add reds dummy', f'scoreboard players set {GUEST_NAME} reds 5',
+            'scoreboard objectives setdisplay sidebar.team.red reds')
+        result['team'] = sidebars(host, guest, (both, ('reds', {GUEST_NAME: 5})))
+        run('scoreboard objectives remove reds', 'scoreboard objectives setdisplay sidebar')
+        result['cleared'] = sidebars(host, guest, (None, None))
+    finally:
+        run('scoreboard objectives remove audit', 'scoreboard objectives remove reds', 'team remove red')
+    want = {'shown': (('audit', {'Alpha': 7, 'Beta': 3}),) * 2, 'changed': (('audit', {'Alpha': 12}),) * 2,
+            'team': (('audit', {'Alpha': 12}), ('reds', {GUEST_NAME: 5})), 'cleared': (None, None)}
+    got = {k: tuple(s and (s['objective'], s['scores']) for s in v) for k, v in result.items()}
+    wrong = {k: v for k, v in got.items() if v != want[k]}
+    assert not wrong, f'sidebars: {wrong}\n{result}'
+    return result
+
+
+def check_border(host, guest, out):
+    spots = apart(host, guest)
+    result = {}
+    try:
+        for label, player, other in (('host', host, guest), ('guest', guest, host)):
+            x, y, z = spots[label]
+            # A whole-block centre: the wall's collision box is the border's, rounded out to blocks.
+            cx, cz = float(x), float(z)
+            # The other player keeps out of harm outside the border meanwhile.
+            other('command', command='gamemode creative')
+            host('command', command=f'fill {x - 3} {y - 1} {z} {x + 4} {y - 1} {z + 10} minecraft:stone')
+            host('command', command=f'fill {x - 3} {y} {z} {x + 4} {y + 3} {z + 10} minecraft:air')
+            # A border 10 wide around the player, its wall 5 blocks ahead: both sides know it.
+            host('command', command=f'worldborder center {cx} {cz}')
+            host('command', command='worldborder set 10')
+            seen = None
+            for _ in range(10):
+                player.wait(2)
+                seen = [g('status').get('border') for g in (player, other)]
+                if all(b and b['size'] == 10 and b['center'] == [cx, cz] for b in seen):
+                    break
+            result[f'{label} border'] = seen
+            # Sprint-jumping into the wall: it stops the player at the border.
+            player('command', command=f'tp @s {cx} {y} {cz} 0 0')
+            player.wait(10)
+            player.raw('look-at', f'{cx:.2f}', f'{y + 1.6:.2f}', f'{cz + 20:.2f}')
+            for k in ('w', 'ctrl', 'space'):
+                player.raw('key', k, 'down')
+            player.wait(40)
+            for k in ('space', 'ctrl', 'w'):
+                player.raw('key', k, 'up')
+            player.wait(10)
+            result[f'{label} reached'] = round(pos_of(player)[2] - cz, 2)
+            player.shot(out, f'border-{label}')
+            # Two blocks outside, with no safe zone: the border hurts.
+            host('command', command='worldborder damage buffer 0')
+            host('command', command='worldborder damage amount 1')
+            player('command', command='effect give @s minecraft:instant_health 1 5')
+            player.wait(20)
+            player('command', command=f'tp @s {cx} {y} {cz + 7}')
+            player.wait(5)
+            before = player('status')['player']['health']
+            player.wait(40)
+            result[f'{label} hurt'] = [before, player('status')['player']['health']]
+            player('command', command=f'tp @s {cx} {y} {cz}')
+            player('command', command='effect give @s minecraft:instant_health 1 5')
+            host('command', command='worldborder damage amount 0.2')
+            host('command', command='worldborder damage buffer 5')
+            other('command', command='gamemode survival')
+    finally:
+        guest('command', command='gamemode survival')
+        host('command', command='gamemode survival')
+        host('command', command='worldborder damage amount 0.2')
+        host('command', command='worldborder damage buffer 5')
+        host('command', command='worldborder center 0 0')
+        host('command', command='worldborder set 59999968')
+    wrong = {}
+    for label in ('host', 'guest'):
+        x, y, z = spots[label]
+        known = result[f'{label} border']
+        if not all(b and b['size'] == 10 and b['center'] == [x, z] for b in known):
+            wrong[f'{label} border'] = known
+        if not 4.0 < result[f'{label} reached'] <= 4.71:
+            wrong[f'{label} reached'] = result[f'{label} reached']
+        before, after = result[f'{label} hurt']
+        if not after < before:
+            wrong[f'{label} hurt'] = result[f'{label} hurt']
+    assert not wrong, f'border: {wrong}\n{result}'
+    return result
+
+
+def check_particles(host, guest, out):
+    spots = apart(host, guest)
+    result = {}
+    for label, player, other in (('host', host, guest), ('guest', guest, host)):
+        # For the player alone (`@s`), then for every player near.
+        before = {side: made(g, 'flame') for side, g in (('own', player), ('other', other))}
+        player('command', command='particle minecraft:flame ~ ~1 ~3 .2 .2 .2 0 60 force @s')
+        player.wait(10)
+        result[f'{label} @s'] = {side: made(g, 'flame') - before[side] for side, g in (('own', player), ('other', other))}
+        player.shot(out, f'flame-{label}')
+        # No spread: one point, wherever the player stands.
+        player('command', command='particle minecraft:flame ~ ~1 ~3 0 0 0 0 200 force @s')
+        player.wait(3)
+        player.shot(out, f'zero-spread-{label}')
+        result[f'{label} all'] = sparked(player, other, ['dust'], lambda: player(
+            'command', command='particle minecraft:dust{color:[1,0,0],scale:2} ~ ~1 ~3 0 0 0 0 10'))
+    # A TNT's blast between the players: its burst on both sides.
+    x, y, z = spots['host']
+    host('command', command='gamemode creative')
+    guest('command', command='gamemode creative')
+    try:
+        result['blast'] = sparked(host, guest, ['explosion_emitter'], lambda: host(
+            'command', command=f'summon minecraft:tnt {x + 6.5} {y} {z + 4.5} {{fuse:10s}}'), ticks=40)
+        host.shot(out, 'blast')
+    finally:
+        host('command', command='gamemode survival')
+        guest('command', command='gamemode survival')
+        host('command', command=f'fill {x - 3} {y - 1} {z - 3} {x + 16} {y - 1} {z + 8} minecraft:stone')
+    # Without the server thread a guest's command reaches no host player (as `@a` doesn't).
+    if not SERVER_THREAD:
+        result['guest all'].pop('other dust')
+    wrong = {k: v for k, v in result.items() if not k.endswith('@s') and not all(n > 0 for n in v.values())}
+    wrong.update({k: v for k, v in result.items() if k.endswith('@s') and not (v['own'] >= 30 and v['other'] == 0)})
+    assert not wrong, f'particles: {wrong}\n{result}'
+    return result
+
+
 def check_blast(host, guest, out):
     guest('command', command='gamemode survival')
     guest('command', command='clear @s')
@@ -3826,7 +4233,15 @@ CHECK_FNS = {'tab': check_tab, 'self': check_self, 'armour': check_armour,
              'worldspawn': check_world_spawn, 'beds': check_beds, 'shield': check_shield, 'deathmining': check_death_mining,
              'contacts': check_contacts, 'absorption': check_absorption, 'breath': check_breath,
              'lava': check_lava, 'levels': check_levels, 'drops': check_drops,
-             'underwater': check_underwater}
+             'underwater': check_underwater,
+             'looks': check_looks,
+             'leads': check_leads,
+             'thrown': check_thrown,
+             'sparks': check_sparks,
+             'hud': check_hud,
+             'sidebar': check_sidebar,
+             'border': check_border,
+             'particles': check_particles}
 
 
 def run(ctl, out, resources, checks):

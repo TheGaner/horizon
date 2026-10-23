@@ -42,6 +42,45 @@ pub fn time<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     SPANS.with(|s| s.borrow_mut().push(Span { name, ms, cpu_ms }));
     out
 }
+/// A non-borrowing named timing scope. Unlike wrapping a large block in a
+/// closure, it can be dropped at a chosen point without changing local
+/// variable lifetimes, `?` propagation or frame-render execution order.
+/// Disabled scopes make no clock reads and do not allocate.
+#[must_use = "keep the scope alive until the operation ends"]
+pub struct Scope {
+    name: &'static str,
+    started: Option<Instant>,
+    started_cpu: Option<Duration>,
+}
+
+#[inline]
+pub fn scope(name: &'static str) -> Scope {
+    let started = ENABLED.load(Ordering::Relaxed).then(Instant::now);
+    Scope {
+        name,
+        started,
+        started_cpu: started.and_then(|_| thread_cpu()),
+    }
+}
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            let ms = started.elapsed().as_secs_f32() * 1000.0;
+            let cpu_ms = thread_cpu()
+                .zip(self.started_cpu)
+                .map_or(ms, |(end, start)| (end - start).as_secs_f32() * 1000.0);
+            SPANS.with(|spans| {
+                spans.borrow_mut().push(Span {
+                    name: self.name,
+                    ms,
+                    cpu_ms,
+                })
+            });
+        }
+    }
+}
+
 /// The CPU time this thread has used, where the platform tells it: a tick
 /// with more wall time than CPU time waited (for a lock, or for a core on a
 /// busy machine).
@@ -87,12 +126,62 @@ pub fn describe(spans: &[Span]) -> String {
     list.join(", ")
 }
 
+/// HORIZON_SPIKES=0: include every span, including submillisecond draw-list
+/// preparation costs. Keep upstream's optional wall/CPU attribution.
+pub fn describe_all(spans: &[Span]) -> String {
+    spans
+        .iter()
+        .map(|s| {
+            if s.cpu_ms < s.ms * 0.9 {
+                format!("{} {:.3}/{:.3}", s.name, s.ms, s.cpu_ms)
+            } else {
+                format!("{} {:.3}", s.name, s.ms)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::Span;
 
-    /// Spans of one name add up; a span the thread spent mostly waiting
-    /// shows its CPU time after the wall time, short ones are left out.
+    #[test]
+    fn detailed_log_preserves_submillisecond_measurements() {
+        let spans = [
+            Span {
+                name: "draw_list",
+                ms: 0.0034,
+                cpu_ms: 0.0034,
+            },
+            Span {
+                name: "tick",
+                ms: 3.4,
+                cpu_ms: 3.4,
+            },
+        ];
+        assert_eq!(super::describe(&spans), "tick 3.4");
+        assert_eq!(super::describe_all(&spans), "draw_list 0.003, tick 3.400");
+    }
+
+    #[test]
+    fn scope_records_on_drop_in_its_thread() {
+        let _ = super::take();
+        let span = super::Scope {
+            name: "scope_regression",
+            started: Some(std::time::Instant::now()),
+            started_cpu: super::thread_cpu(),
+        };
+        assert!(super::take().is_empty());
+        drop(span);
+        let values = super::take();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].name, "scope_regression");
+        assert!(values[0].ms >= 0.0);
+        assert!(values[0].cpu_ms >= 0.0);
+    }
+
+    /// Upstream CPU/wall summation remains exact across repeated scopes.
     #[test]
     fn spans_sum_by_name_and_show_waits() {
         super::SPANS.with(|s| {

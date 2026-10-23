@@ -92,6 +92,12 @@ public final class LocatorBarClient {
     private static volatile boolean players;
     private static volatile boolean chat;
     private static volatile boolean state;
+    /** Only the player-drop oracle enables original-codec item-entity telemetry. */
+    private static volatile boolean items;
+    /** Exact entity lifetime observations, opt-in only for source-hashed tests. */
+    private static volatile boolean entityLife;
+    /** Objective and score-reset packets not included in normal state logging. */
+    private static volatile boolean objectiveWire;
     private static final Map<UUID, String> NAMES = new LinkedHashMap<>();
 
     public static void main(String[] args) throws Exception {
@@ -126,6 +132,15 @@ public final class LocatorBarClient {
                     case "players" -> LocatorBarClient.players = w[1].equals("on");
                     case "chat" -> chat = w[1].equals("on");
                     case "state" -> state = w[1].equals("on");
+                    case "items" -> items = w[1].equals("on");
+                    case "entitylife" -> entityLife = w[1].equals("on");
+                    case "objectives" -> objectiveWire = w[1].equals("on");
+                    case "drop" -> players.get(w[1]).drop(w[2]);
+                    case "throw" -> players.get(w[1]).throwInventorySlot(w[2]);
+                    case "predictthrow" -> players.get(w[1]).predictedThrow(w[2]);
+                    case "predictclick" -> players.get(w[1]).predictedClick(w[2]);
+                    case "select" -> players.get(w[1]).selectHotbar(Integer.parseInt(w[2]));
+                    case "click" -> players.get(w[1]).clickInventory(w[2]);
                     case "end" -> {
                         try (PrintWriter out = new PrintWriter(Files.newBufferedWriter(output, StandardCharsets.UTF_8))) {
                             for (Player p : players.values()) {
@@ -189,6 +204,20 @@ public final class LocatorBarClient {
         private final Map<Integer, String> seen = new java.util.HashMap<>();
         private final Object replyLock = new Object();
         private int replies;
+        /** Last inventory menu state so GUI Q uses the real menu sequence. */
+        private volatile int inventoryStateId;
+        /** Original-codec GUI prediction is deliberately opt-in; normal click/throw
+         * remains the adversarial empty-delta test. This state follows every
+         * server inventory packet, even with state telemetry disabled. */
+        private final Object menuLock = new Object();
+        private final Map<Integer, net.minecraft.world.item.ItemStack> menuSlots = new java.util.HashMap<>();
+        private net.minecraft.world.item.ItemStack menuCarried = net.minecraft.world.item.ItemStack.EMPTY;
+        private boolean menuInitialized;
+        /** Track dropped items by entity id, but never compare the random id. */
+        private final java.util.Set<Integer> itemEntities = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        /** Mapped only within one TCP receiver, not between servers/players. */
+        private final Map<Integer, Integer> itemOrdinals = new java.util.HashMap<>();
+        private int nextItemOrdinal;
 
         Player(String name) {
             this.name = name;
@@ -215,6 +244,200 @@ public final class LocatorBarClient {
             synchronized (lines) {
                 lines.add("step=" + step + " " + line);
             }
+        }
+
+        /** Send precisely the Java 26.3 packet for Q or Ctrl+Q.
+         * Physical-key/latch mapping is separately tested at Horizon's actual
+         * keyboard entry point; this codec client tests authoritative results.
+         */
+        void drop(String mode) throws Exception {
+            var action = switch (mode) {
+                case "single" -> net.minecraft.network.protocol.game.ServerboundPlayerActionPacket.Action.DROP_ITEM;
+                case "all" -> net.minecraft.network.protocol.game.ServerboundPlayerActionPacket.Action.DROP_ALL_ITEMS;
+                default -> throw new IllegalArgumentException("unknown drop kind " + mode);
+            };
+            send(new net.minecraft.network.protocol.game.ServerboundPlayerActionPacket(
+                action, net.minecraft.core.BlockPos.ZERO, net.minecraft.core.Direction.DOWN, 0));
+            record("sent " + mode + " action=" + action.ordinal());
+        }
+
+        /** The inventory screen maps Q to THROW button 0 and Ctrl+Q to button 1.
+         * Optional :SLOT tests every menu slot, rather than just hotbar.0.
+         */
+        void throwInventorySlot(String spec) throws Exception {
+            String[] parts = spec.split(":", -1);
+            if (parts.length > 2) throw new IllegalArgumentException("throw spec " + spec);
+            byte button = switch (parts[0]) {
+                case "single" -> 0;
+                case "all" -> 1;
+                default -> throw new IllegalArgumentException("unknown inventory throw kind " + spec);
+            };
+            short slot = (short) (parts.length == 2 ? Integer.parseInt(parts[1]) : 36);
+            send(new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(
+                0, inventoryStateId, slot, button,
+                net.minecraft.world.inventory.ContainerInput.THROW,
+                new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>(),
+                net.minecraft.network.HashedStack.EMPTY));
+            record("sent gui " + spec + " button=" + button);
+        }
+
+        /** Keep authoritative menu snapshots distinct from client prediction.
+         * Menu 0 maps main inventory indices 9..35 to the same menu slots,
+         * hotbar indices 0..8 to menu slots 36..44, and offhand 40 to 45.
+         */
+        private void receiveMenu(Packet<?> p) {
+            synchronized (menuLock) {
+                if (p instanceof net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket c
+                    && c.containerId() == 0) {
+                    menuSlots.clear();
+                    for (int i = 0; i < c.items().size(); i++) menuSlots.put(i, c.items().get(i).copy());
+                    menuCarried = c.carriedItem().copy();
+                    inventoryStateId = c.stateId();
+                    menuInitialized = true;
+                } else if (p instanceof net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket c) {
+                    if (c.getContainerId() == 0) {
+                        menuSlots.put(c.getSlot(), c.getItem().copy());
+                        inventoryStateId = c.getStateId();
+                        menuInitialized = true;
+                    } else if (c.getContainerId() == -1 && c.getSlot() == -1) {
+                        menuCarried = c.getItem().copy();
+                    }
+                } else if (p instanceof net.minecraft.network.protocol.game.ClientboundSetCursorItemPacket c) {
+                    // Vanilla's client cursor is authoritative on correction;
+                    // otherwise a predicted pickup can contaminate later cases.
+                    menuCarried = c.contents().copy();
+                } else if (p instanceof net.minecraft.network.protocol.game.ClientboundSetPlayerInventoryPacket i) {
+                    int slot = i.slot();
+                    int menu = slot <= 8 ? 36 + slot : slot <= 35 ? slot : slot <= 39 ? 8 - (slot - 36) : slot == 40 ? 45 : -1;
+                    if (menu >= 0 && slot >= 0) {
+                        menuSlots.put(menu, i.contents().copy());
+                        menuInitialized = true;
+                    }
+                }
+            }
+        }
+
+        /** Vanilla HashedStack.create handles normal item IDs/counts and an
+         * empty component patch. Refuse custom patches rather than fabricating
+         * the decorated registry hash used by the real Java client. */
+        private static net.minecraft.network.HashedStack knownHash(net.minecraft.world.item.ItemStack stack) {
+            if (!stack.isEmpty() && !stack.getComponentsPatch().isEmpty()) {
+                throw new IllegalArgumentException("component-hashed predicted items require registry hash generator");
+            }
+            return net.minecraft.network.HashedStack.create(stack,
+                component -> { throw new IllegalStateException("unexpected custom component hash"); });
+        }
+
+        private void sendPredicted(short slot, byte button, net.minecraft.world.inventory.ContainerInput mode,
+                                   net.minecraft.world.item.ItemStack next, boolean changed,
+                                   net.minecraft.world.item.ItemStack nextCursor) throws Exception {
+            if (!menuInitialized) throw new IllegalStateException("no observed inventory slots for predicted click");
+            // Fail *before* mutating the local prediction if a hash is unavailable.
+            var changedSlots = new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<net.minecraft.network.HashedStack>();
+            if (changed) changedSlots.put(slot & 0xffff, knownHash(next));
+            var carried = knownHash(nextCursor);
+            int stateId = inventoryStateId;
+            send(new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(
+                0, stateId, slot, button, mode, changedSlots, carried));
+            if (changed) menuSlots.put((int) slot, next.copy());
+            menuCarried = nextCursor.copy();
+        }
+
+        /** Real Java UI prediction for THROW: locally decrement slot, then send
+         * its hashed changed value rather than the legacy empty change map. */
+        void predictedThrow(String spec) throws Exception {
+            String[] parts = spec.split(":", -1);
+            if (parts.length > 2) throw new IllegalArgumentException("predictthrow " + spec);
+            byte button = switch (parts[0]) {
+                case "single" -> 0;
+                case "all" -> 1;
+                default -> throw new IllegalArgumentException("predictthrow mode " + spec);
+            };
+            short slot = (short) (parts.length == 2 ? Integer.parseInt(parts[1]) : 36);
+            synchronized (menuLock) {
+                var before = menuSlots.get(slot & 0xffff);
+                if (before == null) throw new IllegalStateException("unknown predicted slot " + slot);
+                var after = before.copy();
+                if (!after.isEmpty()) {
+                    if (button == 1 || after.getCount() == 1) after = net.minecraft.world.item.ItemStack.EMPTY;
+                    else after.shrink(1);
+                }
+                sendPredicted(slot, button, net.minecraft.world.inventory.ContainerInput.THROW,
+                    after, !net.minecraft.world.item.ItemStack.matches(before, after), menuCarried);
+            }
+            record("sent predicted-gui " + spec);
+        }
+
+        /** Narrow vanilla PICKUP subset with fully known plain stacks. Clicks
+         * with custom components or unknown slots explicitly fail this oracle. */
+        void predictedClick(String spec) throws Exception {
+            String[] parts = spec.split(":", -1);
+            if (parts.length != 3 || !parts[2].equals("PICKUP"))
+                throw new IllegalArgumentException("predictclick supports PICKUP only: " + spec);
+            short slot = Short.parseShort(parts[0]);
+            byte button = Byte.parseByte(parts[1]);
+            if (button != 0 && button != 1) throw new IllegalArgumentException("PICKUP button " + button);
+            synchronized (menuLock) {
+                var cursor = menuCarried.copy();
+                if (slot == -999) {
+                    if (!cursor.isEmpty()) {
+                        if (button == 0 || cursor.getCount() == 1) cursor = net.minecraft.world.item.ItemStack.EMPTY;
+                        else cursor.shrink(1);
+                    }
+                    sendPredicted(slot, button, net.minecraft.world.inventory.ContainerInput.PICKUP,
+                        net.minecraft.world.item.ItemStack.EMPTY, false, cursor);
+                } else {
+                    var old = menuSlots.get((int) slot);
+                    if (old == null) throw new IllegalStateException("unknown predicted slot " + slot);
+                    var next = old.copy();
+                    if (cursor.isEmpty()) {
+                        if (!next.isEmpty()) {
+                            int count = button == 0 ? next.getCount() : (next.getCount() + 1) / 2;
+                            cursor = next.copy();
+                            cursor.setCount(count);
+                            next.shrink(count);
+                        }
+                    } else if (next.isEmpty()) {
+                        next = cursor.copy();
+                        if (button == 1) {
+                            next.setCount(1);
+                            cursor.shrink(1);
+                        } else cursor = net.minecraft.world.item.ItemStack.EMPTY;
+                    } else if (net.minecraft.world.item.ItemStack.isSameItemSameComponents(next, cursor)) {
+                        int room = next.getMaxStackSize() - next.getCount();
+                        int count = Math.min(cursor.getCount(), button == 1 ? Math.min(1, room) : room);
+                        if (count > 0) { next.grow(count); cursor.shrink(count); }
+                    } else if (button == 0) {
+                        var swap = next;
+                        next = cursor;
+                        cursor = swap;
+                    } else throw new IllegalArgumentException("different-item right-click not in supported oracle");
+                    sendPredicted(slot, button, net.minecraft.world.inventory.ContainerInput.PICKUP,
+                        next, !net.minecraft.world.item.ItemStack.matches(old, next), cursor);
+                }
+            }
+            record("sent predicted-click " + spec);
+        }
+
+        /** Uses the 26.3 vanilla codec for hotbar changes; 0..8 is a client slot. */
+        void selectHotbar(int slot) throws Exception {
+            if (slot < 0 || slot > 8) throw new IllegalArgumentException("hotbar " + slot);
+            send(new net.minecraft.network.protocol.game.ServerboundSetCarriedItemPacket(slot));
+            record("sent select " + slot);
+        }
+
+        /** General inventory click, 'slot:button:mode' (the real ContainerInput enum). */
+        void clickInventory(String spec) throws Exception {
+            String[] parts = spec.split(":", -1);
+            if (parts.length != 3) throw new IllegalArgumentException("click spec " + spec);
+            short slot = Short.parseShort(parts[0]);
+            byte button = Byte.parseByte(parts[1]);
+            var mode = net.minecraft.world.inventory.ContainerInput.valueOf(parts[2]);
+            send(new net.minecraft.network.protocol.game.ServerboundContainerClickPacket(
+                0, inventoryStateId, slot, button, mode,
+                new it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap<>(),
+                net.minecraft.network.HashedStack.EMPTY));
+            record("sent click " + spec);
         }
 
         void still() throws Exception {
@@ -296,7 +519,46 @@ public final class LocatorBarClient {
                     if (p instanceof net.minecraft.network.protocol.game.ClientboundLoginPacket l) {
                         id = l.playerId();
                     }
+                    receiveMenu(p);
                     if (state) recordState(p);
+                    if ((items || entityLife)
+                        && p instanceof net.minecraft.network.protocol.game.ClientboundAddEntityPacket a
+                        && a.getType() == net.minecraft.world.entity.EntityTypes.ITEM) {
+                        itemEntities.add(a.getId());
+                        if (items) record("item-added");
+                        if (entityLife) {
+                            int ordinal = ++nextItemOrdinal;
+                            itemOrdinals.put(a.getId(), ordinal);
+                            record("entity-spawn #" + ordinal);
+                        }
+                    } else if ((items || entityLife)
+                        && p instanceof net.minecraft.network.protocol.game.ClientboundSetEntityDataPacket d
+                        && itemEntities.contains(d.id())) {
+                        for (var value : d.packedItems()) {
+                            if (value.value() instanceof net.minecraft.world.item.ItemStack stack) {
+                                if (items) record("item-data " + item(stack));
+                                if (entityLife) record("entity-meta #" + itemOrdinals.get(d.id()) + " " + item(stack));
+                            }
+                        }
+                    }
+                    if (entityLife && p instanceof net.minecraft.network.protocol.game.ClientboundTakeItemEntityPacket take) {
+                        Integer ordinal = itemOrdinals.get(take.getItemId());
+                        if (ordinal != null) record("entity-take #" + ordinal + " count=" + take.getAmount());
+                    }
+                    if (entityLife && p instanceof net.minecraft.network.protocol.game.ClientboundRemoveEntitiesPacket rm) {
+                        rm.entityIds().forEach(itemId -> {
+                            Integer ordinal = itemOrdinals.remove(itemId);
+                            if (ordinal != null) {
+                                record("entity-remove #" + ordinal);
+                                itemEntities.remove(itemId);
+                            }
+                        });
+                    }
+                    if (objectiveWire && p instanceof net.minecraft.network.protocol.game.ClientboundSetObjectivePacket objective) {
+                        record("objective " + objective.getMethod() + " " + objective.getObjectiveName());
+                    } else if (objectiveWire && p instanceof net.minecraft.network.protocol.game.ClientboundResetScorePacket reset) {
+                        record("reset-score " + reset.owner() + " " + reset.objectiveName());
+                    }
                     if (p instanceof net.minecraft.network.protocol.game.ClientboundAddEntityPacket a
                         && a.getType() == net.minecraft.world.entity.EntityTypes.PLAYER) {
                         String who = NAMES.getOrDefault(a.getUUID(), "uuid?");
@@ -358,9 +620,16 @@ public final class LocatorBarClient {
                 && g.getEvent() == net.minecraft.network.protocol.game.ClientboundGameEventPacket.CHANGE_GAME_MODE) {
                 record("gamemode " + (int) g.getParam());
             } else if (p instanceof net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket c) {
+                if (c.getContainerId() == 0) inventoryStateId = c.getStateId();
                 record("slot " + c.getContainerId() + " " + c.getSlot() + " " + item(c.getItem()));
             } else if (p instanceof net.minecraft.network.protocol.game.ClientboundSetPlayerInventoryPacket i) {
                 record("inventory " + i.slot() + " " + item(i.contents()));
+            } else if (p instanceof net.minecraft.network.protocol.game.ClientboundSetScorePacket score) {
+                // Server-driven command-block scoreboard effects are visible
+                // to each player only when an objective is displayed.
+                record("score " + score.owner() + " " + score.objectiveName() + " " + score.score());
+            } else if (p instanceof net.minecraft.network.protocol.game.ClientboundSetDisplayObjectivePacket display) {
+                record("display " + display.getSlot() + " " + display.getObjectiveName());
             } else if (p instanceof net.minecraft.network.protocol.game.ClientboundUpdateMobEffectPacket e && e.getEntityId() == id) {
                 record("effect " + e.getEffect().getRegisteredName() + " " + e.getEffectAmplifier() + " " + e.getEffectDurationTicks());
             } else if (p instanceof net.minecraft.network.protocol.game.ClientboundRemoveMobEffectPacket e && e.entityId() == id) {

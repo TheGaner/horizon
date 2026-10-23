@@ -292,14 +292,48 @@ fn reports_errors_with_their_place() {
 
 /// What naga refuses and drivers accept: `vec % scalar` (Noble), `sqrt` of
 /// a negative constant (Bloop's NaN), constants naga can't fold (Bliss's
-/// `?:`, `mix`), and 16-bit types (Noble on NVIDIA).
+/// `?:`, `mix`), 16-bit types (Noble on NVIDIA), `mat2(vec4)` (Bloop),
+/// `1 << 31` (Rethinking Voxels), vertex `texture2D` without LOD (Bliss),
+/// nested array varyings (Noble), and struct varyings (Photon).
 #[test]
 fn legalises_what_naga_refuses() {
     let mut link = Link::default();
+    let vs = run(
+        Stage::Vertex,
+        "uniform sampler2D colortex0;
+struct CloudsParameters {
+    vec3 color;
+    float density;
+};
+varying CloudsParameters clouds;
+varying vec3 grid[2][2];
+void main() {
+    vec4 s = texture2D(colortex0, vec2(0.5));
+    clouds.color = s.rgb;
+    clouds.density = s.a;
+    grid[0][0] = s.rgb;
+    grid[0][1] = s.gbr;
+    grid[1][0] = s.brg;
+    grid[1][1] = vec3(1.0);
+    gl_Position = vec4(0.0, 0.0, 0.0, 1.0);
+}
+",
+        &mut link,
+    )
+    .unwrap();
+    reparse(&vs.wgsl).unwrap();
+
     let fs = run(
         Stage::Fragment,
         "uniform vec2 uv;
+struct CloudsParameters {
+    vec3 color;
+    float density;
+};
+varying CloudsParameters clouds;
+varying vec3 grid[2][2];
 const int RES = 256 % 100;
+const int SIGN_BIT = 1 << 31;
 const vec3 TARGET = length(vec3(1.0)) < 0.001 ? vec3(0.0) : normalize(vec3(1.0));
 const vec3 TINT = mix(TARGET, vec3(1.0), 0.5);
 const vec3 HALF = TINT * 0.5;
@@ -309,7 +343,9 @@ void main() {
     ivec2 texel = ivec2(uv) % RES;
     texel %= 7;
     uint packed = packFloat2x16(f16vec2(HALF.xy));
-    gl_FragColor = vec4(vec2(texel), float(pack(packed).x), nan());
+    mat2 rot = mat2(vec4(1.0, 0.0, 0.0, 1.0));
+    vec2 r = rot * vec2(clouds.density, float(SIGN_BIT != 0));
+    gl_FragColor = vec4(vec2(texel) + r + clouds.color.xy + grid[1][0].xy, float(pack(packed).x), nan());
 }
 ",
         &mut link,
@@ -325,10 +361,83 @@ void main() {
         "uvec2 pack(uint v)",
         "return iris_sqrt(-1.);",
         "uint packed = packHalf2x16(vec2(HALF.xy));",
+        "iris_mat2(",
     ] {
         assert!(fs.glsl.contains(wanted), "{wanted}\n{}", fs.glsl);
     }
     reparse(&fs.wgsl).unwrap();
+}
+
+/// What Photon, Chocapic13', MakeUp Ultra Fast and Bliss write and GL takes:
+/// lookups without a level in a vertex shader, a struct passed between
+/// stages, `textureGather`, a `bool` given to `vec3(..)`, `const in`
+/// parameters and an array field in a struct built by its constructor.
+#[test]
+fn legalises_what_photon_and_chocapic_write() {
+    let mut link = Link::default();
+    let header = "uniform sampler2D colortex0;
+uniform sampler2DShadow shadowtex0;
+struct Clouds { float coverage; vec2 wind; mat3 turn; int layers; };
+";
+    let vs = run(
+        Stage::Vertex,
+        &format!(
+            "{header}flat varying Clouds clouds;
+void main() {{
+    clouds.coverage = texture2D(colortex0, vec2(0.5)).r + shadow2D(shadowtex0, vec3(0.5)).r;
+    clouds.wind = textureOffset(colortex0, vec2(0.5), ivec2(1, 0), 2.0).rg;
+    clouds.turn = mat3(1.0);
+    clouds.layers = 2;
+    gl_Position = ftransform();
+}}
+"
+        ),
+        &mut link,
+    )
+    .unwrap();
+    for wanted in [
+        "textureLod(sampler2D(colortex0_t",
+        "vec2(0.5), 0.)",
+        "textureLodOffset(sampler2D(colortex0_t",
+        "clouds_iriscoverage = clouds.coverage;",
+        "clouds_iristurn_iris1 = clouds.turn[1];",
+    ] {
+        assert!(vs.glsl.contains(wanted), "{wanted}\n{}", vs.glsl);
+    }
+    reparse(&vs.wgsl).unwrap();
+    let fs = run(
+        Stage::Fragment,
+        &format!(
+            "{header}flat varying Clouds clouds;
+struct Spline {{ float slope; float[3] coeffs; }};
+float edge(const in float x, const float r) {{ return float(x < r); }}
+void main() {{
+    const Spline spline = Spline(0.0, float[3](1.0, 2.0, 3.0));
+    vec4 four = textureGather(colortex0, vec2(0.5), 1);
+    vec3 disc = vec3(clouds.coverage < 0.5);
+    vec2 cell = vec2(0.0);
+    float part = modf(clouds.coverage * 4.0, cell.y);
+    gl_FragColor = vec4(disc * edge(four.x, spline.coeffs[1]), clouds.wind.x + float(clouds.layers) + part + cell.y);
+}}
+"
+        ),
+        &mut link,
+    )
+    .unwrap();
+    for wanted in [
+        "iris_gather(colortex0_t",
+        "clouds.coverage = clouds_iriscoverage;",
+        "float edge(in float x, float r)",
+        "cell.y = trunc(",
+    ] {
+        assert!(fs.glsl.contains(wanted), "{wanted}\n{}", fs.glsl);
+    }
+    reparse(&fs.wgsl).unwrap();
+    // The vertex program's outputs are the fragment program's inputs.
+    assert_eq!(
+        io(&vs, true).get("clouds_iriswind"),
+        io(&fs, false).get("clouds_iriswind")
+    );
 }
 
 /// A fragment output narrower than its four-channel target (Steadfast's

@@ -22,7 +22,8 @@ struct Out {
     @location(3) @interpolate(flat) edges: vec4<f32>,
 }
 @vertex fn vs_screen(@location(0) pos: vec2<f32>, @location(1) uv: vec2<f32>,
-    @location(2) rect: vec4<f32>, @location(3) color: vec4<f32>) -> Out {
+    @location(2) rect: vec4<f32>, @location(3) color: vec4<f32>,
+    @location(4) sampling: vec2<f32>) -> Out {
     var out: Out;
     out.clip = vec4(pos, 0.0, 1.0);
     out.uv = uv;
@@ -32,6 +33,8 @@ struct Out {
     out.edges = vec4(rect.xy + half, rect.zw - half);
     return out;
 }
+// Source #1190: specialist shaders select nearest/linear, clamp/repeat,
+// and the atlas has padded borders for blurred standalone textures.
 fn sample(in: Out) -> vec4<f32> {
     var f = in.uv;
     if !CLAMP {

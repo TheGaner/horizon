@@ -106,7 +106,14 @@ impl CommandBlock {
             last_output: track_output
                 .then(|| tag.get("LastOutput"))
                 .flatten()
-                .map(|t| crate::scoreboard::comp_text(&crate::scoreboard::tag_to_json(t))),
+                .map(|t| {
+                    let component = crate::scoreboard::tag_to_json(t);
+                    // Rendering into visible Text spans can resolve translations
+                    // and flatten nested hover/click metadata. Keep the decoded
+                    // component itself as the serialization source so saving
+                    // an unedited command result does not lose those fields.
+                    crate::scoreboard::comp_text(&component).with_component(component)
+                }),
             update_last_execution,
             last_execution: if update_last_execution {
                 number(tag.get("LastExecution")).unwrap_or(-1)
@@ -118,8 +125,9 @@ impl CommandBlock {
             condition_met: flag("conditionMet", false),
         }
     }
-    /// `CommandBlockEntity.saveAdditional`. The last output is written as a
-    /// plain string component.
+    /// `CommandBlockEntity.saveAdditional`. Text is encoded with the vanilla
+    /// component codec: plain literals are NBT strings, styled/rich text
+    /// remains an NBT compound or list rather than losing its formatting.
     pub fn save(&self) -> Vec<(&'static str, Tag)> {
         let mut out = vec![
             ("Command", Tag::String(self.command.as_str().into())),
@@ -132,7 +140,10 @@ impl CommandBlock {
         if self.track_output
             && let Some(last) = &self.last_output
         {
-            out.push(("LastOutput", Tag::String(last.plain().as_str().into())));
+            out.push((
+                "LastOutput",
+                crate::scoreboard::component_tag(&last.component()),
+            ));
         }
         out.push((
             "UpdateLastExecution",
@@ -186,6 +197,19 @@ pub fn repeats(mode: Mode, powered: bool, auto: bool) -> bool {
     mode == Mode::Auto && (powered || auto)
 }
 
+/// `CommandBlockEntity.setAutomatic`: an explicit NBT or UI update from
+/// redstone-triggered to always-active schedules one tick, unless this block
+/// needs a redstone signal or is a chain block. This is NOT a rule for
+/// cold-loading existing `auto:1b` block entities from a saved chunk.
+pub fn automatic_transition_schedules(
+    mode: Mode,
+    was_auto: bool,
+    now_auto: bool,
+    powered: bool,
+) -> bool {
+    !was_auto && now_auto && !powered && mode != Mode::Sequence
+}
+
 /// `CommandBlock.setPoweredAndUpdate`: a rising signal schedules the impulse
 /// or repeating block's tick unless it is always active anyway.
 pub fn power_schedules(mode: Mode, was_powered: bool, powered: bool, auto: bool) -> bool {
@@ -227,6 +251,23 @@ mod tests {
     }
 
     #[test]
+    fn automatic_nbt_false_to_true_transition_schedules_once() {
+        for mode in [Mode::Redstone, Mode::Auto] {
+            assert!(automatic_transition_schedules(mode, false, true, false));
+            assert!(!automatic_transition_schedules(mode, true, true, false));
+            assert!(!automatic_transition_schedules(mode, false, false, false));
+            assert!(!automatic_transition_schedules(mode, true, false, false));
+            assert!(!automatic_transition_schedules(mode, false, true, true));
+        }
+        assert!(!automatic_transition_schedules(
+            Mode::Sequence,
+            false,
+            true,
+            false
+        ));
+    }
+
+    #[test]
     fn saves_like_base_command_block() {
         let block = CommandBlock {
             command: "say hi".into(),
@@ -252,5 +293,49 @@ mod tests {
         let tag = Tag::compound(quiet.save());
         assert!(tag.get("LastOutput").is_none() && tag.get("LastExecution").is_none());
         assert_eq!(CommandBlock::load(&tag).last_output, None);
+    }
+
+    #[test]
+    fn translated_nested_last_output_preserves_hover_and_scalar_args() {
+        // Shape saved by a real 26.3 scoreboard command block, including
+        // a nested translatable objective with a hover event and scalar args.
+        let output = horizon_world::nbt::parse_snbt(
+            r##"{text:"[00:26:45] ",extra:[{translate:"commands.scoreboard.players.add.success.single",with:[1,{translate:"chat.square_brackets",with:[{text:"cbhit",hover_event:{action:"show_text",value:"cbhit"}}]},"#probe",2]}]}"##,
+        ).expect("real vanilla nested output fixture").0;
+        let raw = Tag::compound([
+            (
+                "Command",
+                Tag::String("scoreboard players add #probe cbhit 1".into()),
+            ),
+            ("TrackOutput", Tag::Byte(1)),
+            ("SuccessCount", Tag::Int(1)),
+            ("LastOutput", output.clone()),
+        ]);
+        let restored = CommandBlock::load(&raw);
+        assert!(restored.last_output_string().contains("[00:26:45]"));
+        assert_eq!(
+            Tag::compound(restored.save()).get("LastOutput"),
+            Some(&output)
+        );
+    }
+
+    #[test]
+    fn styled_last_output_survives_nbt_roundtrip() {
+        let command = CommandBlock {
+            last_output: Some(Text::colored("Error", crate::text::RED)),
+            ..CommandBlock::default()
+        };
+        let saved = Tag::compound(command.save());
+        let expected = Tag::compound([
+            ("color", Tag::String("red".into())),
+            ("text", Tag::String("Error".into())),
+        ]);
+        assert_eq!(saved.get("LastOutput"), Some(&expected));
+        let restored = CommandBlock::load(&saved);
+        assert_eq!(restored.last_output_string(), "Error");
+        assert_eq!(
+            Tag::compound(restored.save()).get("LastOutput"),
+            Some(&expected)
+        );
     }
 }

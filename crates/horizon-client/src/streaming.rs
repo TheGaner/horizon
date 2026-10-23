@@ -370,8 +370,11 @@ impl GenerationScan {
                     wanted.push((input.ranges.priority(x, z, input.loading), x, z));
                 }
             }
-            // Forced chunks and their generation neighbourhood.
-            let reach = margin - 1;
+            // A level-31 forced ticket block-ticks its neighbouring chunks
+            // (level 32). Each of those needs a resident 3x3 neighbourhood
+            // (`ticking_chunk`), hence two extra columns from the ticket.
+            // Nondecorating generators need this too.
+            let reach = (margin - 1).max(2);
             for &(fx, fz) in input.ranges.forced {
                 for dz in -reach..=reach {
                     for dx in -reach..=reach {
@@ -1564,7 +1567,10 @@ impl Ranges<'_> {
         if dx * dx + dz * dz <= r * r {
             return true;
         }
-        let reach = (margin - 1).max(0);
+        // A forced level-31 ticket block-ticks its adjacent level-32
+        // chunks too; their 3x3 resident neighbourhood extends two columns
+        // from the forced one, even in nondecorating flat worlds.
+        let reach = (margin - 1).max(2);
         self.forced
             .iter()
             .any(|f| (x - f.0).abs() <= reach && (z - f.1).abs() <= reach)
@@ -1602,6 +1608,31 @@ fn section_indexes(mut bits: u32) -> impl Iterator<Item = i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nondecorating_forced_chunk_requests_full_ticking_neighbourhood() {
+        // Java 26.3 level-31 force tickets block-tick all eight neighbouring
+        // chunks. Their 3x3 readiness requires a 5x5 resident area (two
+        // chunks' reach), even in flat worlds without decorations.
+        let forced = [(6, 6)].into_iter().collect();
+        let ranges = Ranges {
+            center: (0, 0),
+            radius: 2,
+            extra: &[],
+            forced: &forced,
+            cover: None,
+        };
+        for z in 4..=8 {
+            for x in 4..=8 {
+                assert!(ranges.requested(x, z, false), "missing ({x},{z})");
+                assert!(ranges.chunk_kept(x, z, false), "dropped ({x},{z})");
+                assert!(!ranges.unloaded(x, z, false), "unloaded ({x},{z})");
+            }
+        }
+        // The adjacent block-ticking chunk (7,6) also gets its neighbours.
+        assert!(ranges.requested(8, 7, false));
+        assert!(!ranges.requested(9, 9, false));
+    }
 
     #[test]
     fn view_distance_is_vanillas_shape() {
@@ -1701,7 +1732,7 @@ mod tests {
         }
     }
 
-    // Original scheduling scan, without snapshot bookkeeping, for differential
+    // Reference scheduling scan, without snapshot bookkeeping, for differential
     // correctness and timing. Keep this independent of the production gate.
     fn baseline_candidates(input: GenerationInputs<'_>, capacity: usize) -> Vec<(i64, i32, i32)> {
         if input.remote || input.generating.len() >= capacity {
@@ -1734,8 +1765,11 @@ mod tests {
             }
         }
         for &(fx, fz) in input.ranges.forced {
-            for dz in -(margin - 1)..=(margin - 1) {
-                for dx in -(margin - 1)..=(margin - 1) {
+            // The block-ticking neighbours of a force-loaded chunk each
+            // need their own 3x3 resident neighbourhood, even for flatgen.
+            let forced_reach = 2;
+            for dz in -forced_reach..=forced_reach {
+                for dx in -forced_reach..=forced_reach {
                     let (x, z) = (fx + dx, fz + dz);
                     if missing(x, z) {
                         wanted.push((input.ranges.distance(x, z), x, z));

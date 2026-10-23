@@ -441,9 +441,10 @@ mod tests {
     }
 
     fn device() -> Option<(wgpu::Device, wgpu::Queue)> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-        let adapter = pollster::block_on(instance.request_adapter(&Default::default())).ok()?;
-        pollster::block_on(adapter.request_device(&Default::default())).ok()
+        // All concurrent renderer GPU tests share one process-wide adapter
+        // discovery. Creating a fresh Instance here races Vulkan loader/ICD
+        // initialization with other tests and can SIGSEGV on Linux.
+        super::super::test_device::device()
     }
 
     /// Every layer's full mip chain, layer major.

@@ -11,7 +11,7 @@ iroh-experimental = ["dep:iroh", "dep:tokio"]
 
 [dependencies]
 iroh = { version = "=1.4.1", default-features = false, features = ["tls-ring"], optional = true }
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "net", "time"], optional = true }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"], optional = true }
 # The key exchange keyed by the code's secret, then the frames.
 spake2 = { version = "0.4", features = ["getrandom"] }
 chacha20poly1305 = "0.10"

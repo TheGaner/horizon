@@ -750,12 +750,6 @@ fn heightmaps(chunk: &Chunk, tables: &SaveTables) -> Tag {
         )
     }))
 }
-/// The heightmaps a ClientboundLevelChunkPacketData carries (the types with
-/// sendToClient: WORLD_SURFACE, MOTION_BLOCKING, MOTION_BLOCKING_NO_LEAVES),
-/// as (network id, packed longs) in Heightmap.Types order.
-pub fn client_heightmaps(chunk: &Chunk, tables: &SaveTables) -> Vec<(i32, Vec<i64>)> {
-    client_heightmaps_in(&chunk.sections, tables, MIN_Y, SECTIONS as i32 * 16)
-}
 /// The client heightmaps of a column's sections, in a level from `min_y`,
 /// `height` blocks high.
 pub fn client_heightmaps_in(
@@ -1936,6 +1930,122 @@ fn read_saved_data(world: &Path, name: &str) -> Option<Tag> {
         .get("data")
         .cloned()
 }
+/// The saved per-dimension tickets (Minecraft 26.3 `TicketStorage`). Unlike
+/// legacy `chunks.dat`, forced tickets live under
+/// `dimensions/<namespace>/<dimension>/data/minecraft/chunk_tickets.dat`.
+/// The engine currently simulates `minecraft:forced` tickets; other ticket
+/// types are retained verbatim when updating this file.
+pub fn read_forced_chunks(dimension_root: &Path) -> Result<std::collections::HashSet<(i32, i32)>> {
+    let path = saved_data_path(dimension_root, "chunk_tickets");
+    if !path.is_file() {
+        return Ok(Default::default());
+    }
+    let root = read_dat(&path).ok_or("cannot decode existing chunk_tickets.dat")?;
+    let Some(Tag::Compound(data)) = root.get("data") else {
+        return Err("invalid chunk tickets saved data".into());
+    };
+    // Vanilla 26.3 writes `{data:{},DataVersion:5023}` after
+    // `/forceload remove all`. Omission means no tickets, not corruption.
+    let Some(tickets) = data.get(&"tickets".into()) else {
+        return Ok(Default::default());
+    };
+    let Tag::List(entries) = tickets else {
+        return Err("invalid chunk tickets list".into());
+    };
+    if entries.iter().any(|entry| {
+        text(entry.get("type")).as_deref() == Some("minecraft:forced")
+            && !matches!(entry.get("chunk_pos"), Some(Tag::IntArray(pos)) if pos.len() == 2)
+    }) {
+        return Err("invalid forced chunk ticket position".into());
+    }
+    Ok(entries
+        .iter()
+        .filter_map(|entry| {
+            if text(entry.get("type")).as_deref() != Some("minecraft:forced") {
+                return None;
+            }
+            let Some(Tag::IntArray(pos)) = entry.get("chunk_pos") else {
+                return None;
+            };
+            (pos.len() == 2).then_some((pos[0], pos[1]))
+        })
+        .collect())
+}
+
+/// Persist only the engine-owned forced ticket entries, preserving all other
+/// ticket kinds and top-level saved-data fields. Do not rewrite an unchanged
+/// file (vanilla may store additional per-type metadata here).
+pub fn write_forced_chunks(
+    dimension_root: &Path,
+    forced: &std::collections::HashSet<(i32, i32)>,
+) -> Result<()> {
+    let path = saved_data_path(dimension_root, "chunk_tickets");
+    if !path.is_file() && forced.is_empty() {
+        return Ok(());
+    }
+    let mut root = if path.exists() {
+        read_dat(&path).ok_or("cannot decode existing chunk_tickets.dat")?
+    } else {
+        Tag::compound([
+            ("data", Tag::compound([("tickets", Tag::List(Vec::new()))])),
+            ("DataVersion", Tag::Int(DATA_VERSION)),
+        ])
+    };
+    let Some(Tag::Compound(root_fields)) = Some(&mut root) else {
+        return Err("invalid chunk_tickets.dat root".into());
+    };
+    let data = root_fields
+        .entry("data".into())
+        .or_insert_with(|| Tag::compound([("tickets", Tag::List(Vec::new()))]));
+    let Tag::Compound(fields) = data else {
+        return Err("invalid chunk tickets saved data".into());
+    };
+    let tickets = fields
+        .entry("tickets".into())
+        .or_insert_with(|| Tag::List(Vec::new()));
+    let Tag::List(entries) = tickets else {
+        return Err("invalid chunk tickets list".into());
+    };
+    if entries.iter().any(|entry| {
+        text(entry.get("type")).as_deref() == Some("minecraft:forced")
+            && !matches!(entry.get("chunk_pos"), Some(Tag::IntArray(pos)) if pos.len() == 2)
+    }) {
+        return Err("invalid forced chunk ticket position; refusing to rewrite".into());
+    }
+    let existing: std::collections::HashSet<_> = entries
+        .iter()
+        .filter_map(|entry| {
+            if text(entry.get("type")).as_deref() != Some("minecraft:forced") {
+                return None;
+            }
+            if let Some(Tag::IntArray(pos)) = entry.get("chunk_pos")
+                && pos.len() == 2
+            {
+                return Some((pos[0], pos[1]));
+            }
+            None
+        })
+        .collect();
+    if &existing == forced {
+        return Ok(());
+    }
+    entries.retain(|entry| text(entry.get("type")).as_deref() != Some("minecraft:forced"));
+    let mut sorted: Vec<_> = forced.iter().copied().collect();
+    sorted.sort_unstable();
+    entries.extend(sorted.into_iter().map(|(x, z)| {
+        Tag::compound([
+            ("chunk_pos", Tag::IntArray(vec![x, z])),
+            ("level", Tag::Int(31)),
+            ("type", Tag::String("minecraft:forced".into())),
+        ])
+    }));
+    // `TicketStorage` omits an empty `tickets` field altogether.
+    if entries.is_empty() {
+        fields.remove(&"tickets".into());
+    }
+    write_dat(&path, root)
+}
+
 /// The world's generator settings: world_gen_settings.dat (26.3) or
 /// level.dat's Data.WorldGenSettings.
 pub fn world_gen_settings(world: &Path) -> Option<Tag> {
@@ -4280,5 +4390,275 @@ mod tests {
             .and_then(|a| number(a.get("flying")))
             .unwrap_or(0);
         assert_eq!(flying_survival, 0);
+    }
+    #[test]
+    fn vanilla_forced_chunk_ticket_storage_roundtrips_without_erasing_other_kinds() {
+        let root = std::env::temp_dir().join(format!("horizon-tickets-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = saved_data_path(&root, "chunk_tickets");
+        write_dat(
+            &path,
+            Tag::compound([
+                ("DataVersion", Tag::Int(DATA_VERSION)),
+                (
+                    "data",
+                    Tag::compound([
+                        ("custom", Tag::String("retained".into())),
+                        (
+                            "tickets",
+                            Tag::List(vec![
+                                Tag::compound([
+                                    ("chunk_pos", Tag::IntArray(vec![6, 6])),
+                                    ("level", Tag::Int(31)),
+                                    ("type", Tag::String("minecraft:forced".into())),
+                                ]),
+                                Tag::compound([
+                                    ("chunk_pos", Tag::IntArray(vec![9, -4])),
+                                    ("level", Tag::Int(30)),
+                                    ("type", Tag::String("minecraft:unknown".into())),
+                                ]),
+                            ]),
+                        ),
+                    ]),
+                ),
+            ]),
+        )
+        .unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let old = read_forced_chunks(&root).unwrap();
+        assert_eq!(old, [(6, 6)].into_iter().collect());
+        write_forced_chunks(&root, &old).unwrap();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "unchanged ticket file is not rewritten"
+        );
+        let new = [(-1, 3), (7, -8)].into_iter().collect();
+        write_forced_chunks(&root, &new).unwrap();
+        assert_eq!(read_forced_chunks(&root).unwrap(), new);
+        let saved = read_dat(&path).unwrap();
+        assert_eq!(
+            saved.get("data").and_then(|v| v.get("custom")),
+            Some(&string("retained"))
+        );
+        let Some(Tag::List(tickets)) = saved.get("data").and_then(|v| v.get("tickets")) else {
+            panic!("no tickets");
+        };
+        assert_eq!(
+            tickets.len(),
+            3,
+            "unrecognised ticket kind retained, two new forced"
+        );
+        assert!(
+            tickets
+                .iter()
+                .any(|t| text(t.get("type")).as_deref() == Some("minecraft:unknown"))
+        );
+        write_forced_chunks(&root, &std::collections::HashSet::new()).unwrap();
+        assert!(read_forced_chunks(&root).unwrap().is_empty());
+        assert_eq!(
+            read_dat(&path)
+                .unwrap()
+                .get("data")
+                .and_then(|v| v.get("tickets")),
+            Some(&Tag::List(vec![tickets[0].clone()]))
+        );
+        // Official vanilla after `/forceload remove all`: data compound
+        // exists but has no tickets key. Loading must succeed, and a no-op
+        // save must preserve the precise NBT bytes.
+        write_dat(
+            &path,
+            Tag::compound([
+                ("DataVersion", Tag::Int(DATA_VERSION)),
+                ("data", Tag::Compound(Default::default())),
+            ]),
+        )
+        .unwrap();
+        let vanilla_empty = std::fs::read(&path).unwrap();
+        assert!(read_forced_chunks(&root).unwrap().is_empty());
+        write_forced_chunks(&root, &std::collections::HashSet::new()).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), vanilla_empty);
+        write_forced_chunks(&root, &new).unwrap();
+        assert_eq!(read_forced_chunks(&root).unwrap(), new);
+        write_forced_chunks(&root, &std::collections::HashSet::new()).unwrap();
+        assert!(
+            read_dat(&path)
+                .unwrap()
+                .get("data")
+                .and_then(|data| data.get("tickets"))
+                .is_none()
+        );
+
+        let malformed = Tag::compound([
+            ("DataVersion", Tag::Int(DATA_VERSION)),
+            (
+                "data",
+                Tag::compound([(
+                    "tickets",
+                    Tag::List(vec![Tag::compound([
+                        ("type", Tag::String("minecraft:forced".into())),
+                        ("level", Tag::Int(31)),
+                        ("chunk_pos", Tag::IntArray(vec![6])),
+                    ])]),
+                )]),
+            ),
+        ]);
+        write_dat(&path, malformed).unwrap();
+        let malformed_bytes = std::fs::read(&path).unwrap();
+        assert!(read_forced_chunks(&root).is_err());
+        assert!(write_forced_chunks(&root, &new).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), malformed_bytes);
+        std::fs::write(&path, b"bad saved data").unwrap();
+        let corrupt = std::fs::read(&path).unwrap();
+        assert!(read_forced_chunks(&root).is_err());
+        assert!(write_forced_chunks(&root, &new).is_err());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            corrupt,
+            "corrupt input must not be replaced"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn command_block_region_disk_reopen_preserves_rich_output_and_pending_ticks() {
+        use crate::containers::BlockEntity;
+        use crate::text::{RED, Text};
+        use horizon_core::ticks::{SavedTick, TickPriority, TickTypeId};
+        let fixture_root = std::env::var_os("HORIZON_COMMAND_BLOCK_REGION_FIXTURE_DIR");
+        let root = fixture_root.as_ref().map_or_else(
+            || {
+                std::env::temp_dir().join(format!(
+                    "horizon-command-block-region-{}",
+                    std::process::id()
+                ))
+            },
+            PathBuf::from,
+        );
+        if fixture_root.is_some() {
+            assert!(
+                !root.exists(),
+                "refusing to overwrite an existing fixture directory"
+            );
+        } else {
+            let _ = fs::remove_dir_all(&root);
+        }
+        let palette = root.join("resources/assets/minecraft/textures/colormap");
+        fs::create_dir_all(&palette).unwrap();
+        for name in ["grass", "foliage", "dry_foliage"] {
+            let image = fs::File::create(palette.join(format!("{name}.png"))).unwrap();
+            let mut encoder = png::Encoder::new(image, 1, 1);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&[25, 70, 40])
+                .unwrap();
+        }
+        let biome_dir = root.join("resources/data/minecraft/worldgen/biome");
+        fs::create_dir_all(&biome_dir).unwrap();
+        fs::write(biome_dir.join("plains.json"), "{}").unwrap();
+        let biomes = Biomes::load(&root.join("resources")).unwrap();
+        let registry = BlockRegistry::from_nbt(&Tag::compound([
+            ("DataVersion", Tag::Int(horizon_world::DATA_VERSION)),
+            (
+                "states",
+                Tag::List(vec![
+                    string("minecraft:air"),
+                    string("minecraft:command_block"),
+                ]),
+            ),
+            (
+                "defaults",
+                Tag::compound([
+                    ("minecraft:air", Tag::Int(0)),
+                    ("minecraft:command_block", Tag::Int(1)),
+                ]),
+            ),
+        ]))
+        .unwrap();
+        let make_tables = || {
+            SaveTables::for_heightmaps(crate::assets::Properties::for_tests(&[
+                (true, false, false, false),
+                (false, false, true, true),
+            ]))
+        };
+        let mut tables = make_tables();
+        tables.block_names = vec!["minecraft:air".into(), "minecraft:command_block".into()];
+        tables.block_ids = tables
+            .block_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i as u16))
+            .collect();
+        tables.default_state = vec![true, true];
+
+        let pos = (-1, 64, 16);
+        let pending = SavedTick {
+            kind: TickTypeId(1),
+            pos: BlockPos::new(pos.0, pos.1, pos.2),
+            delay: 7,
+            priority: TickPriority::High,
+        };
+        let mut chunk = Chunk::empty(-1, 1);
+        chunk.set(15, pos.1, 0, 1);
+        let rich = crate::command_block::CommandBlock {
+            command: "Searge".into(),
+            last_output: Some(Text::colored("alert", RED)),
+            success_count: 1,
+            last_execution: 42,
+            powered: true,
+            ..Default::default()
+        };
+        chunk
+            .block_entities
+            .push((pos, BlockEntity::CommandBlock(Box::new(rich))));
+        chunk.saved = Some(Arc::new(ChunkExtras {
+            block_ticks: vec![pending],
+            ..Default::default()
+        }));
+        let folder = root.join("dimensions/minecraft/overworld");
+        {
+            let dir = SaveDir::new(folder.clone());
+            let mut clone = make_tables();
+            clone.block_names = tables.block_names.clone();
+            clone.block_ids = tables.block_ids.clone();
+            clone.default_state = tables.default_state.clone();
+            dir.tables.set(Arc::new(clone)).ok().unwrap();
+            assert_eq!(dir.save(&[Arc::new(chunk)], &registry, &biomes).unwrap(), 1);
+            assert!(folder.join("region/r.-1.0.mca").is_file());
+        }
+        for cycle in 0..2 {
+            let dir = SaveDir::new(folder.clone());
+            let mut clone = make_tables();
+            clone.block_names = tables.block_names.clone();
+            clone.block_ids = tables.block_ids.clone();
+            clone.default_state = tables.default_state.clone();
+            dir.tables.set(Arc::new(clone)).ok().unwrap();
+            let mut reopened = dir.load(-1, 1, &registry, &biomes).unwrap();
+            assert_eq!(reopened.get(15, 64, 0), 1);
+            assert_eq!(reopened.saved.as_ref().unwrap().block_ticks, vec![pending]);
+            let (_, BlockEntity::CommandBlock(ref mut command)) = reopened.block_entities[0] else {
+                panic!("command block lost on disk reload");
+            };
+            assert_eq!(command.command, "Searge");
+            assert_eq!(command.last_execution, 42);
+            let actual = Tag::compound(command.save());
+            assert_eq!(
+                actual.get("LastOutput"),
+                Some(&Tag::compound([
+                    ("color", string("red")),
+                    ("text", string(if cycle == 0 { "alert" } else { "updated" })),
+                ]))
+            );
+            if cycle == 0 {
+                command.last_output = Some(Text::colored("updated", RED));
+                dir.save(&[Arc::new(reopened)], &registry, &biomes).unwrap();
+            }
+        }
+        if fixture_root.is_none() {
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 }

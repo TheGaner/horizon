@@ -380,6 +380,58 @@ impl Hub {
         drops
     }
 
+    /// Java 26.3 InventoryMenu THROW: after running the action, the *real*
+    /// client already holds the predicted changedSlots and carried stack.
+    /// The item entity is paired on the next tracker tick; an incorrect or
+    /// empty prediction must still be corrected after that AddEntity packet.
+    /// Only mark the precisely claimed changed slots as sent, never unrelated
+    /// pending inventory changes awaiting normal sync_player_state.
+    pub fn accept_predicted_inventory_throw(
+        &mut self,
+        conn: u32,
+        p: &play::ContainerClick,
+        world: &World,
+        changed: &[usize],
+    ) -> bool {
+        let Some(i) = self.guests.iter().position(|g| g.conn == conn) else {
+            return false;
+        };
+        if p.container != 0
+            || p.input != 4
+            || p.state != self.guests[i].menu_state
+            || !exactly_claims_changed_slots(changed, &p.changed)
+        {
+            return false;
+        }
+        for &(slot, ref claim) in &p.changed {
+            let slot = slot as usize;
+            let actual = self.view_slot(i, world, slot);
+            // A custom data patch hash cannot be authenticated with the
+            // current registry-less comparator; let the normal correction
+            // run rather than accepting unverified component claims.
+            if claim
+                .as_ref()
+                .is_some_and(|h| !h.added.is_empty() || !h.removed.is_empty())
+                || !plain_predicted_stack(&actual)
+                || !self.hashed_matches(claim, &actual)
+            {
+                return false;
+            }
+        }
+        let carried = self.guests[i].carried.clone();
+        if !plain_predicted_stack(&carried) || !self.hashed_matches(&p.carried, &carried) {
+            return false;
+        }
+        let updates: Vec<_> = changed
+            .iter()
+            .map(|&s| (s, self.view_slot(i, world, s)))
+            .collect();
+        for (slot, actual) in updates {
+            self.guests[i].menu_sent[slot] = actual;
+        }
+        true
+    }
+
     /// A click on the inventory menu (window 0) the game applied itself
     /// (the crafting grid): the client is corrected like after any click.
     pub fn inventory_clicked(
@@ -560,6 +612,73 @@ impl Hub {
             // Then the data slots, as broadcastChanges does.
             self.sync_container_data(i, world);
         }
+    }
+}
+
+/// HashedStack's component patch requires vanilla's decorated registry hash
+/// generator, which this Hub does not model yet. Even a client that CLAIMS an
+/// empty patch cannot be trusted when the authoritative stack is enchanted,
+/// damaged or carries other NBT components; prefer corrective packets instead.
+fn plain_predicted_stack(stack: &Option<ItemStack>) -> bool {
+    stack
+        .as_ref()
+        .is_none_or(|s| s.damage == 0 && s.extra.is_none())
+}
+
+/// A predicted menu click must supply one distinct claim for every changed
+/// slot. Missing, duplicate or unrelated claims must retain correction path.
+fn exactly_claims_changed_slots(changed: &[usize], claims: &[(i16, Option<Hashed>)]) -> bool {
+    !changed.is_empty()
+        && changed.len() == claims.len()
+        && changed.iter().all(|&index| {
+            claims
+                .iter()
+                .filter(|(slot, _)| *slot == index as i16)
+                .count()
+                == 1
+        })
+}
+
+#[cfg(test)]
+mod predicted_throw_claim_tests {
+    use super::*;
+
+    #[test]
+    fn component_bearing_items_are_never_accepted_by_count_only_hash_check() {
+        assert!(plain_predicted_stack(&None));
+        let plain = ItemStack {
+            item: std::sync::Arc::from("minecraft:stick"),
+            count: 2,
+            damage: 0,
+            extra: None,
+        };
+        assert!(plain_predicted_stack(&Some(plain.clone())));
+        let mut damaged = plain.clone();
+        damaged.damage = 1;
+        assert!(!plain_predicted_stack(&Some(damaged)));
+        let mut custom = plain;
+        custom.extra = Some(Box::new(crate::item_data::StackData::default()));
+        assert!(!plain_predicted_stack(&Some(custom)));
+    }
+
+    #[test]
+    fn changed_slots_must_be_exact_before_suppressing_inventory_correction() {
+        assert!(exactly_claims_changed_slots(&[36], &[(36, None)]));
+        assert!(exactly_claims_changed_slots(
+            &[36, 37],
+            &[(37, None), (36, None)]
+        ));
+        assert!(!exactly_claims_changed_slots(&[36], &[]));
+        assert!(!exactly_claims_changed_slots(&[36], &[(37, None)]));
+        assert!(!exactly_claims_changed_slots(
+            &[36],
+            &[(36, None), (36, None)]
+        ));
+        assert!(!exactly_claims_changed_slots(
+            &[36],
+            &[(36, None), (37, None)]
+        ));
+        assert!(!exactly_claims_changed_slots(&[], &[]));
     }
 }
 

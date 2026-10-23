@@ -184,7 +184,23 @@ impl Game<'_> {
         }
         g.craft_result = menu.slot(0).cloned();
         host.play.entry(conn).or_default().crafting.inventory = Some(menu);
-        host.hub.inventory_clicked(conn, p, &self.world, &changed);
+        if p.input != 4 {
+            host.hub.inventory_clicked(conn, p, &self.world, &changed);
+        } else {
+            // A vanilla client has already applied this click locally and
+            // sent its exact predicted HashedStack slot changes. When those
+            // claims match, do not echo them; for legacy/incorrect empty
+            // claims keep deferred after-spawn reconciliation below.
+            host.hub
+                .accept_predicted_inventory_throw(conn, p, &self.world, &changed);
+        }
+        // ContainerInput.THROW (Q/Ctrl+Q in the inventory menu): vanilla
+        // pairs the dropped item (AddEntity + item data) before the owner's
+        // changed inventory slot. Spawning happens on the *next* tracker
+        // tick, so answering the click immediately inverts that wire order.
+        // Leave *unpredicted* menu_sent dirty for sync_player_state, which
+        // runs after track_entities on the next tick; accepted predictions
+        // are already marked client-known and need no redundant reply.
         true
     }
 

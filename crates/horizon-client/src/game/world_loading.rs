@@ -252,6 +252,11 @@ pub(super) fn make_streaming(
     // A server draws nothing: neither the integrated server nor the
     // dedicated one meshes sections.
     streaming.mesh = !options.integrated && options.dedicated.is_none();
+    // The *initial* world entry calls this constructor directly, not
+    // Game::make_streaming (used by dimension changes). Restore the saved
+    // level-31 force tickets here so command blocks and their neighbouring
+    // ticking chunks are loaded before the first server tick.
+    streaming.forced = horizon_client::save::read_forced_chunks(&save.root)?;
     Ok((streaming, save, locator))
 }
 

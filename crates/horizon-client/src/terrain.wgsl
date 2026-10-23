@@ -22,7 +22,9 @@ struct Globals {
     // Atlas rect of the current destroy stage (read by entity.wgsl).
     crumbling_sprite: vec4<f32>,
     outline_params: vec4<f32>,
-    // Horizon Extras' dynamic lights: camera-relative position and level (dynamic_light.rs).
+    shadow_rect: vec4<f32>,
+    shadow_sampling: vec4<f32>,
+    // Horizon Extras dynamic lights: camera-relative position and level.
     dynamic_lights: array<vec4<f32>, 16>,
 }
 @group(0) @binding(0) var<uniform> globals: Globals;

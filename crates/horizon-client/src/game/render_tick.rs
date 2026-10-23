@@ -214,15 +214,20 @@ impl Game<'_> {
             percent_frozen: p.percent_frozen(),
             partial,
             portal: [fx.o_portal, fx.portal],
-            nausea: 0.0,
-            screen_effect_scale: 1.0,
+            nausea: fx.nausea(partial),
+            screen_effect_scale: self
+                .settings
+                .file
+                .double("screenEffectScale")
+                .clamp(0.0, 1.0) as f32,
         };
         let mut scope = self.scope_scale;
         let gui_overlays =
             hud_overlays::camera_overlays(size[0] as i32, size[1] as i32, &overlays, &mut scope);
         self.screen_fx.build(&ScreenInputs {
             sprites: &self.gui.atlas.sprites,
-            flags: &self.gui.atlas.flags,
+            // The retained source-hashed standalone texture metadata map.
+            sampling: &self.gui.atlas.sampling,
             aspect: size[0] as f32 / size[1].max(1) as f32,
             partial,
             block_overlay,
@@ -251,7 +256,14 @@ impl Game<'_> {
         if let Some(e) = eye {
             let brightness = self.eye_brightness(e);
             let inside_portal = self.client_portal_effect();
-            self.screen_fx.tick(brightness, inside_portal);
+            self.screen_fx.tick(
+                brightness,
+                inside_portal,
+                self.potions
+                    .effects
+                    .get("nausea")
+                    .map(|effect| effect.duration),
+            );
             // LocalPlayer water vision and AtmosphericFogEnvironment rain fog.
             let in_water =
                 fog_type(&self.world, self.res.facts(), e, self.forward()) == FogType::Water;

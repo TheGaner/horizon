@@ -89,6 +89,47 @@ impl Base<'_> {
 }
 
 /// `LivingEntity` + `Mob` (+ `AgeableMob`, creeper and skeleton specifics).
+/// The mobs whose class extends vanilla's `Animal` (and so save `InLove`):
+/// not allays, villagers, golems, dolphins or fish.
+fn is_animal(id: &str) -> bool {
+    matches!(
+        id.strip_prefix("minecraft:").unwrap_or(id),
+        "pig"
+            | "cow"
+            | "mooshroom"
+            | "sheep"
+            | "chicken"
+            | "rabbit"
+            | "horse"
+            | "donkey"
+            | "mule"
+            | "zombie_horse"
+            | "skeleton_horse"
+            | "llama"
+            | "trader_llama"
+            | "goat"
+            | "panda"
+            | "polar_bear"
+            | "fox"
+            | "wolf"
+            | "cat"
+            | "ocelot"
+            | "parrot"
+            | "bee"
+            | "turtle"
+            | "armadillo"
+            | "frog"
+            | "axolotl"
+            | "hoglin"
+            | "strider"
+            | "camel"
+            | "camel_husk"
+            | "sniffer"
+            | "happy_ghast"
+            | "nautilus"
+            | "zombie_nautilus"
+    )
+}
 pub fn mob_to_nbt(m: &Mob, uuid: [i32; 4], raw: Option<&Tag>) -> Tag {
     let base = Base {
         id: &m.kind.id,
@@ -175,11 +216,14 @@ pub fn mob_to_nbt(m: &Mob, uuid: [i32; 4], raw: Option<&Tag>) -> Tag {
         for (key, value) in [
             ("Age", Tag::Int(0)),
             ("ForcedAge", Tag::Int(0)),
-            ("InLove", Tag::Int(0)),
             ("AgeLocked", Tag::Byte(0)),
         ] {
             map.entry(key.into()).or_insert(value);
         }
+    }
+    // Animal.addAdditionalSaveData: the love ticks left, whatever the save had.
+    if is_animal(id) {
+        map.insert("InLove".into(), Tag::Int(m.extra.in_love.max(0)));
     }
     match id {
         "minecraft:creeper" => {
@@ -445,10 +489,10 @@ pub fn mob_to_nbt(m: &Mob, uuid: [i32; 4], raw: Option<&Tag>) -> Tag {
                 map.entry(key.into()).or_insert(value);
             }
         }
+        // Sheep.addAdditionalSaveData: its wool as it is now.
         "minecraft:sheep" => {
-            for (key, value) in [("Color", Tag::Byte(0)), ("Sheared", Tag::Byte(0))] {
-                map.entry(key.into()).or_insert(value);
-            }
+            map.insert("Color".into(), Tag::Byte((m.extra.color & 15) as i8));
+            map.insert("Sheared".into(), Tag::Byte(i8::from(m.extra.sheared)));
         }
         // CopperGolem.addAdditionalSaveData.
         "minecraft:copper_golem" => {
@@ -620,6 +664,9 @@ pub fn mob_from_nbt(tag: &Tag, types: &HashMap<String, Arc<MobType>>, id: u32) -
         m.extra.age = number(tag.get("Age")).unwrap_or(0) as i32;
         m.extra.forced_age = number(tag.get("ForcedAge")).unwrap_or(0) as i32;
         m.extra.age_locked = flag(tag, "AgeLocked");
+    }
+    if is_animal(&m.kind.id) {
+        m.extra.in_love = number(tag.get("InLove")).unwrap_or(0) as i32;
     }
     m.name_visible = flag(tag, "CustomNameVisible");
     m.no_ai = flag(tag, "NoAI");
@@ -832,6 +879,11 @@ pub fn mob_from_nbt(tag: &Tag, types: &HashMap<String, Arc<MobType>>, id: u32) -
         }
         m.extra.egg_time = number(tag.get("life_ticks")).map_or(-1, |v| v as i32);
     }
+    // Sheep.readAdditionalSaveData: white and unsheared when absent.
+    if m.species() == crate::mobs::Species::Sheep {
+        m.extra.color = number(tag.get("Color")).map_or(0, |c| (c as u8) & 15);
+        m.extra.sheared = flag(tag, "Sheared");
+    }
     if m.species() == crate::mobs::Species::Shulker {
         m.extra.variant3 = number(tag.get("AttachFace")).unwrap_or(0).clamp(0, 5) as u8;
         m.extra.counter = number(tag.get("Peek")).unwrap_or(0).clamp(0, 100) as i32;
@@ -876,7 +928,7 @@ pub fn mob_from_nbt(tag: &Tag, types: &HashMap<String, Arc<MobType>>, id: u32) -
     Some(m)
 }
 
-/// `ItemEntity`: Health, Age, PickupDelay, Item, Thrower.
+/// `ItemEntity`: Health, signed Age, PickupDelay, Item, Thrower and Owner.
 pub fn item_entity_to_nbt(e: &ItemEntity, uuid: [i32; 4], raw: Option<&Tag>) -> Tag {
     let base = Base {
         id: "minecraft:item",
@@ -892,7 +944,10 @@ pub fn item_entity_to_nbt(e: &ItemEntity, uuid: [i32; 4], raw: Option<&Tag>) -> 
         ("Item", item_to_nbt(&e.stack)),
         ("Health", Tag::Short(e.health as i16)),
         ("Fire", Tag::Short(e.fire_ticks as i16)),
-        ("Age", Tag::Short(e.age.min(i16::MAX as u32) as i16)),
+        (
+            "Age",
+            Tag::Short((e.age as i32).clamp(i16::MIN as i32, i16::MAX as i32) as i16),
+        ),
         (
             "PickupDelay",
             Tag::Short(e.pickup_delay.min(i16::MAX as u32) as i16),
@@ -900,10 +955,12 @@ pub fn item_entity_to_nbt(e: &ItemEntity, uuid: [i32; 4], raw: Option<&Tag>) -> 
     ] {
         put(&mut tag, key, value);
     }
-    if let Some(thrower) = e.thrower {
-        put(&mut tag, "Thrower", Tag::IntArray(thrower.to_vec()));
-    } else if let Tag::Compound(map) = &mut tag {
-        map.remove(&"Thrower".into());
+    for (key, value) in [("Thrower", e.thrower), ("Owner", e.target)] {
+        if let Some(uuid) = value {
+            put(&mut tag, key, Tag::IntArray(uuid.to_vec()));
+        } else if let Tag::Compound(map) = &mut tag {
+            map.remove(&key.into());
+        }
     }
     tag
 }
@@ -916,15 +973,16 @@ pub fn item_entity_from_nbt(tag: &Tag, id: u32, bob_offset: f32) -> Option<ItemE
         id,
         stack,
         thrower: uuid_from_tag(tag.get("Thrower")),
+        target: uuid_from_tag(tag.get("Owner")),
         position,
         previous: position,
         velocity: motion(tag),
         on_ground: flag(tag, "OnGround"),
-        // Age -32768 marks items that never despawn; Horizon counts upwards.
-        age: number(tag.get("Age")).unwrap_or(0).max(0) as u32,
+        // Java signed Age: -32768 never despawns, -6000 has extended life.
+        age: number(tag.get("Age")).unwrap_or(0) as i32 as u32,
+        tick_count: 0,
         pickup_delay: number(tag.get("PickupDelay")).unwrap_or(0).clamp(0, 32767) as u32,
         bob_offset,
-        ticks: 0,
     })
 }
 
@@ -1662,6 +1720,7 @@ mod tests {
             health: 2,
             fire_ticks: 73,
             thrower: Some([5, 6, 7, 8]),
+            target: Some([9, 10, 11, 12]),
             id: 7,
             stack: ItemStack {
                 item: Arc::from("minecraft:diamond_pickaxe"),
@@ -1674,8 +1733,8 @@ mod tests {
             velocity: Vec3::new(0.0, -0.04, 0.0),
             on_ground: true,
             age: 120,
+            tick_count: 0,
             pickup_delay: 10,
-            ticks: 0,
             bob_offset: 0.0,
         };
         let tag = item_entity_to_nbt(&e, [1, 2, 3, 4], None);
@@ -1688,6 +1747,9 @@ mod tests {
             (back.age, back.pickup_delay, back.on_ground),
             (120, 10, true)
         );
+        assert_eq!(back.thrower, Some([5, 6, 7, 8]));
+        assert_eq!(back.target, Some([9, 10, 11, 12]));
+        assert_eq!(back.tick_count, 0);
         assert_eq!(back.position.x, 100.5);
         assert_eq!(back.thrower, e.thrower);
         let mut cleared = back;
@@ -1695,6 +1757,31 @@ mod tests {
         let cleared = item_entity_to_nbt(&cleared, [1, 2, 3, 4], Some(&tag));
         assert!(cleared.get("Thrower").is_none());
     }
+    #[test]
+    fn signed_item_age_round_trips_unlimited_and_extended_lifetimes() {
+        let tag = Tag::compound([
+            ("id", string("minecraft:item")),
+            ("Pos", doubles(&[0.5, 64.0, 0.5])),
+            (
+                "Item",
+                Tag::compound([("id", string("minecraft:stone")), ("count", Tag::Int(1))]),
+            ),
+            ("Age", Tag::Short(-32768)),
+        ]);
+        let e = item_entity_from_nbt(&tag, 1, 0.0).expect("unlimited item loads");
+        assert_eq!(e.age, ItemEntity::UNLIMITED_AGE);
+        let saved = item_entity_to_nbt(&e, [1, 2, 3, 4], Some(&tag));
+        assert_eq!(saved.get("Age"), Some(&Tag::Short(-32768)));
+        let mut extended = e;
+        extended.age = (-6000_i32) as u32;
+        let tag2 = item_entity_to_nbt(&extended, [1, 2, 3, 4], None);
+        assert_eq!(tag2.get("Age"), Some(&Tag::Short(-6000)));
+        assert_eq!(
+            item_entity_from_nbt(&tag2, 2, 0.0).unwrap().age as i32,
+            -6000
+        );
+    }
+
     #[test]
     fn unknown_fields_survive() {
         let raw = Tag::compound([
@@ -2049,5 +2136,41 @@ mod axolotl_nbt_tests {
         let mm = &restored.extra.animal_brain.as_ref().unwrap().mem;
         assert_eq!(mm.play_dead_ticks.value(), Some(78));
         assert_eq!(mm.temptation_cooldown_ticks.value(), Some(42));
+    }
+}
+
+#[cfg(test)]
+mod sheep_nbt_tests {
+    use super::*;
+    #[test]
+    fn a_sheep_keeps_its_dyed_and_sheared_wool() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.local/horizon-client")
+            .join(horizon_core::VANILLA_VERSION);
+        if !root.join("items.json").exists() {
+            return;
+        }
+        let data = crate::mobs::MobTypes::load(&root).unwrap();
+        let mut m = Mob::new(
+            1,
+            Arc::new(data.types["minecraft:sheep"].clone()),
+            Vec3::new(0.0, 4.0, 0.0),
+            0.0,
+        );
+        // Summoned white, then dyed red and sheared: the save has it now.
+        let raw = Tag::compound([("Color", Tag::Byte(0)), ("Sheared", Tag::Byte(0))]);
+        (m.extra.color, m.extra.sheared) = (14, true);
+        let tag = mob_to_nbt(&m, [1, 2, 3, 4], Some(&raw));
+        assert_eq!(
+            (number(tag.get("Color")), number(tag.get("Sheared"))),
+            (Some(14), Some(1))
+        );
+        let types: HashMap<String, Arc<MobType>> = data
+            .types
+            .iter()
+            .map(|(k, v)| (k.clone(), Arc::new(v.clone())))
+            .collect();
+        let back = mob_from_nbt(&tag, &types, 2).unwrap();
+        assert_eq!((back.extra.color, back.extra.sheared), (14, true));
     }
 }

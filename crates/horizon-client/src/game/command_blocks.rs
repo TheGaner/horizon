@@ -205,6 +205,27 @@ impl Game<'_> {
         mark_condition_met(&mut self.world, self.pack.assets.registry, pos);
         self.schedule_command_block(pos);
     }
+    /// `BlockEntity.loadAdditional` can be invoked by `/data merge block` or
+    /// `/data modify block` while a world is running. Only an explicit
+    /// auto=false -> true transition should schedule a new command tick;
+    /// registering an already-saved chunk must not rearm its auto blocks.
+    pub(super) fn command_block_automatic_nbt_changed(&mut self, pos: Pos, was_auto: Option<bool>) {
+        let Some(mode) = self
+            .block_state_at(pos)
+            .and_then(|s| Mode::of_block(&s.name))
+        else {
+            return;
+        };
+        let Some(current) = self.command_block(pos) else {
+            return;
+        };
+        if was_auto.is_some_and(|old| {
+            command_block::automatic_transition_schedules(mode, old, current.auto, current.powered)
+        }) {
+            self.schedule_command_block_tick(pos);
+        }
+    }
+
     fn update_output_signal(&mut self, pos: Pos) {
         let at = BlockPos::new(pos.0, pos.1, pos.2);
         self.with_level(|b, level, ticks| b.update_neighbour_for_output_signal(level, ticks, at));
@@ -621,7 +642,7 @@ impl Game<'_> {
         // CommandBlockEntity.setAutomatic, then onModeSwitch.
         let (was_auto, powered) = (c.auto, c.powered);
         c.auto = s.auto;
-        if !was_auto && s.auto && !powered && s.mode != Mode::Sequence {
+        if command_block::automatic_transition_schedules(s.mode, was_auto, s.auto, powered) {
             self.schedule_command_block_tick(pos);
         }
         if old_mode != s.mode && s.mode == Mode::Auto && (powered || s.auto) {

@@ -95,6 +95,37 @@ fn kind_of(class: Class) -> Option<Kind> {
     })
 }
 
+#[cfg(test)]
+mod spread_particle_tests {
+    use super::{Class, Kind, kind_of};
+
+    #[test]
+    fn spreading_bonemeal_kinds_are_distinct_from_in_block_growth() {
+        for class in [
+            Class::Grass,
+            Class::Nylium,
+            Class::Netherrack,
+            Class::BonemealableFeaturePlacer,
+        ] {
+            assert!(matches!(
+                kind_of(class),
+                Some(Kind::Grass | Kind::Nylium | Kind::Netherrack | Kind::FeaturePlacer)
+            ));
+        }
+        for class in [
+            Class::Sapling,
+            Class::RootedDirt,
+            Class::MangroveLeaves,
+            Class::Crop,
+        ] {
+            assert!(!matches!(
+                kind_of(class),
+                Some(Kind::Grass | Kind::Nylium | Kind::Netherrack | Kind::FeaturePlacer)
+            ));
+        }
+    }
+}
+
 /// `Mth.nextInt(random, min, max)`.
 fn next_int_between<R: RandomSource>(random: &mut R, min: i32, max: i32) -> i32 {
     if min >= max {
@@ -160,15 +191,17 @@ impl Behaviours {
     ) -> bool {
         self.sim(level, ticks).grow_water_plant(pos, face)
     }
-    /// The `BonemealableBlock.Type` particle spread of a block at level event
-    /// 1505: Some(true) for `NEIGHBOR_SPREADER` (particles over a 3-block
-    /// area above), Some(false) for `GROWER`, None when not bonemealable.
+    /// `BonemealableBlock`'s 1505 growth-particle pattern: spreading
+    /// bonemeal targets show happy-villager particles in the surrounding
+    /// region, while other bonemealable blocks show them inside the shape.
+    /// `None` lets the client handle water particles separately.
     pub fn bone_meal_spreads(&self, state: BlockStateId) -> Option<bool> {
-        let kind = self.bonemeal_kind(state)?;
-        Some(matches!(
-            kind,
-            Kind::Grass | Kind::Nylium | Kind::Netherrack | Kind::FeaturePlacer
-        ))
+        self.bonemeal_kind(state).map(|kind| {
+            matches!(
+                kind,
+                Kind::Grass | Kind::Nylium | Kind::Netherrack | Kind::FeaturePlacer
+            )
+        })
     }
     fn bonemeal_kind(&self, state: BlockStateId) -> Option<Kind> {
         let data = self.data(state);

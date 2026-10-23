@@ -940,6 +940,7 @@ mod item_column_tests {
             id,
             stack: ItemStack::new("minecraft:stone", 1),
             thrower: None,
+            target: None,
             position: at,
             previous: at,
             velocity: Vec3::ZERO,
@@ -947,7 +948,7 @@ mod item_column_tests {
             age: 0,
             pickup_delay: 0,
             bob_offset: 0.0,
-            ticks: 0,
+            tick_count: 0,
         }
     }
     /// `hopper_suck`'s test: some item box meets the hopper's SUCK_AABB.

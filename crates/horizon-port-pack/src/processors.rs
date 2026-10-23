@@ -498,6 +498,12 @@ fn referenced(lists: &Value, data: &ProcessorData) -> Option<Vec<Value>> {
 /// (none for a no-op), or `None` when it has none.
 fn as_data(kind: &str, p: &Value, data: &ProcessorData) -> Option<Vec<Value>> {
     let (ns, _) = kind.split_once(':')?;
+    // Rust stable (including the pinned toolchain) does not support `if let`
+    // bindings in match guards. Precompute the optional special-case rule;
+    // missing rules must still fall through to the YUNG spawner processor.
+    let desert_rule = (ns == "betterdeserttemples")
+        .then(|| desert_temple(kind))
+        .flatten();
     Some(match kind {
         // Its structure voids keep the world's block, as vanilla's
         // block_ignore does (the templates hold them; vanilla places them).
@@ -593,11 +599,7 @@ fn as_data(kind: &str, p: &Value, data: &ProcessorData) -> Option<Vec<Value>> {
                 |s| config(s.get("ominous") == Some(&"true")),
             )]
         }
-        _ if ns == "betterdeserttemples"
-            && let Some(processor) = desert_temple(kind) =>
-        {
-            vec![processor]
-        }
+        _ if desert_rule.is_some() => vec![desert_rule?],
         "lithostitched:block_swap" => {
             // The same map; the game's swap keeps the properties both have.
             p["blocks"].as_object()?;
