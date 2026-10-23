@@ -363,6 +363,13 @@ impl Guest {
     pub fn send(&self, packet: &play::Clientbound) {
         self.sender.send(packet.encode());
     }
+    /// Send scoreboard or other ordered packet groups together under the
+    /// existing tick batching lock. Equivalent to `send` per packet, but
+    /// preserves packet order with fewer lock acquisitions during a tick.
+    pub fn send_all(&self, packets: &[play::Clientbound]) {
+        self.sender
+            .send_many(packets.iter().map(play::Clientbound::encode));
+    }
     pub fn chunk(&self) -> (i32, i32) {
         (
             (self.position[0].floor() as i32) >> 4,
