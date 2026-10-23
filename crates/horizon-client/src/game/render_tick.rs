@@ -214,8 +214,12 @@ impl Game<'_> {
             percent_frozen: p.percent_frozen(),
             partial,
             portal: [fx.o_portal, fx.portal],
-            nausea: 0.0,
-            screen_effect_scale: 1.0,
+            nausea: fx.nausea(partial),
+            screen_effect_scale: self
+                .settings
+                .file
+                .double("screenEffectScale")
+                .clamp(0.0, 1.0) as f32,
         };
         let mut scope = self.scope_scale;
         let gui_overlays =
@@ -251,7 +255,14 @@ impl Game<'_> {
         if let Some(e) = eye {
             let brightness = self.eye_brightness(e);
             let inside_portal = self.client_portal_effect();
-            self.screen_fx.tick(brightness, inside_portal);
+            self.screen_fx.tick(
+                brightness,
+                inside_portal,
+                self.potions
+                    .effects
+                    .get("nausea")
+                    .map(|effect| effect.duration),
+            );
             // LocalPlayer water vision and AtmosphericFogEnvironment rain fog.
             let in_water =
                 fog_type(&self.world, self.res.facts(), e, self.forward()) == FogType::Water;

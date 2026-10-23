@@ -363,8 +363,8 @@ pub struct Renderer {
     border_group: wgpu::BindGroup,
     border_uniform: wgpu::Buffer,
     border_vertices: wgpu::Buffer,
-    /// Screen effects: alpha-blended and vignette (`dst * (1 - src)`) pipelines.
-    screen_pipelines: [wgpu::RenderPipeline; 2],
+    /// Screen effects: alpha, vignette and standalone additive nausea.
+    screen_pipelines: [wgpu::RenderPipeline; 3],
     screen_buffer: wgpu::Buffer,
     screen_capacity: u64,
     entity_group: wgpu::BindGroup,
@@ -1984,37 +1984,54 @@ impl Renderer {
                 operation: wgpu::BlendOperation::Add,
             },
         };
-        let screen_pipelines =
-            [("fs_screen", alpha_blend), ("fs_vignette", vignette_blend)].map(|(entry, blend)| {
-                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                    label: Some("Screen effects"),
-                    layout: Some(&entity_layout),
-                    vertex: wgpu::VertexState {
-                        module: &screen_shader,
-                        entry_point: Some("vs_screen"),
-                        compilation_options: Default::default(),
-                        buffers: &screen_vertex,
-                    },
-                    primitive: wgpu::PrimitiveState {
-                        cull_mode: None,
-                        ..Default::default()
-                    },
-                    depth_stencil: None,
-                    multisample: Default::default(),
-                    fragment: Some(wgpu::FragmentState {
-                        module: &screen_shader,
-                        entry_point: Some(entry),
-                        compilation_options: Default::default(),
-                        targets: &[Some(wgpu::ColorTargetState {
-                            format: config.format.remove_srgb_suffix(),
-                            blend: Some(blend),
-                            write_mask: wgpu::ColorWrites::ALL,
-                        })],
-                    }),
-                    multiview_mask: None,
-                    cache: None,
-                })
-            });
+        // Original Minecraft 26.3 `BlendFunction.ADDITIVE` uses ONE/ONE
+        // independently for both RGB and alpha (verified from client.jar).
+        let additive = wgpu::BlendComponent {
+            src_factor: wgpu::BlendFactor::One,
+            dst_factor: wgpu::BlendFactor::One,
+            operation: wgpu::BlendOperation::Add,
+        };
+        let screen_pipelines = [
+            ("fs_screen", alpha_blend),
+            ("fs_vignette", vignette_blend),
+            (
+                "fs_screen",
+                wgpu::BlendState {
+                    color: additive,
+                    alpha: additive,
+                },
+            ),
+        ]
+        .map(|(entry, blend)| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Screen effects"),
+                layout: Some(&entity_layout),
+                vertex: wgpu::VertexState {
+                    module: &screen_shader,
+                    entry_point: Some("vs_screen"),
+                    compilation_options: Default::default(),
+                    buffers: &screen_vertex,
+                },
+                primitive: wgpu::PrimitiveState {
+                    cull_mode: None,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: Default::default(),
+                fragment: Some(wgpu::FragmentState {
+                    module: &screen_shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format.remove_srgb_suffix(),
+                        blend: Some(blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        });
         let screen_capacity = 64;
         let screen_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Screen effect vertices"),
@@ -3906,6 +3923,7 @@ impl Renderer {
                 let pipeline = match quad.blend {
                     crate::screen_effects::Blend::Alpha => &self.screen_pipelines[0],
                     crate::screen_effects::Blend::Vignette => &self.screen_pipelines[1],
+                    crate::screen_effects::Blend::Nausea => &self.screen_pipelines[2],
                 };
                 pass.set_pipeline(pipeline);
                 pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
