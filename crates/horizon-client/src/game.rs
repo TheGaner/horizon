@@ -3,6 +3,7 @@
 mod advancements;
 mod advancements_screen;
 mod agent;
+mod agent_settings;
 mod allays;
 mod armor_stands;
 mod banners;
@@ -524,6 +525,7 @@ struct GameLevel<'w> {
     spill: &'w mut spill::Spill,
     /// Where the chunk tickets let blocks tick.
     tickets: horizon_client::ticket_levels::Levels,
+    random_tick_sections: &'w mut horizon_client::random_tick_sections::RandomTickSections,
 }
 struct PlayerCollision {
     y: f64,
@@ -1436,6 +1438,10 @@ struct Game<'a> {
     item_columns: Option<machines::ItemColumns>,
     creative_screen: Creative,
     control: Option<horizon_client::control::Server>,
+    /// The Agent Control setting the socket was last opened or closed for (`agent_settings`).
+    agent_control_on: bool,
+    /// When an agent's last command came.
+    agent_last: Option<Instant>,
     frame_stats: horizon_client::control::FrameStats,
     /// This play session's frame and tick times, for opt-in performance statistics.
     perf: horizon_client::telemetry::Session,
@@ -2274,6 +2280,7 @@ impl Game<'_> {
             pending: &mut self.pending,
             spill: &mut self.spill,
             tickets: self.tickets.levels(),
+            random_tick_sections: &mut self.random_tick_sections,
         };
         let result = f(self.res.behaviours(), &mut level, &mut self.block_ticks);
         self.flush_spill();
@@ -2368,18 +2375,15 @@ impl Game<'_> {
         self.sync_tick_chunks();
         self.start_ticking_chunks();
         let levels = self.tickets.levels();
-        let mut ticking = Vec::new();
-        let facts = self.res.facts();
-        for (&(x, z), chunk) in &self.world.chunks {
-            if !levels.random_ticking(x, z) || !ticking_chunk(&self.world, x, z) {
-                continue;
-            }
-            // Capture eligibility before inside-block and scheduled updates, as
-            // before. Keep the world map's chunk order, including empty chunks
-            // (tick_chunk_random still draws for precipitation in those).
-            let sections = self.random_tick_sections.get((x, z), chunk, facts);
-            ticking.push((x, z, sections));
-        }
+        // Keep the world map's chunk order, including empty chunks
+        // (tick_chunk_random still draws for precipitation in those).
+        let ticking: Vec<_> = self
+            .world
+            .chunks
+            .keys()
+            .copied()
+            .filter(|&(x, z)| levels.random_ticking(x, z) && ticking_chunk(&self.world, x, z))
+            .collect();
         // Entity.checkInsideBlocks for the plates, tripwires and detector rails
         // under the players (the host and the LAN guests) and the minecarts.
         let mut inside = Vec::new();
@@ -2421,13 +2425,24 @@ impl Game<'_> {
         self.process_level_events()?;
         self.tick_scheduled()?;
         self.with_level(|b, level, ticks| {
-            for (x, z, sections) in ticking {
-                b.tick_chunk_random(
-                    level,
-                    ticks,
-                    horizon_core::position::ChunkPos::new(x, z),
-                    sections,
-                );
+            for (x, z) in ticking {
+                // The sections are read again only after a block changed.
+                let mut read = None;
+                let mut sections = Default::default();
+                let pos = horizon_core::position::ChunkPos::new(x, z);
+                b.tick_chunk_random(level, ticks, pos, |level, from| {
+                    if read != Some(level.world.revision) {
+                        read = Some(level.world.revision);
+                        sections = level
+                            .world
+                            .chunks
+                            .get(&(x, z))
+                            .map_or_else(Default::default, |chunk| {
+                                level.random_tick_sections.get((x, z), chunk, level.facts)
+                            });
+                    }
+                    sections.from(from)
+                });
             }
             b.run_block_events(level, ticks);
             b.tick_block_entities(level, ticks);
@@ -11675,6 +11690,8 @@ impl<'a> Game<'a> {
             item_columns: None,
             creative_screen: prepared.creative_screen,
             control: None,
+            agent_control_on: false,
+            agent_last: None,
             frame_stats: Default::default(),
             perf: Default::default(),
             pending_screenshot: None,
@@ -12471,18 +12488,7 @@ fn start_game<'a>(
         game.mods.dev = game.options.dev_mods.clone();
         game.start_mods();
     }
-    if game.options.control.is_some() && game.settings.extras.no_ai {
-        // No AI turns agent control off: the socket is never opened.
-        log::warn!(
-            "Horizon: control socket not opened: {}",
-            horizon_core::no_ai::REFUSAL
-        );
-    } else if let Some(path) = &game.options.control {
-        let server = horizon_client::control::Server::start(path)
-            .map_err(|e| format!("control socket {}: {e}", path.display()))?;
-        log::info!("Horizon: control socket {}", server.path().display());
-        game.control = Some(server);
-    }
+    game.start_agent_control()?;
     if let Some(scenario) = game.options.benchmark.clone() {
         let control = game
             .control
