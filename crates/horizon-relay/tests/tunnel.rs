@@ -215,6 +215,7 @@ fn relay_pool_skips_dead_first_relay_and_publishes_only_the_live_address() {
     let full = long(&code);
     let relay_ref = full.relay.unwrap();
     assert!(host.state().relay_problem.is_none());
+    assert_eq!(host.state().active_relay.as_deref(), Some(address.as_str()));
     assert_eq!(relay_ref.address, address);
     assert_eq!(short.unwrap(), relay_ref.code);
     let tunnel = join(&code, None, PathMode::RelayOnly).unwrap();

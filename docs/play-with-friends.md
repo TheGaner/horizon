@@ -131,7 +131,8 @@ actually serving the host**, so a guest joining with the full code requires
 no matching relay configuration. A guest entering just the eight-character
 short code may supply the same trusted relay list, which it tries in order;
 otherwise enter the active relay address individually. Duplicate or blank
-entries are ignored. This does not provide public relays or proximity-based
+entries are ignored. The sharing screen displays the active relay
+address for diagnostics. This does not provide public relays or proximity-based
 routing: the player still needs reachable, configured relay servers. Existing
 single-address settings and direct connections remain supported.
 

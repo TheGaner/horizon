@@ -32,7 +32,9 @@ semicolon-separated relay endpoints. The host registers with the first
 available relay, rotates when a registration or connection fails, publishes
 only its active address in full invitation codes, and applies exponential
 backoff only after trying the full list. Short-code guests can use an
-explicitly trusted matching pool. Legacy single-address behavior remains.
+explicitly trusted matching pool. The active relay is included in
+`HostState` and visible on the sharing screen for troubleshooting; no invite
+secret is logged. Legacy single-address behavior remains.
 This is **configured failover, not automatic public relay discovery**.
 
 Relevant files:

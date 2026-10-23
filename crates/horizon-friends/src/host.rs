@@ -67,6 +67,8 @@ pub struct HostState {
     pub verdict: Option<Verdict>,
     /// Why the relay isn't serving, when one is configured.
     pub relay_problem: Option<String>,
+    /// Currently registered relay, if one is active (not the whole pool).
+    pub active_relay: Option<String>,
     pub port: u16,
 }
 
@@ -129,11 +131,13 @@ impl Shared {
         };
         {
             let mut s = self.state.lock().unwrap();
-            if s.invite.as_deref() == Some(&text) && s.short == short {
+            let active = short.as_ref().and(active_relay).map(str::to_owned);
+            if s.invite.as_deref() == Some(&text) && s.short == short && s.active_relay == active {
                 return;
             }
             s.invite = Some(text.clone());
             s.short = short;
+            s.active_relay = active;
         }
         self.emit(HostEvent::Code(text));
     }

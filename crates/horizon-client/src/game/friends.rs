@@ -238,6 +238,9 @@ impl Game<'_> {
         if let Some(short) = &state.short {
             status.push_str(&format!(" Short code for the relay: {short}."));
         }
+        if let Some(active) = &state.active_relay {
+            status.push_str(&format!(" Active relay: {active}."));
+        }
         if let Some(problem) = &state.relay_problem {
             status.push(' ');
             status.push_str(problem);
