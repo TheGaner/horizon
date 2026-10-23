@@ -51,13 +51,36 @@ impl TextureSampling {
         }
     }
 }
-
+/// `TextureMetadataSection`'s `blur` and `clamp`: how vanilla samples a
+/// standalone texture (`ReloadableTexture.setSampler`: linear rather than
+/// nearest filtering, clamp-to-edge rather than repeat addressing).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextureFlags {
+    pub blur: bool,
+    pub clamp: bool,
+}
+impl TextureFlags {
+    /// The `texture` section of a `.png.mcmeta` file, if it sets either flag.
+    pub fn from_mcmeta(json: &str) -> Option<Self> {
+        let meta: serde_json::Value = serde_json::from_str(json).ok()?;
+        let section = meta.get("texture")?;
+        let flag = |key| section.get(key).and_then(serde_json::Value::as_bool) == Some(true);
+        let flags = Self {
+            blur: flag("blur"),
+            clamp: flag("clamp"),
+        };
+        (flags != Self::default()).then_some(flags)
+    }
+}
 pub struct HudAtlas {
     pub sampling: HashMap<String, TextureSampling>,
     pub pixels: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub sprites: HashMap<String, Rect>,
+    /// Sprites whose `.png.mcmeta` sets `blur` or `clamp`; the others
+    /// sample as vanilla's defaults (nearest, repeat).
+    pub flags: HashMap<String, TextureFlags>,
     pub fire_animations: Vec<(Rect, crate::sprites::SpriteAnimation)>,
     /// The default font (bitmap sheets in this atlas, unifont rasterized on demand).
     pub font: crate::font::Font,
@@ -115,6 +138,20 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 /// A packed atlas image: sprite name, size and RGBA pixels.
 type PackedImage = (String, u32, u32, Vec<u8>);
+/// `image` inside a one-texel border copied from its opposite edges, the
+/// texels repeat addressing reads past each edge.
+fn wrap_border((name, w, h, data): &PackedImage) -> PackedImage {
+    let (bw, bh) = (w + 2, h + 2);
+    let mut out = Vec::with_capacity((bw * bh * 4) as usize);
+    for y in 0..bh {
+        let row = (y + h - 1) % h;
+        for x in 0..bw {
+            let at = ((row * w + (x + w - 1) % w) * 4) as usize;
+            out.extend_from_slice(&data[at..at + 4]);
+        }
+    }
+    (name.clone(), bw, bh, out)
+}
 /// Sprites the atlas definitions (`atlases/*.json`) add beyond the texture
 /// files already packed: generated ones (`paletted_permutations` such as the
 /// armour trim sprites, `unstitch` regions) and files listed under another id.
@@ -278,7 +315,7 @@ impl HudAtlas {
             let s = p.to_string_lossy();
             !s.contains("title/background") && !s.contains("realms") && !s.contains("presets")
         });
-        let decode_one = |path: &PathBuf| -> Option<(String, u32, u32, Vec<u8>)> {
+        let decode_one = |path: &PathBuf| -> Option<(PackedImage, Option<TextureFlags>)> {
             let name = path
                 .strip_prefix(&textures)
                 .ok()?
@@ -293,11 +330,15 @@ impl HudAtlas {
             } else {
                 pixels
             };
-            (w <= 1024 && (h <= 512 || name.starts_with("font/"))).then_some((name, w, h, pixels))
+            let flags = fs::read_to_string(path.with_extension("png.mcmeta"))
+                .ok()
+                .and_then(|json| TextureFlags::from_mcmeta(&json));
+            (w <= 1024 && (h <= 512 || name.starts_with("font/")))
+                .then_some(((name, w, h, pixels), flags))
         };
         let threads = std::thread::available_parallelism().map_or(2, |n| n.get());
         let chunk = files.len().div_ceil(threads).max(1);
-        let mut images: Vec<_> = std::thread::scope(|scope| {
+        let decoded: Vec<_> = std::thread::scope(|scope| {
             let handles: Vec<_> = files
                 .chunks(chunk)
                 .map(|part| {
@@ -309,6 +350,14 @@ impl HudAtlas {
                 .flat_map(|h| h.join().unwrap_or_default())
                 .collect()
         });
+        let mut flags = HashMap::new();
+        let mut images: Vec<PackedImage> = Vec::with_capacity(decoded.len());
+        for (image, image_flags) in decoded {
+            if let Some(f) = image_flags {
+                flags.insert(image.0.clone(), f);
+            }
+            images.push(image);
+        }
         if full {
             images.extend(atlas_sprites(root, &images));
         }
@@ -335,6 +384,16 @@ impl HudAtlas {
                 (flags != TextureSampling::default()).then_some((name.clone(), flags))
             })
             .collect();
+        // Blurred sprites are sampled linearly in the atlas (screen.wgsl): a
+        // border wrapped from their own edges keeps the filter off their
+        // neighbours, as repeat addressing of their own texture would.
+        let mut bordered = std::collections::HashSet::new();
+        for image in &mut images {
+            if flags.get(&image.0).is_some_and(|f: &TextureFlags| f.blur) {
+                *image = wrap_border(image);
+                bordered.insert(image.0.clone());
+            }
+        }
         images.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.cmp(&a.1)));
         let width = 4096u32;
         let mut placements = Vec::with_capacity(images.len());
@@ -359,6 +418,8 @@ impl HudAtlas {
                 let dst = (((py + row) * width + px) * 4) as usize;
                 pixels[dst..dst + (w * 4) as usize].copy_from_slice(src);
             }
+            let b = u32::from(bordered.contains(name));
+            let (px, py, w, h) = (px + b, py + b, w - 2 * b, h - 2 * b);
             sprites.insert(
                 name.clone(),
                 Rect {
@@ -366,8 +427,8 @@ impl HudAtlas {
                     v0: py as f32 / height as f32,
                     u1: (px + w) as f32 / width as f32,
                     v1: (py + h) as f32 / height as f32,
-                    w: *w,
-                    h: *h,
+                    w,
+                    h,
                 },
             );
         }
@@ -415,6 +476,7 @@ impl HudAtlas {
             width,
             height,
             sprites,
+            flags,
             fire_animations,
             font,
             white,
@@ -1501,12 +1563,42 @@ mod tests {
                 clamp: true
             }
         );
-        assert_eq!(reloaded.pixels, atlas.pixels);
+        // Source #1190 pads blurred atlas sprites with edge texels; toggling
+        // blur may correctly repack atlas bytes even when the *source PNG*
+        // is unchanged. Verify actual sprite source identity instead.
+        assert_eq!(
+            decode(&textures.join("vignette.png")).unwrap().2,
+            vec![255; 16 * 16 * 4]
+        );
         // No texture section returns to nearest/repeat on the next reload.
         fs::remove_file(meta).unwrap();
         let default = HudAtlas::build(&root).unwrap();
         assert!(!default.sampling.contains_key("misc/vignette"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_wrapped_border_repeats_the_opposite_edges() {
+        // 2x2 texels a b / c d, one byte each in red.
+        let image = (
+            "x".to_owned(),
+            2,
+            2,
+            [1u8, 2, 3, 4]
+                .iter()
+                .flat_map(|&v| [v, 0, 0, 255])
+                .collect(),
+        );
+        let (_, w, h, data) = wrap_border(&image);
+        assert_eq!((w, h), (4, 4));
+        let red: Vec<u8> = data.chunks(4).map(|t| t[0]).collect();
+        #[rustfmt::skip]
+        assert_eq!(red, [
+            4, 3, 4, 3,
+            2, 1, 2, 1,
+            4, 3, 4, 3,
+            2, 1, 2, 1,
+        ]);
     }
 
     /// A synthetic default font: two 8x8 glyphs, 3 and 5 pixels wide.

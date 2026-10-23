@@ -36,6 +36,14 @@ pub struct ScreenVertex {
 pub struct ScreenQuad {
     pub vertices: [ScreenVertex; 4],
     pub blend: Blend,
+    /// Source #1190: 0..3 metadata blur/clamp pipeline specialization.
+    pub sampling: u32,
+}
+
+pub const SAMPLE_BLUR: u32 = 1;
+pub const SAMPLE_CLAMP: u32 = 2;
+fn sampling_bits(flags: [f32; 2]) -> u32 {
+    u32::from(flags[0] > 0.5) * SAMPLE_BLUR | u32::from(flags[1] > 0.5) * SAMPLE_CLAMP
 }
 
 /// What the camera sees this frame.
@@ -143,6 +151,7 @@ impl ScreenEffects {
                 sampling,
             }),
             blend: Blend::Alpha,
+            sampling: sampling_bits(sampling),
         };
         let full = [[-1.0, -1.0], [1.0, -1.0], [1.0, 1.0], [-1.0, 1.0]];
         // ScreenEffectRenderer.submitBlockSprite: u1/v1 at (-1, -1), colour 0xFF191919.
@@ -155,7 +164,7 @@ impl ScreenEffects {
                 [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
                 rect,
                 [c, c, c, 1.0],
-                flags(name),
+                [0.0; 2],
             ));
         }
         if let Some((brightness, yaw, pitch)) = input.water
@@ -190,7 +199,7 @@ impl ScreenEffects {
                     [[1.0, 1.0], [0.0, 1.0], [0.0, 0.0], [1.0, 0.0]],
                     rect,
                     [1.0, 1.0, 1.0, alpha],
-                    flags("block/fire_1"),
+                    [0.0; 2],
                 ));
             }
         }
@@ -218,6 +227,7 @@ impl ScreenEffects {
                 }
             }),
             blend,
+            sampling: sampling_bits(sampling),
         };
         let rgba = |c: u32| {
             let [a, r, g, b] = c.to_be_bytes();
@@ -253,6 +263,10 @@ impl ScreenEffects {
                         crate::hud_layout::Blend::Nausea => Blend::Nausea,
                         _ => Blend::Alpha,
                     };
+                    // Latest Source: a zero-colour vignette is a no-op.
+                    if blend == Blend::Vignette && color & 0x00ff_ffff == 0 {
+                        continue;
+                    }
                     if let Some(rect) = sprite(texture)
                         && *w > 0
                         && *h > 0

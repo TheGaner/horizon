@@ -367,8 +367,8 @@ pub struct Renderer {
     border_group: wgpu::BindGroup,
     border_uniform: wgpu::Buffer,
     border_vertices: wgpu::Buffer,
-    /// Screen effects: alpha, vignette and standalone additive nausea.
-    screen_pipelines: [wgpu::RenderPipeline; 3],
+    /// Source blur/clamp four-mode specialization for alpha/vignette/nausea.
+    screen_pipelines: [wgpu::RenderPipeline; 12],
     screen_buffer: wgpu::Buffer,
     screen_capacity: u64,
     entity_group: wgpu::BindGroup,
@@ -2013,32 +2013,41 @@ impl Renderer {
                 operation: wgpu::BlendOperation::Add,
             },
         };
-        // Original Minecraft 26.3 `BlendFunction.ADDITIVE` uses ONE/ONE
-        // independently for both RGB and alpha (verified from client.jar).
-        let additive = wgpu::BlendComponent {
+        // Our original Java 26.3 nausea effect uses ONE/ONE additive RGB
+        // and alpha, independent of Source's four sampler modes.
+        let add = wgpu::BlendComponent {
             src_factor: wgpu::BlendFactor::One,
             dst_factor: wgpu::BlendFactor::One,
             operation: wgpu::BlendOperation::Add,
         };
-        let screen_pipelines = [
-            ("fs_screen", alpha_blend),
-            ("fs_vignette", vignette_blend),
-            (
-                "fs_screen",
-                wgpu::BlendState {
-                    color: additive,
-                    alpha: additive,
-                },
-            ),
-        ]
-        .map(|(entry, blend)| {
+        let nausea_blend = wgpu::BlendState {
+            color: add,
+            alpha: add,
+        };
+        // One per blend and `.png.mcmeta` sampling (screen_effects::SAMPLE_*):
+        // the shader is specialised, so a pixel pays for none of the others.
+        let screen_pipelines: [wgpu::RenderPipeline; 12] = std::array::from_fn(|i| {
+            let (entry, blend) = match i / 4 {
+                0 => ("fs_screen", alpha_blend),
+                1 => ("fs_vignette", vignette_blend),
+                _ => ("fs_screen", nausea_blend),
+            };
+            let on = |bit: u32| f64::from(u8::from(i as u32 & bit != 0));
+            let constants = [
+                ("BLUR", on(crate::screen_effects::SAMPLE_BLUR)),
+                ("CLAMP", on(crate::screen_effects::SAMPLE_CLAMP)),
+            ];
+            let compilation_options = wgpu::PipelineCompilationOptions {
+                constants: &constants,
+                ..Default::default()
+            };
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("Screen effects"),
                 layout: Some(&entity_layout),
                 vertex: wgpu::VertexState {
                     module: &screen_shader,
                     entry_point: Some("vs_screen"),
-                    compilation_options: Default::default(),
+                    compilation_options: compilation_options.clone(),
                     buffers: &screen_vertex,
                 },
                 primitive: wgpu::PrimitiveState {
@@ -2050,7 +2059,7 @@ impl Renderer {
                 fragment: Some(wgpu::FragmentState {
                     module: &screen_shader,
                     entry_point: Some(entry),
-                    compilation_options: Default::default(),
+                    compilation_options,
                     targets: &[Some(wgpu::ColorTargetState {
                         format: config.format.remove_srgb_suffix(),
                         blend: Some(blend),
@@ -3972,12 +3981,12 @@ impl Renderer {
             pass.set_index_buffer(self.indices.slice(..), wgpu::IndexFormat::Uint32);
             pass.set_vertex_buffer(0, self.screen_buffer.slice(..));
             for (i, quad) in frame.screen.iter().enumerate() {
-                let pipeline = match quad.blend {
-                    crate::screen_effects::Blend::Alpha => &self.screen_pipelines[0],
-                    crate::screen_effects::Blend::Vignette => &self.screen_pipelines[1],
-                    crate::screen_effects::Blend::Nausea => &self.screen_pipelines[2],
+                let blend = match quad.blend {
+                    crate::screen_effects::Blend::Alpha => 0,
+                    crate::screen_effects::Blend::Vignette => 4,
+                    crate::screen_effects::Blend::Nausea => 8,
                 };
-                pass.set_pipeline(pipeline);
+                pass.set_pipeline(&self.screen_pipelines[blend + (quad.sampling & 3) as usize]);
                 pass.draw_indexed(0..6, (i * 4) as i32, 0..1);
             }
         }
