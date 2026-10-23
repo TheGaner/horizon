@@ -7,7 +7,11 @@
 //! direct local ticket: callers must apply the transport privacy policy.
 //! This module deliberately uses no default public relay or name service.
 
-use iroh::{Endpoint, EndpointAddr, endpoint::presets};
+use crate::PathMode;
+use iroh::{
+    Endpoint, EndpointAddr, TransportAddr,
+    endpoint::{PortmapperConfig, presets},
+};
 use std::{
     io,
     net::{Ipv4Addr, SocketAddr},
@@ -132,15 +136,49 @@ pub struct Guest {
 }
 
 impl Guest {
+    /// Experimental direct-only connection. Does not enable public relays.
     pub async fn connect(ticket: &Ticket) -> io::Result<Self> {
-        let endpoint = Endpoint::bind(presets::Minimal).await.map_err(other)?;
-        let conn = tokio::time::timeout(
-            HANDSHAKE_TIMEOUT,
-            endpoint.connect(ticket.endpoint.clone(), ALPN),
-        )
-        .await
-        .map_err(|_| io::ErrorKind::TimedOut)?
-        .map_err(other)?;
+        Self::connect_with_mode(ticket, PathMode::DirectOnly).await
+    }
+
+    /// A fail-closed path selector for the experimental native QUIC client.
+    /// There is no independently operated Iroh relay configured yet, so
+    /// RelayOnly must refuse before binding UDP or advertising local IPs.
+    /// Auto currently selects only explicit direct candidates, never an
+    /// unapproved third-party default relay. Do not use this experimental
+    /// method as production routing until a relay policy is implemented.
+    pub async fn connect_with_mode(ticket: &Ticket, mode: PathMode) -> io::Result<Self> {
+        if mode == PathMode::RelayOnly {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Iroh relay-only mode requires a configured, trusted relay; direct UDP is forbidden",
+            ));
+        }
+        let direct: Vec<_> = ticket
+            .endpoint
+            .ip_addrs()
+            .copied()
+            .filter(|addr| addr.port() != 0)
+            .map(TransportAddr::Ip)
+            .collect();
+        if direct.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "No direct Iroh address provided; relay fallback is not configured",
+            ));
+        }
+        let endpoint_addr = EndpointAddr::from_parts(ticket.endpoint.id, direct);
+        let endpoint = Endpoint::builder(presets::Minimal)
+            .clear_relay_transports()
+            .clear_address_lookup()
+            .portmapper_config(PortmapperConfig::Disabled)
+            .bind()
+            .await
+            .map_err(other)?;
+        let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, endpoint.connect(endpoint_addr, ALPN))
+            .await
+            .map_err(|_| io::ErrorKind::TimedOut)?
+            .map_err(other)?;
         let (mut send, mut recv) = conn.open_bi().await.map_err(other)?;
         send.write_all(&ticket.secret).await.map_err(other)?;
         let mut response = [0u8; 2];
@@ -229,7 +267,9 @@ mod tests {
             host.close().await;
             result
         });
-        let guest = Guest::connect(&ticket).await.unwrap();
+        let guest = Guest::connect_with_mode(&ticket, PathMode::DirectOnly)
+            .await
+            .unwrap();
         let (port, relay) = guest.serve_loopback().await.unwrap();
         let mut local = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
             .await
@@ -250,6 +290,26 @@ mod tests {
             .unwrap()
             .unwrap();
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn relay_only_fails_closed_before_creating_any_udp_endpoint() {
+        let host = Host::bind_local([61u8; SECRET_LENGTH]).await.unwrap();
+        let ticket = host.ticket();
+        let result = Guest::connect_with_mode(&ticket, PathMode::RelayOnly).await;
+        assert!(matches!(result, Err(ref e) if e.kind() == io::ErrorKind::PermissionDenied));
+        host.close().await;
+    }
+
+    #[tokio::test]
+    async fn direct_only_never_attempts_to_use_an_invited_relay_without_ip_candidates() {
+        let host = Host::bind_local([62u8; SECRET_LENGTH]).await.unwrap();
+        let mut ticket = host.ticket();
+        ticket.endpoint = EndpointAddr::new(ticket.endpoint.id)
+            .with_relay_url("https://relay.invalid.example".parse().unwrap());
+        let result = Guest::connect_with_mode(&ticket, PathMode::DirectOnly).await;
+        assert!(matches!(result, Err(ref e) if e.kind() == io::ErrorKind::InvalidInput));
+        host.close().await;
     }
 
     #[tokio::test]

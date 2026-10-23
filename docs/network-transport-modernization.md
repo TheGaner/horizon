@@ -160,6 +160,25 @@ from the implemented V3 payload (no flag byte yet); this section and the
 source module define the **implemented experimental format**. No production
 commit should rely on the experimental format without compatibility review.
 
+## NET-02C — opt-in QUIC transport policy guard
+
+**Partial experimental implementation** in `iroh_transport::Guest::connect_with_mode`:
+`PathMode::RelayOnly` returns an explicit `PermissionDenied` error **before**
+constructing any guest Iroh UDP endpoint. No approved Iroh relay map is
+configured yet, so the code deliberately declines to connect rather than
+silently falling back to direct IP and revealing a player's address.
+`DirectOnly` and current experimental `Auto` connect only to explicit IP
+candidates from the decoded ticket, with Iroh relay transport, implicit
+address lookup and gateway port mapping disabled. An ID-only or relay-only
+invite without usable direct candidates is refused. `Guest::connect` defaults
+to `DirectOnly` for compatibility with existing localhost test callers.
+Dedicated unit tests exercise RelayOnly fail-closed and DirectOnly refusing an
+invitation with only a relay URL, in addition to the working QUIC localhost
+echo. The host remains localhost-only and serves one guest, so this is **not**
+a ready-to-ship privacy mode or real WAN NAT traversal; configured
+operator-controlled relay transport, socket instrumentation, cancellation,
+quota/replay handling and full `PathMode` matrix are still required.
+
 ## NET-03 relay discovery and usability
 
 A public relay broker requires **operator-provided infrastructure**. e4mc's
