@@ -50,13 +50,14 @@ Cross-internet, CGNAT and real-network latency remain **untested**.
 
 ## Follow-on design — NET-02 native Iroh QUIC
 
-**Dependency gate:** Horizon workspace pins `rustc 1.90.0` via
-`../scripts/horizon_env.sh`; current `n0-computer/iroh` 1.x manifests require
-`rust-version = "1.91"` (verified against v1.3.0 and latest main on
-2026-10-23). Do not patch away the MSRV, silently select an old protocol,
-or change the globally shared Rust toolchain while upstream review jobs run.
-Upgrade toolchain in a coordinated, isolated build environment first and
-prove full workspace builds before changing release requirements.
+**Dependency gate: independently resolved for experimental feature.** Horizon
+normally pins `rustc 1.90.0` via `../scripts/horizon_env.sh`; native Iroh 1.4.1
+requires Rust >=1.91. Rust 1.91.0 was installed **alongside**, not instead of,
+1.90 in the shared rustup install. Run only the experimental feature with an
+explicit `RUSTUP_TOOLCHAIN=1.91.0` override. The default gameplay builds must
+continue to compile on the pinned Rust 1.90, and the production workspace MSRV
+is unchanged. Production release/CI toolchain migration requires a separate
+review and full workspace gate.
 
 **Integration sequence:**
 
@@ -77,6 +78,47 @@ prove full workspace builds before changing release requirements.
    and automatic. No connection may bypass explicit relay-only settings.
 5. Add telemetry limited to connection route, handshake timing, hop RTT and
    failures; avoid logging invitation secrets, raw tickets or public IPs.
+
+## NET-02A — opt-in QUIC localhost proof
+
+**Implementation in this topic branch (experimental, not selectable in-game):**
+`crates/horizon-friends/src/iroh_transport.rs` uses native Rust Iroh 1.4.1,
+Tokio and QUIC streams behind Cargo feature `iroh-experimental`. It binds an
+endpoint on local UDP, provides an `EndpointAddr` and 32-byte capability ticket,
+authenticates the capability **before** dialing the integrated TCP loopback
+server, and pipes Minecraft TCP bytes bidirectionally between QUIC and TCP.
+A guest can expose the QUIC stream as a local `127.0.0.1` TCP port, matching
+Horizon’s existing remote client contract. All proof code is written in Rust.
+
+Iroh `presets::Minimal` disables public DNS lookups and relays: these tests
+exercise encrypted QUIC **over loopback UDP only**. It must NOT be described as
+Internet NAT traversal, regional relay discovery or a replacement of the
+production encrypted TCP invite protocol. The new ticket is not yet encoded
+in legacy invite v2, and there is not yet an automatic path selector, public
+service or in-game opt-in. Production must maintain relay-only IP privacy;
+no UDP probe should run without explicit user consent in that mode. QUIC's TLS
+endpoint identity protects against endpoint impersonation while the separate
+capability authenticates authorization. This prototype's bearer capability
+is NOT equivalent to the existing SPAKE2 negotiation and requires a security
+review, replay limits and secret/identity binding before production use.
+
+The tests `iroh_transport::tests` cover successful TCP echo over QUIC and
+rejecting a wrong capability before the local server is reached. No public
+service is contacted by design. Timeout and host shutdown semantics need
+focused testing beyond these two cases. Reproduce from the checkout root:
+
+```sh
+. ../scripts/horizon_env.sh
+RUSTUP_TOOLCHAIN=1.91.0 cargo test --locked -p horizon-friends --features iroh-experimental --lib iroh_transport
+RUSTUP_TOOLCHAIN=1.90.0 cargo test --locked -p horizon-friends --lib
+```
+
+**Next engineering slice:** Add a versioned invitation encoding that binds the
+Iroh EndpointId and capability securely and is backward-compatible with v2;
+apply `PathMode` direct-only/relay-only policies to real Iroh UDP transport;
+wire the adapter into the host/guest lifecycle. Add per-client concurrency
+budgets, slowloris/replay tests, multi-guest sessions, and a real CGNAT / relay
+harness before selecting QUIC by default.
 
 ## NET-03 relay discovery and usability
 
@@ -109,3 +151,11 @@ scoped commit preserves it on the topic branch. It is not upstream-merged nor
 part of H004 until the separate guarded review and relevant multiplayer parity
 checks are complete. Rollback by omitting the topic branch; existing worktrees
 and upstream tracking refs must remain untouched.
+
+## Additional performance research
+
+KryptonReno pipeline, VarInt, compression and Happy Eyeballs ideas are tracked
+separately in [`network-kryptonreno-research.md`](network-kryptonreno-research.md)
+for follow-on work **after** the native Iroh connection path. These optimizations
+need identical packet-contract tests and A/B profiling; they do not replace
+NAT traversal or offer free access to e4mc public relays.

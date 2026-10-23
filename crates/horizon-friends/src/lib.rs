@@ -14,6 +14,8 @@ pub mod direct;
 pub mod guest;
 pub mod host;
 pub mod invite;
+#[cfg(feature = "iroh-experimental")]
+pub mod iroh_transport;
 pub mod portmap;
 pub mod reach;
 mod session;
